@@ -1,0 +1,526 @@
+"""Capture one Windows keyboard chord for the settings recorder.
+
+The QML ``Keys`` layer intentionally does not participate in recording. This
+module owns a real ``WH_KEYBOARD_LL`` hook as the primary recorder: it keeps
+the first key-down order, preserves directional modifiers, suppresses the
+captured events so they cannot affect the foreground application, and emits
+one serialized token string after the last captured key is released.
+The settings controller's focused Qt fallback also uses this module's token
+resolver with native Windows key data to preserve left/right modifiers.
+
+The normal low-level primitive rejects injected events. The settings UI opts
+in while the user is explicitly recording so a keyboard forwarded by remote
+control software can configure the same field as a local physical keyboard.
+
+The settings UI uses ``isolated=True``: its hook runs in a disposable child
+without Raw Input registration, so a foreground desktop/bridge process cannot
+disable the first hook dispatch. Both modes share the same key state machine.
+The hook is installed only while the settings recorder dialog is open. The
+module can still be imported on non-Windows hosts; only ``start()`` requires
+the Win32 APIs, so token-formatting tests remain cross-platform.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import itertools
+import json
+import logging
+import sys
+import threading
+from ctypes import wintypes
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+from . import win32_keys
+
+
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+WM_SYSKEYDOWN = 0x0104
+WM_KEYUP = 0x0101
+WM_SYSKEYUP = 0x0105
+WM_QUIT = 0x0012
+PM_NOREMOVE = 0x0000
+VK_ESCAPE = 0x1B
+VK_NONAME = 0xFC
+
+LLKHF_EXTENDED = 0x00000001
+LLKHF_INJECTED = 0x00000010
+LLKHF_UP = 0x00000080
+
+_STOP_JOIN_TIMEOUT_SECONDS = 2.0
+_LOGGER = logging.getLogger("ovb")
+_CAPTURE_IDS = itertools.count(1)
+
+
+class HotkeyCaptureUnavailableError(Exception):
+    """Raised when the real Windows keyboard hook cannot be started."""
+
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    """The cross-platform ctypes shape of Win32 ``KBDLLHOOKSTRUCT``."""
+
+    _fields_ = [
+        ("vkCode", ctypes.c_uint32),
+        ("scanCode", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("time", ctypes.c_uint32),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+_DIRECTIONAL_VK_TO_TOKEN = {
+    0xA0: "lshift",
+    0xA1: "rshift",
+    0xA2: "lctrl",
+    0xA3: "rctrl",
+    0xA4: "lalt",
+    0xA5: "ralt",
+    0x5B: "lwin",
+    0x5C: "rwin",
+}
+
+# If a low-level hook reports a generic modifier VK, its scan code and E0
+# flag still identify the side. This fallback also covers keyboard layouts or
+# drivers that do not emit VK_L*/VK_R* for the modifier event.
+_GENERIC_MODIFIER_BY_PHYSICAL_KEY: Dict[Tuple[int, bool], str] = {
+    (0x2A, False): "lshift",
+    (0x36, False): "rshift",
+    (0x1D, False): "lctrl",
+    (0x1D, True): "rctrl",
+    (0x38, False): "lalt",
+    (0x38, True): "ralt",
+}
+
+_GENERIC_MODIFIER_VKS = {0x10, 0x11, 0x12}
+
+
+def token_for_keyboard_event(vk_code: int, scan_code: int, flags: int) -> str:
+    """Return the lossless token used by the mapping parser for one VK edge.
+
+    Directional modifiers are always returned as ``l*``/``r*`` tokens. A VK
+    not in the friendly table is represented as ``vk_XX``; win32_keys.py
+    resolves that form back to the original virtual-key code at runtime.
+    """
+
+    vk = int(vk_code)
+    if not 0 <= vk <= 0xFF:
+        return "unsupported_key"
+    scan = int(scan_code) & 0xFF
+    is_extended = bool(int(flags) & LLKHF_EXTENDED)
+    if vk == 0x0D and is_extended:
+        # The current persisted/send model has no extended Enter identity.
+        # Keep an explicit unsupported token; never silently record main Enter.
+        return "numpad_enter"
+    keypad = win32_keys.KEYPAD_NAVIGATION_KEYS.get(vk)
+    if keypad is not None and scan == keypad[1] and not is_extended:
+        return keypad[0]
+    if vk in _DIRECTIONAL_VK_TO_TOKEN:
+        return _DIRECTIONAL_VK_TO_TOKEN[vk]
+    if vk in _GENERIC_MODIFIER_VKS:
+        token = _GENERIC_MODIFIER_BY_PHYSICAL_KEY.get((scan, is_extended))
+        if token is not None:
+            return token
+    return win32_keys.key_token_for_vk(vk)
+
+
+CaptureCallback = Callable[[str], None]
+
+
+class HotkeyCapture:
+    """Own one short-lived global low-level keyboard hook."""
+
+    def __init__(
+        self,
+        on_captured: CaptureCallback,
+        *,
+        accept_injected: bool = False,
+        isolated: bool = False,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Create a recorder; injected input is accepted only by explicit opt-in."""
+
+        self._on_captured = on_captured
+        self._accept_injected = bool(accept_injected)
+        self._isolated = bool(isolated)
+        self._on_error = on_error
+        self._process_capture = None
+        self._thread: Optional[threading.Thread] = None
+        self._thread_id = 0
+        self._hook = None
+        self._hookproc_keepalive = None
+        self._ready_event = threading.Event()
+        self._stop_event = threading.Event()
+        self._start_error: Optional[BaseException] = None
+        self._state_lock = threading.Lock()
+        self._tokens: List[str] = []
+        self._pressed_tokens: Set[str] = set()
+        self._passthrough_vks: Set[int] = set()
+        self._reset_diagnostics()
+
+    def _reset_diagnostics(self) -> None:
+        # Only counters and fixed stages: never retain key data or exception text.
+        # The callback updates memory only; summaries are logged outside it.
+        self._diagnostics = dict(
+            capture_id=next(_CAPTURE_IDS), thread_id=0,
+            worker_stage="not_started", worker_error_stage="none",
+            worker_error_type="none", message_calls=0, message_result=None,
+            callback_entries=0, callback_returns=0, callback_errors=0,
+            callback_stage="not_entered", first_error_stage="none",
+            first_error_type="none", suppressed_events=0, forwarded_events=0,
+            result_deliveries=0, result_delivery_errors=0,
+            unhook_succeeded=None, unhook_error_type="none",
+            diagnostic_log_errors=0, diagnostic_log_error_type="none",
+        )
+
+    def _remember_callback_error(self, exc: BaseException) -> None:
+        state = self._diagnostics
+        if state["first_error_type"] == "none":
+            state["first_error_stage"] = state["callback_stage"]
+            state["first_error_type"] = type(exc).__name__
+
+    def _log_diagnostics(self, reason: str) -> None:
+        # No recorder lock: a stop timeout must still describe a stuck callback.
+        # A broken logging path must not hide the original failure or stop cleanup.
+        state = self._diagnostics.copy()
+        state["stop_requested"] = self._stop_event.is_set()
+        failed = (state["callback_errors"] or state["result_delivery_errors"]
+                  or state["worker_error_type"] != "none"
+                  or state["message_result"] == -1
+                  or state["unhook_succeeded"] is False
+                  or state["diagnostic_log_errors"]
+                  or reason in ("start_timeout", "stop_timeout", "start_error"))
+        try:
+            _LOGGER.log(
+                logging.ERROR if failed else logging.INFO,
+                "settings hotkey capture: diagnostics reason=%s state=%s",
+                reason, json.dumps(state, separators=(",", ":")),
+                extra={"failure_key": "hotkey_capture_diagnostics" if failed else ""},
+            )
+        except Exception as exc:
+            self._diagnostics["diagnostic_log_errors"] += 1
+            self._diagnostics["diagnostic_log_error_type"] = type(exc).__name__
+
+    @property
+    def is_running(self) -> bool:
+        if self._process_capture is not None:
+            return self._process_capture.is_running
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(
+        self,
+        *,
+        start_timeout: float = 5.0,
+        _run_target: Optional[Callable[[], None]] = None,
+    ) -> None:
+        if self._isolated and _run_target is None:
+            from .hotkey_capture_process import ProcessCapture
+            if self._process_capture is None:
+                self._process_capture = ProcessCapture(
+                    self._on_captured, accept_injected=self._accept_injected,
+                    on_error=self._on_error,
+                )
+            self._process_capture.start(start_timeout=start_timeout)
+            return
+        if _run_target is None and sys.platform != "win32":
+            raise HotkeyCaptureUnavailableError(
+                "keyboard shortcut capture is only available on Windows"
+            )
+        if self.is_running:
+            raise HotkeyCaptureUnavailableError(
+                "keyboard shortcut capture is already running"
+            )
+        with self._state_lock:
+            self._tokens.clear()
+            self._pressed_tokens.clear()
+            self._passthrough_vks.clear()
+        self._ready_event.clear()
+        self._stop_event.clear()
+        self._start_error = None
+        self._reset_diagnostics()
+        self._thread = threading.Thread(target=_run_target or self._run, daemon=True)
+        self._thread.start()
+        if not self._ready_event.wait(timeout=start_timeout):
+            self._stop_event.set()
+            self._post_quit()
+            self._join_thread_or_report_alive()
+            self._log_diagnostics("start_timeout")
+            raise HotkeyCaptureUnavailableError(
+                f"keyboard shortcut capture did not start within {start_timeout}s"
+            )
+        if self._start_error is not None:
+            error = self._start_error
+            self._stop_event.set()
+            self._post_quit()
+            self._join_thread_or_report_alive()
+            self._log_diagnostics("start_error")
+            raise HotkeyCaptureUnavailableError(str(error)) from error
+        self._log_diagnostics("ready")
+
+    def _join_thread_or_report_alive(self) -> bool:
+        thread = self._thread
+        if thread is None:
+            return True
+        thread.join(timeout=_STOP_JOIN_TIMEOUT_SECONDS)
+        if thread.is_alive():
+            return False
+        self._thread = None
+        self._thread_id = 0
+        return True
+
+    def stop(self) -> None:
+        if self._process_capture is not None:
+            self._process_capture.stop()
+            return
+        thread = self._thread
+        if thread is None:
+            return
+        self._stop_event.set()
+        self._post_quit()
+        if not self._join_thread_or_report_alive():
+            self._log_diagnostics("stop_timeout")
+            raise HotkeyCaptureUnavailableError(
+                "keyboard shortcut capture did not stop within the bounded timeout"
+            )
+
+    def _post_quit(self) -> None:
+        if not self._thread_id:
+            return
+        try:
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            user32.PostThreadMessageW.argtypes = (
+                wintypes.DWORD,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+            user32.PostThreadMessageW.restype = wintypes.BOOL
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+        except Exception:
+            # The bounded join in stop() remains the authoritative failure
+            # signal. A hook thread that has not received WM_QUIT is never
+            # silently reported as stopped.
+            pass
+
+    def _complete_capture(self) -> None:
+        self._diagnostics["callback_stage"] = "complete_capture"
+        with self._state_lock:
+            if not self._tokens or self._pressed_tokens:
+                return
+            chord = "+".join(self._tokens)
+            self._tokens.clear()
+        self._stop_event.set()
+        self._post_quit()
+        self._diagnostics["callback_stage"] = "deliver_result"
+        try:
+            self._on_captured(chord)
+            self._diagnostics["result_deliveries"] += 1
+        except Exception as exc:
+            # A GUI receiver may be in teardown. The hook itself must still
+            # unwind and unhook; the controller owns user-visible reporting.
+            self._diagnostics["result_delivery_errors"] += 1
+            self._remember_callback_error(exc)
+
+    def _handle_event(self, message: int, data: KBDLLHOOKSTRUCT) -> bool:
+        self._diagnostics["callback_stage"] = "filter_event"
+        if self._stop_event.is_set():
+            return False
+        if int(data.flags) & LLKHF_INJECTED:
+            # Chatterfly's hook health probes use the reserved VK_NONAME.
+            # Forward both edges so its health check still completes; this is
+            # not a user key, even when remote keyboard input is accepted.
+            if not self._accept_injected or int(data.vkCode) == VK_NONAME:
+                return False
+        is_down = message in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        is_up = message in (WM_KEYUP, WM_SYSKEYUP) or bool(
+            int(data.flags) & LLKHF_UP
+        )
+        if not (is_down or is_up):
+            return False
+        # Escape belongs to the focused settings field's cancel action. Let
+        # Qt receive both edges instead of recording Escape as a shortcut.
+        if int(data.vkCode) == VK_ESCAPE:
+            return False
+
+        self._diagnostics["callback_stage"] = "log_event"
+        _LOGGER.info(
+            "settings hotkey capture: hook event edge=%s injected=%s",
+            "down" if is_down else "up",
+            bool(int(data.flags) & LLKHF_INJECTED),
+        )
+
+        self._diagnostics["callback_stage"] = "decode_token"
+        token = token_for_keyboard_event(data.vkCode, data.scanCode, data.flags)
+        owns_event = False
+        self._diagnostics["callback_stage"] = "update_state"
+        with self._state_lock:
+            vk_code = int(data.vkCode)
+            if vk_code in self._passthrough_vks:
+                if is_up:
+                    self._passthrough_vks.discard(vk_code)
+                return False
+            if is_down:
+                owns_event = True
+                if token not in self._pressed_tokens:
+                    self._pressed_tokens.add(token)
+                    self._tokens.append(token)
+            elif token in self._pressed_tokens:
+                owns_event = True
+                self._pressed_tokens.remove(token)
+        if is_up and owns_event:
+            self._complete_capture()
+        return owns_event
+
+    def _run(self) -> None:
+        user32 = None
+        hook = None
+        state = self._diagnostics
+        try:
+            state["worker_stage"] = "setup"
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.GetCurrentThreadId.argtypes = ()
+            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+            self._thread_id = int(kernel32.GetCurrentThreadId())
+            state["thread_id"] = self._thread_id
+            lresult = ctypes.c_ssize_t
+            hookproc_type = ctypes.WINFUNCTYPE(
+                lresult,
+                ctypes.c_int,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+
+            user32.PeekMessageW.argtypes = (
+                ctypes.POINTER(wintypes.MSG),
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.UINT,
+                wintypes.UINT,
+            )
+            user32.PeekMessageW.restype = wintypes.BOOL
+            user32.GetMessageW.argtypes = (
+                ctypes.POINTER(wintypes.MSG),
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.UINT,
+            )
+            user32.GetMessageW.restype = ctypes.c_int
+            user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
+            user32.TranslateMessage.restype = wintypes.BOOL
+            user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+            user32.DispatchMessageW.restype = lresult
+            user32.SetWindowsHookExW.argtypes = (
+                ctypes.c_int,
+                hookproc_type,
+                wintypes.HINSTANCE,
+                wintypes.DWORD,
+            )
+            user32.SetWindowsHookExW.restype = wintypes.HHOOK
+            user32.CallNextHookEx.argtypes = (
+                wintypes.HHOOK,
+                ctypes.c_int,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+            user32.CallNextHookEx.restype = lresult
+            user32.UnhookWindowsHookEx.argtypes = (wintypes.HHOOK,)
+            user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+            user32.GetAsyncKeyState.argtypes = (ctypes.c_int,)
+            user32.GetAsyncKeyState.restype = ctypes.c_short
+            kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
+            kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+            def hook_proc(n_code, w_param, l_param):
+                # Enter before parsing, logging, or acquiring the recorder lock.
+                state["callback_entries"] += 1
+                state["callback_stage"] = "entry"
+                try:
+                    captured = False
+                    if n_code >= 0:
+                        state["callback_stage"] = "read_event"
+                        data = ctypes.cast(
+                            l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)
+                        ).contents
+                        captured = self._handle_event(int(w_param), data)
+                    if captured:
+                        state["suppressed_events"] += 1
+                        result = 1
+                    else:
+                        state["callback_stage"] = "forward_event"
+                        result = user32.CallNextHookEx(hook, n_code, w_param, l_param)
+                        state["forwarded_events"] += 1
+                except BaseException as exc:  # preserve ctypes' existing exception boundary
+                    state["callback_errors"] += 1
+                    self._remember_callback_error(exc)
+                    state["callback_stage"] = "error"
+                    raise
+                else:
+                    state["callback_returns"] += 1
+                    state["callback_stage"] = "returned"
+                    return result
+
+            # Low-level hooks are delivered through the installing thread's
+            # message queue. Create that queue with a real writable MSG before
+            # registering the hook; a NULL lpMsg does not establish a valid
+            # queue and can leave SetWindowsHookExW looking successful while
+            # no keyboard callback is ever dispatched.
+            msg = wintypes.MSG()
+            user32.PeekMessageW(
+                ctypes.byref(msg),
+                None,
+                0,
+                0,
+                PM_NOREMOVE,
+            )
+            self._hookproc_keepalive = hookproc_type(hook_proc)
+            state["worker_stage"] = "install_hook"
+            hook = user32.SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                self._hookproc_keepalive,
+                kernel32.GetModuleHandleW(None),
+                0,
+            )
+            if not hook:
+                raise ctypes.WinError()
+            self._hook = hook
+            state["worker_stage"] = "snapshot_preheld"
+            # The foreground application already owns keys that were held
+            # before this hook existed. Pass their repeats and matching key-up
+            # through until release instead of adopting half of the hold.
+            with self._state_lock:
+                self._passthrough_vks.update(
+                    vk_code
+                    for vk_code in range(1, 256)
+                    if user32.GetAsyncKeyState(vk_code) & 0x8000
+                )
+            self._ready_event.set()
+
+            while not self._stop_event.is_set():
+                state["worker_stage"] = "message_wait"
+                state["message_calls"] += 1
+                result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                state["message_result"] = int(result)
+                if result in (0, -1):
+                    break
+                state["worker_stage"] = "dispatch_message"
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except BaseException as exc:  # noqa: BLE001 - surfaced by start()
+            state["worker_error_stage"] = state["worker_stage"]
+            state["worker_error_type"] = type(exc).__name__
+            self._start_error = exc
+            self._ready_event.set()
+        finally:
+            state["worker_stage"] = "unhook"
+            if user32 is not None and hook:
+                try:
+                    state["unhook_succeeded"] = bool(user32.UnhookWindowsHookEx(hook))
+                except Exception as exc:
+                    state["unhook_succeeded"] = False
+                    state["unhook_error_type"] = type(exc).__name__
+            self._hook = None
+            self._hookproc_keepalive = None
+            self._ready_event.set()
+            state["worker_stage"] = "exiting"
+            self._log_diagnostics("thread_exit")

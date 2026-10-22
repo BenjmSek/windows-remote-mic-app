@@ -1,0 +1,172 @@
+"""User-requested ZIP of existing diagnostic logs, never config or recordings."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import stat
+import tempfile
+import threading
+import zipfile
+
+from . import __version__, diagnostic_trace, logging_setup
+
+# Bound older logs from previous versions without changing the source files.
+MAX_FILE_BYTES = 512 * 1024
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    outcome: str
+    path: Path | None = None
+    file_count: int = 0
+    incomplete: bool = False
+
+
+def default_filename() -> str:
+    return datetime.now().strftime('无线麦Mod日志-%Y%m%d-%H%M%S.zip')
+
+
+def _log_names() -> tuple[str, ...]:
+    names = []
+    for name, backups in ((logging_setup.LOG_FILENAME, logging_setup.LOG_BACKUP_COUNT),
+                          (diagnostic_trace.TRACE_FILENAME, diagnostic_trace.TRACE_BACKUP_COUNT)):
+        # Old-version history is read-only here; its writer retires it on rotation.
+        retained = max(backups, logging_setup.LEGACY_LOG_BACKUP_COUNT)
+        names.extend([name] + [f'{name}.{i}' for i in range(1, retained + 1)])
+    helper = logging_setup.HID_HELPER_LOG_FILENAME
+    return (*names, helper,
+            *(f'{helper}.{i}' for i in range(1, logging_setup.HID_HELPER_LOG_BACKUP_COUNT + 1)),
+            diagnostic_trace.REPORT_FILENAME)
+
+
+def _snapshot(path: Path) -> tuple[bytes, dict]:
+    before = path.lstat()
+    if (not stat.S_ISREG(before.st_mode)
+            or getattr(before, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise OSError('unsupported_log_file')
+    with path.open('rb') as source:
+        opened = os.fstat(source.fileno())
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise OSError('log_replaced_during_open')
+        limit = (diagnostic_trace.REPORT_MAX_BYTES
+                 if path.name == diagnostic_trace.REPORT_FILENAME else MAX_FILE_BYTES)
+        offset = max(0, opened.st_size - limit)
+        source.seek(offset)
+        content = source.read(min(opened.st_size, limit))
+        after = os.fstat(source.fileno())
+    # A truncated text log starts at its first complete line, not in a UTF-8 character.
+    if offset and path.name != diagnostic_trace.REPORT_FILENAME:
+        newline = content.find(b'\n')
+        content = content[newline + 1:] if newline >= 0 else b''
+    return content, dict(source_bytes=opened.st_size, exported_bytes=len(content),
+                         truncated=bool(offset), modified_ns=opened.st_mtime_ns,
+                         _identity=(opened.st_dev, opened.st_ino),
+                         changed_during_read=(after.st_size, after.st_mtime_ns)
+                         != (opened.st_size, opened.st_mtime_ns))
+
+
+def _file_state(path: Path):
+    """Compare names after the whole collection, including missing/new files."""
+    try:
+        info = path.lstat()
+        if (not stat.S_ISREG(info.st_mode)
+                or getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            return 'unreadable'
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    except FileNotFoundError:
+        return 'missing'
+    except OSError:
+        return 'unreadable'
+
+
+def export_logs(destination: Path, *, root: Path | None = None,
+                cancel: threading.Event | None = None) -> ExportResult:
+    """Replace only the selected ZIP, atomically after success; keep original logs intact."""
+    destination = Path(destination)
+    if not destination.is_absolute() or destination.suffix.casefold() != '.zip':
+        return ExportResult('invalid_destination')
+    cancelled = cancel.is_set if cancel is not None else lambda: False
+    temporary = None
+    try:
+        if cancelled():
+            return ExportResult('cancelled')
+        directory = logging_setup.log_dir(root)
+        # Flush what already arrived; do not wait for the post-failure window.
+        application_flushed = logging_setup.flush_application_logs(directory)
+        diagnostic_flushed = diagnostic_trace.flush_diagnostic_logs(directory)
+        report_flushed = diagnostic_trace.flush_fault_report(directory)
+        # A rotation can move an already-read file into a later backup slot.
+        # Retry the entire bounded collection once; never lock the live writers
+        # or silently call an unstable second collection complete.
+        for attempt in range(1, 3):
+            records, captured, states = [], [], {}
+            for name in _log_names():
+                if cancelled():
+                    return ExportResult('cancelled')
+                try:
+                    content, metadata = _snapshot(directory / name)
+                except FileNotFoundError:
+                    states[name] = 'missing'
+                    records.append(dict(name=name, status='missing'))
+                    continue
+                except OSError:
+                    states[name] = 'unreadable'
+                    records.append(dict(name=name, status='unreadable'))
+                    continue
+                states[name] = (*metadata.pop('_identity'), metadata['source_bytes'], metadata['modified_ns'])
+                records.append(dict(name=name, status='included', **metadata))
+                captured.append((name, content))
+            stable = all(_file_state(directory / name) == state for name, state in states.items())
+            stable = stable and not any(r.get('changed_during_read') for r in records)
+            if stable:
+                break
+        incomplete = not all((application_flushed, diagnostic_flushed, report_flushed, stable)) or any(
+            r['status'] == 'unreadable' or r.get('truncated') or r.get('changed_during_read')
+            for r in records)
+        if not any(content for _, content in captured):
+            return ExportResult('read_failed' if incomplete else 'no_logs')
+        manifest = dict(schema_version=1, app_version=__version__,
+                        incomplete=incomplete, snapshot_stable=stable, snapshot_attempts=attempt,
+                        fault_report_flushed=report_flushed,
+                        application_log_flushed=application_flushed,
+                        diagnostic_trace_flushed=diagnostic_flushed,
+                        exported_at=datetime.now().astimezone().isoformat(),
+                        snapshot='bounded_live_files_not_atomic', files=records,
+                        includes_configuration=False, includes_recordings=False)
+        with tempfile.NamedTemporaryFile(prefix='.remote-mic-logs-', suffix='.tmp',
+                                         dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+        with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED, compresslevel=3) as archive:
+            for name, content in captured:
+                if cancelled():
+                    return ExportResult('cancelled')
+                archive.writestr(name, content)
+            archive.writestr('export-info.json', json.dumps(manifest, ensure_ascii=False, indent=2))
+        if cancelled():
+            return ExportResult('cancelled')
+        os.replace(temporary, destination)
+        return ExportResult('exported', destination, len(captured), incomplete)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        return ExportResult('write_failed')
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def describe_result(result: ExportResult) -> str:
+    if result.outcome == 'exported':
+        note = '；部分日志未能完整保存或读取，详情见包内说明' if result.incomplete else ''
+        return f'已导出 {result.file_count} 个日志文件：{result.path}{note}'
+    return {
+        'no_logs': '暂无可导出的日志。请先运行服务，复现问题后再导出。',
+        'read_failed': '日志暂时无法读取，请稍后重试。',
+        'invalid_destination': '请选择一个 ZIP 文件保存位置。',
+        'cancelled': '已取消日志导出。',
+        'write_failed': '日志导出失败，请检查保存位置是否可写、磁盘空间是否充足后重试。',
+    }.get(result.outcome, '日志导出失败，请重试。')

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Build / packaging
+.build/
+build/
+dist/
+*.egg-info/
+
+# Runtime state written by the app.  config/ is NOT ignored wholesale: the
+# shipped device profile chromecast-remote.json lives there and belongs in the
+# release.  Everything else in config/ is user state - see below.
+config/*
+!config/chromecast-remote.json
+config/runtime/
+config/key-detection/
+log/
+
+# Written by scripts/run_tests.py; machine-specific timings.
+scripts/.test-timings.json
+
+# Local diagnostics and exported bundles
+*.log
+diagnostic-trace.jsonl
+audit-bundle/
+audit-bundle-*/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local project-control records are not part of the public source release.
+AGENTS.md
+CLAUDE.md
+.codex/

@@ -1,0 +1,338 @@
+"""Tests logging_setup.py's log-location helpers: the canonical
+path functions must never create anything as a side effect of merely being
+asked a question, and open_log_location() must give an honest answer for a
+directory/file that does not exist yet rather than fabricating one - all
+exercised against real tmp directories (no mocking needed for pure
+filesystem checks) plus an injected ``_open_directory`` for the one actual
+OS-facing call, the same dependency-injection pattern
+tests/test_bridge_launcher.py uses for subprocess.Popen.
+"""
+
+import tempfile
+import unittest
+import logging
+import threading
+import time
+from pathlib import Path
+from unittest import mock
+
+from ovb import dev_session, diagnostic_trace, logging_setup
+
+
+class LogPathHelpersTests(unittest.TestCase):
+    def test_log_dir_is_logs_under_the_given_root(self):
+        # Pinned to a packaged launch: a portable one redirects every log to
+        # the workspace log directory and ignores the root on purpose, so the
+        # ``root/logs`` mapping below is only what an installed build does.
+        with mock.patch.object(
+            dev_session, "portable_log_root", return_value=None
+        ):
+            root = Path("/tmp/example-root")
+            self.assertEqual(logging_setup.log_dir(root), root / "logs")
+
+    def test_log_file_path_is_app_log_under_log_dir(self):
+        with mock.patch.object(
+            dev_session, "portable_log_root", return_value=None
+        ):
+            root = Path("/tmp/example-root")
+            self.assertEqual(
+                logging_setup.log_file_path(root), root / "logs" / "app.log"
+            )
+
+    def test_portable_launch_sends_every_root_to_the_workspace_log_directory(self):
+        workspace_log = Path("/tmp/workspace-log")
+        with mock.patch.object(
+            dev_session,
+            "portable_log_root",
+            return_value=workspace_log,
+        ):
+            self.assertEqual(logging_setup.log_dir(None), workspace_log)
+            self.assertEqual(logging_setup.log_dir(Path("/tmp/other")), workspace_log)
+            self.assertEqual(
+                logging_setup.log_file_path(Path("/tmp/other")),
+                workspace_log / "app.log",
+            )
+
+    def test_log_dir_does_not_create_anything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "not-created-yet"
+            logging_setup.log_dir(root)
+            logging_setup.log_file_path(root)
+        self.assertFalse(root.exists())
+
+
+class PersistentLogPrivacyTests(unittest.TestCase):
+    def test_native_exception_text_and_traceback_are_removed(self):
+        record = logging.LogRecord(
+            name="ovb",
+            level=logging.ERROR,
+            pathname=__file__,
+            lineno=1,
+            msg="native operation failed: %s",
+            args=(RuntimeError("sensitive device interface detail"),),
+            exc_info=None,
+        )
+        try:
+            raise RuntimeError("sensitive traceback detail")
+        except RuntimeError:
+            import sys
+
+            record.exc_info = sys.exc_info()
+
+        self.assertTrue(logging_setup.PrivacySafeExceptionFilter().filter(record))
+        rendered = logging.Formatter("%(message)s").format(record)
+
+        self.assertEqual(rendered, "native operation failed: RuntimeError")
+        self.assertNotIn("sensitive", rendered)
+        self.assertIsNone(record.exc_info)
+
+    def test_logger_uses_bounded_rotation(self):
+        self.assertEqual(logging_setup.LOG_MAX_BYTES, 512 * 1024)
+        self.assertEqual(logging_setup.LOG_BACKUP_COUNT, 1)
+        self.assertEqual(logging_setup.HID_HELPER_LOG_MAX_BYTES, 512 * 1024)
+        self.assertEqual(logging_setup.HID_HELPER_LOG_BACKUP_COUNT, 1)
+        self.assertEqual(diagnostic_trace.TRACE_MAX_BYTES, 512 * 1024)
+        self.assertEqual(diagnostic_trace.TRACE_BACKUP_COUNT, 1)
+
+    def test_one_shot_hid_event_is_sanitized_and_closes_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertTrue(
+                logging_setup.write_parent_hid_helper_event(
+                    "setup_result",
+                    available=False,
+                    detail=r"C:\private\device path",
+                    root=root,
+                )
+            )
+            log_path = logging_setup.hid_helper_log_file_path(root)
+            text = log_path.read_text(encoding="utf-8")
+            self.assertIn("event=setup_result", text)
+            self.assertIn("available=false", text)
+            self.assertIn("detail=invalid_detail", text)
+            self.assertNotIn("private", text)
+
+            moved = log_path.with_name("moved.log")
+            log_path.rename(moved)
+            moved.unlink()
+
+    def test_one_shot_hid_event_is_independent_from_an_open_app_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_log = logging_setup.log_file_path(root)
+            app_log.parent.mkdir(parents=True)
+            with app_log.open("w", encoding="utf-8") as app_stream:
+                app_stream.write("main app still running\n")
+                self.assertTrue(
+                    logging_setup.write_parent_hid_helper_event(
+                        "setup_result",
+                        available=False,
+                        detail="hid_helper_setup_timeout",
+                        root=root,
+                    )
+                )
+
+            helper_log = logging_setup.hid_helper_log_file_path(root)
+            self.assertIn(
+                "detail=hid_helper_setup_timeout",
+                helper_log.read_text(encoding="utf-8"),
+            )
+
+    def test_concurrent_first_use_installs_only_one_handler(self):
+        class FakeHandler:
+            def addFilter(self, _filter):
+                return None
+
+            def setFormatter(self, _formatter):
+                return None
+
+        class FakeLogger:
+            def __init__(self):
+                self.handlers = []
+
+            def setLevel(self, _level):
+                return None
+
+            def addHandler(self, handler):
+                self.handlers.append(handler)
+
+        fake_logger = FakeLogger()
+        handler_calls = []
+        errors = []
+        start = threading.Barrier(12)
+
+        def handler_factory(*_args, **_kwargs):
+            handler_calls.append(1)
+            time.sleep(0.02)
+            return FakeHandler()
+
+        original_configured = logging_setup._configured
+        logging_setup._configured = False
+        try:
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+                logging_setup.logging,
+                "getLogger",
+                return_value=fake_logger,
+            ), mock.patch.object(
+                logging_setup,
+                "EvidenceFileHandler",
+                side_effect=handler_factory,
+            ):
+                def configure_logger():
+                    try:
+                        start.wait()
+                        logging_setup.get_logger(Path(tmp))
+                    except Exception as exc:
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=configure_logger)
+                    for _ in range(start.parties)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2.0)
+
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(handler_calls), 1)
+            self.assertEqual(len(fake_logger.handlers), 1)
+        finally:
+            logging_setup._configured = original_configured
+
+
+class DescribeLogLocationTests(unittest.TestCase):
+    def test_directory_missing_when_root_never_existed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "never-run"
+            location = logging_setup.describe_log_location(root)
+            self.assertEqual(
+                location.status, logging_setup.LogLocationStatus.DIRECTORY_MISSING
+            )
+            self.assertEqual(location.directory, logging_setup.log_dir(root))
+
+    def test_file_missing_when_directory_exists_but_no_app_log_yet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logging_setup.log_dir(root).mkdir()
+            location = logging_setup.describe_log_location(root)
+            self.assertEqual(
+                location.status, logging_setup.LogLocationStatus.FILE_MISSING
+            )
+
+    def test_ready_when_both_directory_and_file_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_dir = logging_setup.log_dir(root)
+            log_dir.mkdir(parents=True)
+            (log_dir / "app.log").write_text("hello\n", encoding="utf-8")
+            location = logging_setup.describe_log_location(root)
+            self.assertEqual(location.status, logging_setup.LogLocationStatus.READY)
+
+    def test_ready_when_only_the_hid_helper_log_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            helper_log = logging_setup.hid_helper_log_file_path(root)
+            helper_log.parent.mkdir()
+            helper_log.write_text("helper failure\n", encoding="utf-8")
+
+            location = logging_setup.describe_log_location(root)
+
+            self.assertEqual(location.status, logging_setup.LogLocationStatus.READY)
+            self.assertEqual(location.file_path, helper_log)
+
+    def test_never_creates_the_directory_it_is_only_describing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "still-never-run"
+            logging_setup.describe_log_location(root)
+            self.assertFalse(root.exists())
+
+
+class OpenLogLocationTests(unittest.TestCase):
+    def test_directory_missing_never_calls_open_and_is_reported_honestly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "never-run"
+            open_calls = []
+
+            result = logging_setup.open_log_location(
+                root, _open_directory=lambda directory: open_calls.append(directory)
+            )
+
+            self.assertEqual(
+                result.outcome, logging_setup.LogOpenOutcome.DIRECTORY_MISSING
+            )
+            self.assertEqual(open_calls, [])
+            # No fake log/directory was fabricated to make this "succeed".
+            self.assertFalse(root.exists())
+
+    def test_existing_directory_is_opened_and_reports_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_dir = logging_setup.log_dir(root)
+            log_dir.mkdir(parents=True)
+            (log_dir / "app.log").write_text("hello\n", encoding="utf-8")
+            open_calls = []
+
+            result = logging_setup.open_log_location(
+                root, _open_directory=lambda directory: open_calls.append(directory)
+            )
+
+            self.assertEqual(result.outcome, logging_setup.LogOpenOutcome.OPENED)
+            self.assertEqual(open_calls, [log_dir])
+            self.assertEqual(
+                result.location.status, logging_setup.LogLocationStatus.READY
+            )
+
+    def test_directory_exists_without_app_log_still_opens_and_flags_file_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logging_setup.log_dir(root).mkdir(parents=True)
+            open_calls = []
+
+            result = logging_setup.open_log_location(
+                root, _open_directory=lambda directory: open_calls.append(directory)
+            )
+
+            self.assertEqual(result.outcome, logging_setup.LogOpenOutcome.OPENED)
+            self.assertEqual(len(open_calls), 1)
+            self.assertEqual(
+                result.location.status, logging_setup.LogLocationStatus.FILE_MISSING
+            )
+
+    def test_open_call_raising_is_reported_as_open_failed_not_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logging_setup.log_dir(root).mkdir(parents=True)
+
+            def raising_open(directory):
+                raise OSError("no shell association available")
+
+            result = logging_setup.open_log_location(root, _open_directory=raising_open)
+
+            self.assertEqual(result.outcome, logging_setup.LogOpenOutcome.OPEN_FAILED)
+            self.assertIn("no shell association available", result.error)
+
+    def test_default_open_directory_raises_cleanly_when_startfile_is_unavailable(self):
+        # Proves the off-Windows fallback path (os.startfile does not exist
+        # on macOS/Linux) raises a clear OSError rather than an
+        # AttributeError - exercised via the real _default_open_directory,
+        # with os.startfile itself monkeypatched away for this one test.
+        import os
+
+        from ovb import logging_setup as module_under_test
+
+        had_startfile = hasattr(os, "startfile")
+        original = getattr(os, "startfile", None)
+        if had_startfile:
+            del os.startfile
+        try:
+            with self.assertRaises(OSError):
+                module_under_test._default_open_directory(Path("/tmp"))
+        finally:
+            if had_startfile:
+                os.startfile = original
+
+
+if __name__ == "__main__":
+    unittest.main()

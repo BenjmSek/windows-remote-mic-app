@@ -1,0 +1,14804 @@
+"""Qt-gated tests for qt_settings_app.py: ButtonMappingModel,
+SettingsController, and an offscreen load of the real main.qml. Every test
+class here self-skips with an explicit reason if PySide6-Essentials is not
+installed - same "skip with reason, never silently pass" convention as
+tests/windows/test_windows_only.py, except gated on PySide6 availability
+rather than the host OS, since these are meant to run for REAL wherever Qt
+is actually installed (including the real Windows CI runner, now that
+PySide6-Essentials is a pinned requirement - see requirements.txt).
+
+No real Windows device or real BLE/HID/audio hardware is ever touched here:
+bridge_launcher.launch_bridge()/shell_targets.open_external_target() are
+monkeypatched exactly like tests/test_bridge_launcher.py and
+tests/test_shell_targets.py already do at their own layer. Real, disposable
+CHILD PROCESSES are deliberately spawned by some tests below:
+DiagnosticsController's real BLE candidate check now runs its
+discovery in a genuinely separate OS process (see windows_diagnostics.py's
+"-- BLE candidate --" section) - this file's own shutdown/probe tests
+exercise that real process boundary rather than mocking it away, since the
+whole point of that design is a real, OS-confirmed hard bound this project
+cannot prove any other way.
+"""
+
+import json
+import logging
+import os
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from ovb import (
+    audio_output,
+    bridge_control_windows,
+    bridge_launcher,
+    bridge_runtime_status,
+    config,
+    device_catalog,
+    frida_compat,
+    hotkey,
+    key_detection_bridge,
+    key_mapping,
+    product_identity,
+    qt_settings_app,
+    remote_layout,
+    settings_ui,
+    shell_targets,
+    single_instance,
+    vb_cable_bundle,
+    voice_program_manager,
+    windows_diagnostics,
+)
+
+
+def _has_pyside6() -> bool:
+    try:
+        import PySide6.QtCore  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+_HAS_PYSIDE6 = _has_pyside6()
+
+if _HAS_PYSIDE6:
+    # Must be set before any QGuiApplication is constructed anywhere in this
+    # process - a real display server/compositor is neither available nor
+    # wanted in a test run (matches how this task's own isolated-venv
+    # screenshot step invokes the same app code). ``qt_settings_app`` itself
+    # is already imported unconditionally above (importing it never
+    # requires PySide6 - only actually calling ``_load_qt_classes()``/
+    # constructing a QGuiApplication does, both of which only happen later,
+    # inside test methods, after this env var is already set).
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    # Every test below that needs to drive a real QQmlApplicationEngine/QML
+    # window (load, click, type, render) does so inside an isolated
+    # subprocess - see _QML_LOAD_PROBE_SCRIPT/_DIRECT_AUTO_SAVE_PROBE_SCRIPT/
+    # _CONTRAST_PROBE_SCRIPT below for why: QQuickStyle is a process-global,
+    # set-once setting, and separately, multiple QQmlApplicationEngine
+    # instances loading Qt Quick Controls QML within one process turned out
+    # to conflict over other internal per-style singletons too (both
+    # reproduced empirically while writing these tests). This module's own
+    # process therefore never needs to import PySide6's GUI/QML/Test
+    # classes directly - only ``qt_settings_app`` itself, for the
+    # ButtonMappingModel/SettingsController unit tests above, which never
+    # construct a QQmlApplicationEngine at all.
+
+
+_SKIP_REASON = "PySide6-Essentials not installed - Qt settings UI not verified here"
+
+
+class DiagnosticsThreadLifecycleAtExitTests(unittest.TestCase):
+    """Pure-Python coverage of the diagnostics worker-thread registry and
+    its atexit join hook - deliberately NOT gated on PySide6 (importing
+    ``qt_settings_app`` never requires it), since none of this touches Qt at
+    all. Proves the atexit hook is a genuinely
+    BOUNDED, best-effort courtesy - never a guarantee every tracked thread
+    has actually stopped - matching the corrected module docstring.
+    """
+
+    def test_join_at_exit_is_bounded_and_returns_even_if_a_thread_never_finishes(self):
+        blocker = threading.Event()
+        thread = threading.Thread(target=blocker.wait, daemon=True)
+        qt_settings_app._remember_diagnostics_thread(thread)
+        thread.start()
+        try:
+            # A tiny timeout (not the real 2.0s default) keeps this test
+            # fast without weakening the production default anywhere.
+            with mock.patch.object(
+                qt_settings_app, "_DIAGNOSTICS_THREAD_JOIN_TIMEOUT_SECONDS", 0.05
+            ):
+                started = time.monotonic()
+                qt_settings_app._join_diagnostics_threads_at_exit()
+                elapsed = time.monotonic() - started
+            # The hook must return promptly - it must never block on a
+            # thread that simply never finishes.
+            self.assertLess(elapsed, 2.0)
+            # The thread is genuinely still alive - the join was bounded,
+            # not a guarantee of completion, exactly as documented.
+            self.assertTrue(thread.is_alive())
+        finally:
+            blocker.set()
+            thread.join(timeout=5.0)
+            qt_settings_app._forget_diagnostics_thread(thread)
+
+    def test_join_at_exit_actually_joins_a_thread_that_finishes_in_time(self):
+        release_event = threading.Event()
+        thread = threading.Thread(target=release_event.wait, daemon=True)
+        qt_settings_app._remember_diagnostics_thread(thread)
+        thread.start()
+        release_event.set()
+        try:
+            qt_settings_app._join_diagnostics_threads_at_exit()
+            self.assertFalse(thread.is_alive())
+        finally:
+            qt_settings_app._forget_diagnostics_thread(thread)
+
+    def test_diagnostics_worker_thread_is_created_as_a_daemon_thread(self):
+        # The actual safety property against a process-exit hang: the real
+        # production code's own diagnostics-worker Thread() construction
+        # must pass daemon=True, so CPython itself never waits for it at
+        # interpreter shutdown regardless of what the best-effort atexit
+        # join above managed to join in time. A static source check (no
+        # PySide6 needed) rather than constructing a real DiagnosticsController.
+        from ovb import settings_qt_classes
+        from tests.source_contract import source_text
+
+        source = source_text(settings_qt_classes)
+        self.assertIn('threading.Thread(target=_run_in_background, daemon=True)', source)
+
+    def test_full_exit_budget_covers_background_cleanup_bridge_stop_and_margin(self):
+        minimum = (
+            qt_settings_app._SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS
+            + bridge_control_windows.DEFAULT_EXIT_TIMEOUT_SECONDS
+            + 1.0
+        )
+        self.assertGreaterEqual(
+            qt_settings_app._APPLICATION_EXIT_WAIT_TIMEOUT_SECONDS,
+            minimum,
+        )
+
+
+class DiagnosticsShutdownOrderingTests(unittest.TestCase):
+    """``_join_diagnostics_threads_at_exit`` and
+    ``_release_qt_classes_cache`` used to be registered as two SEPARATE
+    ``atexit`` callbacks -
+    since ``atexit`` runs registered functions in LIFO order, the
+    second-registered function (cache release) actually ran FIRST at real
+    process exit, the reverse of what the module docstring claimed. These
+    tests are deliberately NOT gated on PySide6 (none of this touches Qt -
+    the functions under test are pure Python, and are exercised here via
+    mocks standing in for the real join/cache-release steps).
+    """
+
+    def tearDown(self):
+        # Defensive: no test below should leave this set, but clear it
+        # unconditionally so a failure here never leaks into a later test
+        # in the same process (this is process-global, persistent state).
+        qt_settings_app._diagnostics_shutdown_event.clear()
+
+    def test_module_registers_exactly_one_atexit_shutdown_hook(self):
+        # Guards against silently reintroducing the two-separate-
+        # registrations bug this RETRY fixes: an AST-level count of actual
+        # atexit.register(...) CALL expressions (not a naive substring
+        # count, which would also match this module's own docstring prose
+        # explaining why there is only one) - introspecting the real source
+        # rather than CPython's private atexit internals.
+        import ast
+        from tests.source_contract import source_text
+
+        source = source_text(qt_settings_app)
+        tree = ast.parse(source)
+        register_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "register"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "atexit"
+        ]
+        self.assertEqual(len(register_calls), 1)
+        (call,) = register_calls
+        self.assertEqual(call.args[0].id, "_shutdown_qt_settings_app_at_exit")
+
+    def test_shutdown_at_exit_runs_flag_then_join_then_release_cache_in_order(self):
+        calls = []
+        with mock.patch.object(
+            qt_settings_app,
+            "_begin_diagnostics_shutdown",
+            side_effect=lambda: calls.append("begin_shutdown"),
+        ):
+            with mock.patch.object(
+                qt_settings_app,
+                "_join_diagnostics_threads_at_exit",
+                side_effect=lambda: calls.append("join"),
+            ):
+                with mock.patch.object(
+                    qt_settings_app,
+                    "_release_qt_classes_cache",
+                    side_effect=lambda: calls.append("release_cache"),
+                ):
+                    qt_settings_app._shutdown_qt_settings_app_at_exit()
+        self.assertEqual(calls, ["begin_shutdown", "join", "release_cache"])
+
+    def test_begin_diagnostics_shutdown_sets_the_event(self):
+        self.assertFalse(qt_settings_app._diagnostics_shutdown_event.is_set())
+        qt_settings_app._begin_diagnostics_shutdown()
+        self.assertTrue(qt_settings_app._diagnostics_shutdown_event.is_set())
+
+    def test_join_diagnostics_threads_at_exit_never_touches_the_shutdown_event(self):
+        # Kept orthogonal on purpose (see _join_diagnostics_threads_at_exit's
+        # docstring) so tests that call this function directly without
+        # expecting a global side effect keep working.
+        self.assertFalse(qt_settings_app._diagnostics_shutdown_event.is_set())
+        qt_settings_app._join_diagnostics_threads_at_exit()
+        self.assertFalse(qt_settings_app._diagnostics_shutdown_event.is_set())
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class ButtonMappingModelTests(unittest.TestCase):
+    def setUp(self):
+        self.Model = qt_settings_app._load_qt_classes()["ButtonMappingModel"]
+
+    def test_row_count_matches_the_active_layout(self):
+        model = self.Model()
+        self.assertEqual(model.rowCount(), len(remote_layout.button_order()))
+
+    def test_role_names_cover_every_expected_role(self):
+        model = self.Model()
+        role_names = {value.data().decode() for value in model.roleNames().values()}
+        for expected in (
+            "buttonId", "displayName", "hidUsage", "actionText", "isMic",
+            "doubleClickText", "longPressText",
+            "isSelected", "hotspotX", "hotspotY", "hotspotWidth",
+            "hotspotHeight", "isVoice",
+        ):
+            self.assertIn(expected, role_names)
+
+    def test_data_matches_remote_layout_for_the_ok_button(self):
+        model = self.Model()
+        index = model.index(model.index_of("ok"), 0)
+        self.assertEqual(model.data(index, model.ButtonIdRole), "ok")
+        self.assertEqual(
+            model.data(index, model.DisplayNameRole),
+            remote_layout.display_names()["ok"],
+        )
+        self.assertEqual(
+            model.data(index, model.HidUsageRole),
+            remote_layout.hid_usage_display("ok"),
+        )
+        self.assertFalse(model.data(index, model.IsMicRole))
+
+    def test_hotspot_geometry_matches_remote_layout_for_mic(self):
+        model = self.Model()
+        index = model.index(model.index_of("mic"), 0)
+        hotspot = remote_layout.hotspot_for("mic")
+        self.assertEqual(model.data(index, model.XRole), hotspot.x)
+        self.assertEqual(model.data(index, model.YRole), hotspot.y)
+        self.assertEqual(model.data(index, model.WidthRole), hotspot.width)
+        self.assertEqual(model.data(index, model.HeightRole), hotspot.height)
+        self.assertTrue(model.data(index, model.IsVoiceRole))
+
+    def test_mic_row_uses_the_loaded_mapping(self):
+        model = self.Model()
+        model.load_display_map({"mic": "Escape"})
+        index = model.index(model.index_of("mic"), 0)
+        self.assertTrue(model.data(index, model.IsMicRole))
+        self.assertEqual(model.data(index, model.ActionTextRole), "Escape")
+
+    def test_set_action_text_at_updates_a_non_mic_row(self):
+        model = self.Model()
+        row = model.index_of("power")
+        model.setActionTextAt(row, "escape")
+        index = model.index(row, 0)
+        self.assertEqual(model.data(index, model.ActionTextRole), "Esc")
+
+    def test_mapping_edited_emits_only_when_an_action_really_changes(self):
+        model = self.Model()
+        changes = []
+        model.mappingEdited.connect(lambda: changes.append(True))
+        row = model.index_of("power")
+
+        model.setActionTextAt(row, "escape")
+        model.setActionTextAt(row, "escape")
+        model.setSecondaryActionTextAt(row, "double_click", "f5")
+        model.setSecondaryActionTextAt(row, "double_click", "f5")
+
+        self.assertEqual(len(changes), 2)
+
+    def test_set_action_text_at_updates_the_mic_row(self):
+        model = self.Model()
+        row = model.index_of("mic")
+        model.setActionTextAt(row, "方向上")
+        index = model.index(row, 0)
+        self.assertEqual(model.data(index, model.ActionTextRole), "方向上")
+
+    def test_secondary_action_text_can_be_set_and_round_tripped(self):
+        model = self.Model()
+        row = model.index_of("power")
+        model.setSecondaryActionTextAt(row, "double_click", "f5")
+        model.setSecondaryActionTextAt(row, "long_press", "系统音量 +")
+        index = model.index(row, 0)
+        self.assertEqual(model.data(index, model.DoubleClickTextRole), "F5")
+        self.assertEqual(model.data(index, model.LongPressTextRole), "系统音量 +")
+        self.assertEqual(
+            model.to_secondary_display_map()["power"],
+            {"double_click": "f5", "long_press": "系统音量 +"},
+        )
+
+    def test_mic_secondary_action_can_be_set_and_round_tripped(self):
+        model = self.Model()
+        row = model.index_of("mic")
+        model.setSecondaryActionTextAt(row, "double_click", "Escape")
+        self.assertEqual(
+            model.to_secondary_display_map()["mic"]["double_click"],
+            "Escape",
+        )
+
+    def test_display_note_can_be_set_and_round_tripped(self):
+        model = self.Model()
+        row = model.index_of("power")
+        model.setDisplayNoteAt(row, "single_click", "  关机  ")
+        index = model.index(row, 0)
+        self.assertEqual(model.data(index, model.SingleNoteRole), "关机")
+        self.assertEqual(
+            model.to_display_note_map(),
+            {"power": {"single_click": "关机"}},
+        )
+
+    def test_to_display_map_round_trips_all_physical_buttons(self):
+        model = self.Model()
+        model.load_display_map({"power": "escape", "up": "up", "mic": "Escape"})
+        result = model.to_display_map()
+        self.assertEqual(result["power"], "escape")
+        self.assertEqual(result["up"], "up")
+        self.assertEqual(result["mic"], "Escape")
+
+    def test_unconfigured_secondary_actions_have_an_explicit_display_value(self):
+        model = self.Model()
+        model.load_display_map({"power": "escape"})
+        index = model.index(model.index_of("power"), 0)
+        self.assertEqual(
+            model.data(index, model.DoubleClickTextRole),
+            settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
+        )
+        self.assertEqual(
+            model.data(index, model.LongPressTextRole),
+            settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
+        )
+        self.assertEqual(
+            model.to_secondary_display_map()["power"],
+            {"double_click": "", "long_press": ""},
+        )
+
+    def test_load_display_map_updates_rows_without_resetting_or_losing_selection(self):
+        model = self.Model()
+        resets = []
+        changes = []
+        model.modelReset.connect(lambda: resets.append(True))
+        model.dataChanged.connect(
+            lambda first, last, roles: changes.append(
+                (first.row(), last.row(), tuple(roles))
+            )
+        )
+        model.set_selected_button("power")
+
+        model.load_display_map(
+            {"power": "Escape", "mic": "按住说话"},
+            {"power": {"double_click": "Return", "long_press": ""}},
+            {"power": {"single_click": "关机"}},
+        )
+
+        self.assertEqual(resets, [])
+        self.assertTrue(changes)
+        self.assertEqual(model.selected_button_id(), "power")
+        power = model.index(model.index_of("power"), 0)
+        self.assertTrue(model.data(power, model.IsSelectedRole))
+        self.assertEqual(model.data(power, model.ActionTextRole), "Escape")
+        self.assertEqual(model.data(power, model.DoubleClickTextRole), "Return")
+        self.assertEqual(model.data(power, model.SingleNoteRole), "关机")
+
+    def test_selecting_a_button_flags_only_that_row_as_selected(self):
+        model = self.Model()
+        self.assertEqual(model.selected_button_id(), "ok")
+        model.set_selected_button("power")
+        self.assertEqual(model.selected_button_id(), "power")
+        power_index = model.index(model.index_of("power"), 0)
+        ok_index = model.index(model.index_of("ok"), 0)
+        self.assertTrue(model.data(power_index, model.IsSelectedRole))
+        self.assertFalse(model.data(ok_index, model.IsSelectedRole))
+
+    def test_index_of_button_slot_matches_the_plain_python_helper(self):
+        model = self.Model()
+        self.assertEqual(model.indexOfButton("tv"), model.index_of("tv"))
+
+    def test_index_of_button_returns_negative_one_for_unknown_id(self):
+        model = self.Model()
+        self.assertEqual(model.indexOfButton("does_not_exist"), -1)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class SettingsControllerTests(unittest.TestCase):
+    def setUp(self):
+        profile_patch = mock.patch.object(
+            qt_settings_app.wetype_control_windows, "begin_input_profile_selection",
+            return_value=mock.Mock(result=mock.Mock(return_value=False)),
+        )
+        self._profile_selection_mock = profile_patch.start()
+        self.addCleanup(profile_patch.stop)
+        classes = qt_settings_app._load_qt_classes()
+        self.Model = classes["ButtonMappingModel"]
+        self.Controller = classes["SettingsController"]
+        self.Qt = classes["Qt"]
+        self._controllers = []
+        self._tmpdir = tempfile.TemporaryDirectory()
+        from PySide6.QtCore import QStandardPaths
+        self._desktop = Path(self._tmpdir.name) / "redirected-desktop"
+        self._desktop.mkdir()
+        logging_patch = mock.patch("ovb.chromecast_etw_windows.sensitive_logging_enabled", return_value=True)
+        logging_patch.start()
+        self.addCleanup(logging_patch.stop)
+        real_location = QStandardPaths.writableLocation
+        desktop_patch = mock.patch.object(
+            QStandardPaths, "writableLocation",
+            side_effect=lambda kind: str(self._desktop) if kind == QStandardPaths.DesktopLocation
+            else real_location(kind),
+        )
+        desktop_patch.start()
+        self.addCleanup(desktop_patch.stop)
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "LOCALAPPDATA": self._tmpdir.name,
+                "OVB_DISABLE_LIVE_INPUT": "1",
+            },
+        )
+        self._env_patch.start()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        )
+        self._bridge_status_patch.start()
+        self._startup_state_patch = mock.patch.object(
+            qt_settings_app.startup_windows,
+            "read_startup_state",
+            return_value=qt_settings_app.startup_windows.StartupState(False),
+        )
+        self._startup_state_mock = self._startup_state_patch.start()
+        self._startup_rebind_patch = mock.patch.object(
+            qt_settings_app.startup_windows,
+            "rebind_owned_frozen_startup",
+            return_value=qt_settings_app.startup_windows.StartupState(False),
+        )
+        self._startup_rebind_mock = self._startup_rebind_patch.start()
+        self._hid_helper_offer_patch = mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "bundled_helper_offer_id",
+            return_value="3:" + ("a" * 64),
+        )
+        self._hid_helper_offer_patch.start()
+        self._hid_helper_self_elevate_patch = mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "can_current_user_self_elevate",
+            return_value=True,
+        )
+        self._hid_helper_self_elevate_patch.start()
+        self._hid_helper_consumer_patch = mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "current_consumer_is_registered",
+            return_value=True,
+        )
+        self._hid_helper_consumer_patch.start()
+        self._voice_hotkey_read_patch = mock.patch.object(
+            qt_settings_app.voice_hotkey_sync_windows,
+            "read_provider_hotkey",
+            side_effect=lambda provider_id, **_kwargs: (
+                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    str(provider_id),
+                    False,
+                    "local_only",
+                    message="test uses remembered shortcut",
+                )
+            ),
+        )
+        self._voice_hotkey_read_mock = self._voice_hotkey_read_patch.start()
+        self._voice_program_launch_patch = mock.patch.object(
+            qt_settings_app.voice_program_manager, "launch_voice_program",
+            return_value=voice_program_manager.VoiceProgramLaunchResult(
+                "sogou", False, True, "already_running"
+            ),
+        )
+        self._voice_program_launch_mock = self._voice_program_launch_patch.start()
+        self._voice_hotkey_sync_patch = mock.patch.object(
+            qt_settings_app.voice_hotkey_sync_windows,
+            "sync_provider_hotkey",
+            side_effect=lambda provider_id, shortcut, **_kwargs: (
+                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    str(provider_id),
+                    True,
+                    "synced",
+                    shortcut,
+                    "test shortcut synchronized",
+                )
+            ),
+        )
+        self._voice_hotkey_sync_mock = self._voice_hotkey_sync_patch.start()
+        self._voice_hotkey_restore_patch = mock.patch.object(
+            qt_settings_app.voice_hotkey_sync_windows,
+            "restore_provider_write",
+            side_effect=lambda provider_id, _receipt, **_kwargs: (
+                qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    str(provider_id),
+                    True,
+                    "restored",
+                    "lctrl+lshift+f7",
+                    "test provider state restored",
+                )
+            ),
+        )
+        self._voice_hotkey_restore_mock = self._voice_hotkey_restore_patch.start()
+        qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
+
+    def tearDown(self):
+        qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
+        for controller in reversed(self._controllers):
+            controller._mapping_auto_save_timer.stop()
+            controller._mapping_auto_save_scheduled = False
+            self.Controller.shutdownBackgroundTasks(controller)
+        self._hid_helper_consumer_patch.stop()
+        self._hid_helper_self_elevate_patch.stop()
+        self._hid_helper_offer_patch.stop()
+        self._startup_rebind_patch.stop()
+        self._startup_state_patch.stop()
+        self._voice_hotkey_sync_patch.stop()
+        self._voice_hotkey_restore_patch.stop()
+        self._voice_hotkey_read_patch.stop()
+        self._voice_program_launch_patch.stop()
+        self._bridge_status_patch.stop()
+        logger = logging.getLogger(qt_settings_app.logging_setup.LOGGER_NAME)
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+        qt_settings_app.logging_setup._configured = False
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def _new_controller(self, *args, **kwargs):
+        controller = self.Controller(*args, **kwargs)
+        self._controllers.append(controller)
+        return controller
+
+    def _make_controller(self, *, selected_remote=False):
+        model = self.Model()
+        controller = self.Controller(
+            model,
+            background_task_runner=lambda target, _name: target(),
+        )
+        controllers = getattr(self, "_controllers", None)
+        if controllers is not None:
+            controllers.append(controller)
+        if selected_remote:
+            # Other device behavior tests represent a user-selected remote;
+            # PnP matching itself has dedicated A/B isolation coverage.
+            controller._config["remote_selection"] = {
+                "schema": 1, "active": "a" * 64,
+                "devices": [{"key": "a" * 64, "profile": "chromecast-remote"}],
+            }
+            selection_patch = mock.patch(
+                "ovb.remote_selection.selected_raw_path",
+                side_effect=lambda paths, _key: qt_settings_app.raw_input_windows.hid_identity.select_single_device_path(paths),
+            )
+            selection_patch.start()
+            self.addCleanup(selection_patch.stop)
+        return controller, model
+
+    def _wait_for_qt(self, app, predicate, message, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.005)
+        app.processEvents()
+        self.assertTrue(predicate(), message)
+
+    def _continue_save_and_launch(self, controller):
+        controller._continue_save_and_launch()
+
+    def test_desktop_behavior_defaults_to_tray_and_does_not_auto_start_bridge(self):
+        controller, _model = self._make_controller()
+        self.assertFalse(controller.launchAtLogin)
+        self.assertFalse(controller.launchBridgeOnAppStart)
+        self.assertFalse(controller.diagnosticTraceEnabled)
+        self.assertEqual(controller.closeBehavior, "hide_to_tray")
+        self.assertEqual(controller.applicationVersion, qt_settings_app.__version__)
+        self.assertEqual(
+            controller.applicationPresentationLabel,
+            qt_settings_app.product_identity.windows_window_title(),
+        )
+        self.assertTrue(
+            controller.trayIconSource.endswith("remote-mic-unavailable.svg")
+        )
+
+    def test_tray_requires_connection_and_a_usable_selected_receiver(self):
+        controller, _model = self._make_controller()
+        controller._config["remote_selection"] = {
+            "schema": 1,
+            "active": "a" * 64,
+            "devices": [
+                {"key": "a" * 64, "profile": "chromecast-remote"}
+            ],
+        }
+        controller.remoteSelectionChanged.emit()
+        changes = []
+        controller.trayStateChanged.connect(lambda: changes.append(True))
+        controller._set_bridge_running(True)
+        controller._set_bridge_connected(True)
+        controller._set_bridge_input_states(
+            bridge_runtime_status.BridgeRuntimeStatus(
+                schema=bridge_runtime_status.SCHEMA_VERSION,
+                state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=os.getpid(),
+                updated_at=time.time(),
+                raw_input_state="chromecast_ready",
+                hid_tap_state="unavailable",
+                voice_key_physicalizer_state="ready",
+            )
+        )
+
+        self.assertTrue(controller.buttonReceiverUsable)
+        self.assertTrue(
+            controller.trayIconSource.endswith("remote-mic-connected.svg")
+        )
+        self.assertIn(device_catalog.DEFAULT_DISPLAY_NAME, controller.trayTooltip)
+        self.assertIn("正常", controller.trayTooltip)
+
+        controller._set_bridge_connected(False)
+        self.assertTrue(controller.buttonReceiverUsable)
+        self.assertTrue(
+            controller.trayIconSource.endswith("remote-mic-unavailable.svg")
+        )
+        self.assertIn("未连接", controller.trayTooltip)
+
+        controller._set_bridge_connected(True)
+        controller._set_bridge_input_states(
+            bridge_runtime_status.BridgeRuntimeStatus(
+                schema=bridge_runtime_status.SCHEMA_VERSION,
+                state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=os.getpid(),
+                updated_at=time.time(),
+                raw_input_state="chromecast_source_unconfirmed",
+                hid_tap_state="ready",
+                voice_key_physicalizer_state="failed",
+            )
+        )
+        self.assertFalse(controller.buttonReceiverUsable)
+        self.assertTrue(
+            controller.trayIconSource.endswith("remote-mic-unavailable.svg")
+        )
+        self.assertIn("按键接收异常", controller.trayTooltip)
+        self.assertGreaterEqual(len(changes), 5)
+
+    def test_chromecast_tray_uses_its_receiver_and_selected_device_name(self):
+        controller, _model = self._make_controller()
+        controller._config["remote_selection"] = {
+            "schema": 1,
+            "active": "c" * 64,
+            "devices": [
+                {"key": "c" * 64, "profile": "chromecast-remote"}
+            ],
+        }
+        controller.remoteSelectionChanged.emit()
+        controller._set_bridge_running(True)
+        controller._set_bridge_connected(True)
+        controller._set_bridge_input_states(
+            bridge_runtime_status.BridgeRuntimeStatus(
+                schema=bridge_runtime_status.SCHEMA_VERSION,
+                state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=os.getpid(),
+                updated_at=time.time(),
+                raw_input_state="chromecast_ready",
+                hid_tap_state="failed",
+                voice_key_physicalizer_state="failed",
+            )
+        )
+
+        self.assertTrue(controller.buttonReceiverUsable)
+        self.assertTrue(
+            controller.trayIconSource.endswith("remote-mic-connected.svg")
+        )
+        self.assertIn("谷歌 Chromecast 遥控器", controller.trayTooltip)
+
+    def test_remote_battery_exposes_valid_level_and_clears_when_status_disappears(self):
+        controller, _model = self._make_controller()
+        changes = []
+        controller.remoteBatteryChanged.connect(lambda: changes.append(True))
+
+        controller._set_bridge_input_states(
+            bridge_runtime_status.BridgeRuntimeStatus(
+                schema=bridge_runtime_status.SCHEMA_VERSION,
+                state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=os.getpid(),
+                updated_at=time.time(),
+                battery_level=59,
+            )
+        )
+        self.assertEqual(controller.remoteBatteryLevel, 59)
+
+        controller._set_bridge_input_states(None)
+        self.assertEqual(controller.remoteBatteryLevel, -1)
+        self.assertEqual(len(changes), 2)
+
+    def test_startup_rebind_runs_before_startup_state_read(self):
+        calls = []
+        self._startup_rebind_mock.side_effect = lambda: calls.append("rebind")
+        self._startup_state_mock.side_effect = lambda: (
+            calls.append("read")
+            or qt_settings_app.startup_windows.StartupState(True)
+        )
+
+        controller, _model = self._make_controller()
+
+        self.assertEqual(calls, ["rebind", "read"])
+        self.assertTrue(controller.launchAtLogin)
+
+    def test_installed_helper_issue_exposes_an_explicit_repair_action(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "hid_helper_task_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertEqual(controller.hidHelperIssueText, "改键已停用")
+
+    def test_standard_account_hides_helper_actions_that_cannot_succeed(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "hid_helper_task_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "can_current_user_self_elevate",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair, mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+        ) as remove:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+            controller.removeHidHelper()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperAccountUnsupported)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertEqual(controller.hidHelperIssueText, "换管理员账号")
+        repair.assert_not_called()
+        remove.assert_not_called()
+
+    def test_standard_account_keeps_an_existing_valid_helper_available(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                True, "ready"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "can_current_user_self_elevate",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertFalse(controller.hidHelperIssueVisible)
+        self.assertFalse(controller.hidHelperAccountUnsupported)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+
+    def test_portable_helper_issue_offers_one_time_enable_action(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "protected_helper_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertTrue(controller.hidHelperSetupRequired)
+        self.assertEqual(controller.hidHelperIssueText, "")
+
+    def test_newer_helper_state_hides_actions_that_cannot_succeed(self):
+        newer = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "helper_task_contract_newer"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=newer,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair, mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+        ) as remove:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+            controller.removeHidHelper()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertEqual(controller.hidHelperIssueText, "请安装新版")
+        repair.assert_not_called()
+        remove.assert_not_called()
+
+    def test_elevated_portable_session_needs_no_helper_setup_or_repair(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                False, "protected_helper_missing"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_process_elevated",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertFalse(controller.hidHelperIssueVisible)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers, "install_for_current_consumer"
+        ) as install, mock.patch.object(
+            qt_settings_app.config, "save_config_and_load"
+        ) as save:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+        install.assert_not_called()
+        save.assert_not_called()
+
+    def test_elevated_session_keeps_pending_helper_cleanup_repair(self):
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                True, "helper_cleanup_pending"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_process_elevated",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperCleanupPending)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.claimPortableHidSetupPrompt())
+
+    def test_successful_helper_repair_clears_the_issue(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "hid_helper_task_missing"
+        )
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=ready,
+        ) as repair, mock.patch.object(
+            qt_settings_app.logging_setup,
+            "write_parent_hid_helper_event",
+        ) as helper_log:
+            controller.repairHidHelper()
+
+        repair.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_install_elevation,
+        )
+        helper_log.assert_called_once_with(
+            "setup_result",
+            available=True,
+            detail="",
+            root=controller._config_root,
+        )
+        self.assertFalse(controller.hidHelperRepairBusy)
+        self.assertFalse(controller.hidHelperIssueVisible)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertIn("管理员按键组件已启用", controller.statusMessage)
+        saved = config.load_config(config.config_path(controller._config_root))
+        self.assertEqual(
+            saved["hid_helper_setup_prompted_offer_id"],
+            "3:" + ("a" * 64),
+        )
+
+    def test_cleanup_pending_stays_usable_and_exposes_a_retry(self):
+        pending = qt_settings_app.hid_elevation_windows.HidHelperState(
+            True, "helper_cleanup_pending"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=pending,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        self.assertTrue(controller.hidHelperIssueVisible)
+        self.assertTrue(controller.hidHelperCleanupPending)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertEqual(controller.hidHelperIssueText, "")
+
+    def test_cleanup_retry_that_still_has_residue_does_not_claim_full_success(self):
+        pending = qt_settings_app.hid_elevation_windows.HidHelperState(
+            True, "helper_cleanup_pending"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=pending,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=pending,
+        ) as repair:
+            controller.repairHidHelper()
+
+        repair.assert_called_once()
+        self.assertTrue(controller.hidHelperCleanupPending)
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertIn("尚未清理", controller.statusMessage)
+        self.assertNotIn("权限已启用", controller.statusMessage)
+
+    def test_cancelled_helper_repair_keeps_all_custom_mapping_disabled(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "hid_helper_task_missing"
+        )
+        cancelled = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "uac_cancelled"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=cancelled,
+        ):
+            controller.repairHidHelper()
+
+        self.assertTrue(controller.hidHelperRepairVisible)
+        self.assertIn("未确认管理员权限", controller.errorMessage)
+        self.assertIn("全部自定义按键映射已停用", controller.errorMessage)
+        self.assertIn("Windows 原始按键操作", controller.errorMessage)
+
+    def test_visible_portable_launch_claims_one_short_prompt_before_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=ready,
+        ) as request:
+            self.assertTrue(controller.claimPortableHidSetupPrompt())
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            request.assert_not_called()
+            controller.repairHidHelper()
+
+        request.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_install_elevation,
+        )
+        saved = config.load_config(config.config_path(controller._config_root))
+        self.assertEqual(
+            saved["hid_helper_setup_prompted_offer_id"],
+            "3:" + ("a" * 64),
+        )
+        self.assertFalse(controller.hidHelperIssueVisible)
+
+    def test_hidden_portable_start_can_prompt_after_the_window_is_shown(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller = self._new_controller(
+                self.Model(),
+                start_hidden=True,
+                background_task_runner=lambda target, _name: target(),
+            )
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=ready,
+        ) as request:
+            self.assertTrue(controller.claimPortableHidSetupPrompt())
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            request.assert_not_called()
+            controller.repairHidHelper()
+
+        request.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_install_elevation,
+        )
+
+    def test_portable_setup_never_starts_after_full_exit_has_begun(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+        controller._application_exit_requested = True
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as request:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+
+        request.assert_not_called()
+        self.assertFalse(
+            config.config_path(controller._config_root).exists()
+        )
+
+    def test_manual_helper_repair_records_prompt_and_remains_retryable(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        cancelled = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "uac_cancelled"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=cancelled,
+        ) as request:
+            controller.repairHidHelper()
+            controller.repairHidHelper()
+
+        self.assertEqual(request.call_count, 2)
+        saved = config.load_config(config.config_path(controller._config_root))
+        self.assertEqual(
+            saved["hid_helper_setup_prompted_offer_id"],
+            "3:" + ("a" * 64),
+        )
+
+    def test_setup_marker_save_failure_never_starts_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.config,
+            "save_config_and_load",
+            side_effect=OSError("read only"),
+        ) as save, mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as request:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+
+        save.assert_called_once()
+        request.assert_not_called()
+        self.assertIn("无法记录首次提示状态", controller.errorMessage)
+
+    def test_incomplete_portable_bundle_gives_a_direct_recovery_action(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        incomplete = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "bundled_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=incomplete,
+        ):
+            controller.repairHidHelper()
+
+        self.assertIn("完整解压 ZIP", controller.errorMessage)
+        self.assertIn(
+            qt_settings_app.product_identity.windows_executable_name(
+                qt_settings_app.__version__
+            ),
+            controller.errorMessage,
+        )
+
+    def test_missing_portable_helper_at_start_never_requests_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "bundled_helper_offer_id",
+            return_value="",
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair:
+            self.assertFalse(controller.claimPortableHidSetupPrompt())
+            controller.repairHidHelper()
+
+        repair.assert_not_called()
+        self.assertIn("完整解压 ZIP", controller.errorMessage)
+        self.assertIn(
+            qt_settings_app.product_identity.windows_executable_name(
+                qt_settings_app.__version__
+            ),
+            controller.errorMessage,
+        )
+
+    def test_incomplete_installed_bundle_recommends_reinstall(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        incomplete = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "bundled_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=incomplete,
+        ):
+            controller.repairHidHelper()
+
+        self.assertIn("重新安装当前版本", controller.errorMessage)
+        self.assertNotIn("解压 ZIP", controller.errorMessage)
+
+    def test_missing_installed_helper_at_start_never_requests_uac(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "bundled_helper_offer_id",
+            return_value="",
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+        ) as repair:
+            controller.repairHidHelper()
+
+        repair.assert_not_called()
+        self.assertIn("重新安装当前版本", controller.errorMessage)
+        self.assertNotIn("解压 ZIP", controller.errorMessage)
+
+    def test_repair_that_finds_a_newer_helper_stops_offering_old_actions(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        newer = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "newer_helper_preserved"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=newer,
+        ) as repair:
+            controller.repairHidHelper()
+
+        repair.assert_called_once()
+        self.assertIn("较新版本", controller.errorMessage)
+        self.assertFalse(controller.hidHelperSetupRequired)
+        self.assertFalse(controller.hidHelperRepairVisible)
+        self.assertFalse(controller.hidHelperRemovalVisible)
+
+    def test_installed_helper_timeout_points_to_repair_permission(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        timed_out = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "hid_helper_setup_timeout"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=True,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "install_for_current_consumer",
+            return_value=timed_out,
+        ):
+            controller.repairHidHelper()
+
+        self.assertIn("修复权限", controller.errorMessage)
+        self.assertNotIn("启用改键", controller.errorMessage)
+
+    def test_helper_validation_failure_points_to_retry_and_the_log(self):
+        missing = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "protected_helper_missing"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=missing,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        details = (
+            "hid_helper_task_acl_invalid",
+            "hid_helper_setup_exit_"
+            + str(
+                qt_settings_app.hid_elevation_windows.HELPER_EXIT_VALIDATION_FAILED
+            ),
+        )
+        for detail in details:
+            with self.subTest(detail=detail), mock.patch.object(
+                qt_settings_app.hid_helper_consumers,
+                "install_for_current_consumer",
+                return_value=qt_settings_app.hid_elevation_windows.HidHelperState(
+                    False, detail
+                ),
+            ):
+                controller.repairHidHelper()
+
+            self.assertIn("请再次尝试点击", controller.errorMessage)
+            self.assertIn("运行日志", controller.errorMessage)
+
+    def test_portable_can_remove_the_shared_helper_after_confirmation(self):
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=ready,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+            return_value=ready,
+        ) as remove, mock.patch.object(
+            qt_settings_app.logging_setup,
+            "write_parent_hid_helper_event",
+        ) as helper_log:
+            controller.removeHidHelper()
+
+        remove.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_uninstall_elevation,
+        )
+        helper_log.assert_called_once_with(
+            "removal_result",
+            available=True,
+            detail="",
+            root=controller._config_root,
+        )
+        self.assertFalse(controller.hidHelperRemovalVisible)
+        self.assertTrue(controller.hidHelperSetupRequired)
+        self.assertIn("管理员按键组件已移除", controller.statusMessage)
+
+    def test_failed_portable_helper_removal_restores_its_consumer_marker(self):
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        cancelled = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "uac_cancelled"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=ready,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+            return_value=cancelled,
+        ) as remove:
+            controller.removeHidHelper()
+
+        remove.assert_called_once_with(
+            controller._config_root,
+            qt_settings_app.hid_elevation_windows.request_uninstall_elevation,
+        )
+        self.assertTrue(controller.hidHelperRemovalVisible)
+        self.assertIn("没有移除", controller.errorMessage)
+
+    def test_portable_does_not_claim_a_preserved_newer_helper_was_removed(self):
+        ready = qt_settings_app.hid_elevation_windows.HidHelperState(True)
+        preserved = qt_settings_app.hid_elevation_windows.HidHelperState(
+            False, "helper_preserved_newer_contract"
+        )
+        with mock.patch.object(
+            qt_settings_app.sys, "frozen", True, create=True
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "inspect_installed_helper",
+            return_value=ready,
+        ), mock.patch.object(
+            qt_settings_app.hid_elevation_windows,
+            "is_installed_distribution",
+            return_value=False,
+        ):
+            controller, _model = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.hid_helper_consumers,
+            "remove_for_portable_consumer",
+            return_value=preserved,
+        ):
+            controller.removeHidHelper()
+
+        self.assertTrue(controller.hidHelperRemovalVisible)
+        self.assertIn("较新版本", controller.errorMessage)
+        self.assertNotIn("权限已移除", controller.statusMessage)
+
+    def test_desktop_behavior_changes_are_persisted_immediately(self):
+        controller, _model = self._make_controller()
+        controller.setLaunchBridgeOnAppStart(True)
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reload_in_process_bridge_settings",
+            return_value=True,
+        ) as reload_settings:
+            controller.setDiagnosticTraceEnabled(True)
+        controller.setCloseBehaviorIndex(1)
+
+        saved = config.load_config(config.config_path(Path(self._tmpdir.name) / "RemoteMic"))
+        self.assertTrue(saved["launch_bridge_on_app_start"])
+        self.assertTrue(saved["diagnostic_trace_enabled"])
+        self.assertEqual(saved["close_behavior"], "quit")
+        reload_settings.assert_called_once_with()
+
+    def test_launch_at_login_uses_the_scoped_windows_owner(self):
+        controller, _model = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.startup_windows,
+            "set_startup_enabled",
+            return_value=qt_settings_app.startup_windows.StartupState(True),
+        ) as setter:
+            controller.setLaunchAtLogin(True)
+
+        setter.assert_called_once_with(True)
+        self.assertTrue(controller.launchAtLogin)
+        self.assertFalse(controller.launchBridgeOnAppStart)
+
+    def test_application_start_option_reuses_the_normal_bridge_start(self):
+        controller, _model = self._make_controller()
+        controller._launch_bridge_on_app_start = True
+        calls = []
+        controller.startBridge = lambda: calls.append(True)
+
+        controller.startBridgeOnApplicationStart()
+
+        self.assertEqual(calls, [True])
+        self.assertFalse(controller.launchAtLogin)
+
+    def test_application_start_migrates_a_legacy_bridge_into_this_process(self):
+        controller, _model = self._make_controller()
+        controller._set_bridge_running(True)
+        recoveries = []
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            controller,
+            "_begin_bridge_restart",
+            side_effect=lambda **kwargs: recoveries.append(kwargs),
+        ):
+            controller.startBridgeOnApplicationStart()
+
+        self.assertEqual(recoveries, [{"automatic": True}])
+
+    def test_full_exit_without_a_bridge_is_immediate(self):
+        controller, _model = self._make_controller()
+        ready = []
+        controller.applicationExitReady.connect(
+            lambda: ready.append(controller.applicationExitConfirmed)
+        )
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+        ) as request_exit:
+            controller.requestApplicationExit()
+
+        self.assertEqual(ready, [True])
+        request_exit.assert_not_called()
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_waits_for_an_in_progress_settings_save(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        controller._set_settings_save_busy(True)
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+
+            self.assertEqual(ready, [])
+            self.assertTrue(controller._application_exit_requested)
+            self.assertTrue(controller._application_exit_waiting_for_save)
+            self.assertFalse(controller._application_exit_intent.is_set())
+
+            controller._set_settings_save_busy(False)
+            controller._begin_application_exit()
+            self.assertEqual(ready, [])
+            callbacks.pop()()
+
+        self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
+        self.assertFalse(controller._application_exit_waiting_for_save)
+
+    def test_full_exit_save_wait_is_bounded_without_spending_the_cleanup_budget(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        failures = []
+        now = [10.0]
+        controller.applicationExitFailed.connect(failures.append)
+        controller._set_settings_save_busy(True)
+
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            side_effect=lambda: now[0],
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+            save_deadline = controller._application_exit_deadline
+            self.assertEqual(
+                save_deadline,
+                now[0]
+                + qt_settings_app._APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS,
+            )
+
+            now[0] += 5.0
+            controller._set_settings_save_busy(False)
+            controller._begin_application_exit()
+
+            self.assertEqual(
+                controller._application_exit_deadline,
+                now[0] + qt_settings_app._APPLICATION_EXIT_WAIT_TIMEOUT_SECONDS,
+            )
+            self.assertEqual(failures, [])
+            callbacks.pop()()
+
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_save_wait_times_out_instead_of_polling_forever(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        failures = []
+        now = [10.0]
+        controller.applicationExitFailed.connect(failures.append)
+        controller._set_settings_save_busy(True)
+
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            side_effect=lambda: now[0],
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+            now[0] = controller._application_exit_deadline
+            callbacks.pop()()
+
+        self.assertEqual(
+            failures,
+            ["完全退出超时：设置仍在保存，请稍后重试。"],
+        )
+        self.assertFalse(controller._application_exit_requested)
+        self.assertFalse(controller._application_exit_waiting_for_save)
+
+    def test_full_exit_reuses_the_existing_poll_and_starts_one_bridge_stop(self):
+        model = self.Model()
+        background_tasks = []
+        callbacks = []
+
+        def runner(target, name):
+            if name == "remote-mic-application-exit":
+                background_tasks.append((target, name))
+            else:
+                target()
+
+        controller = self._new_controller(
+            model,
+            background_task_runner=runner,
+        )
+        controller._set_settings_save_busy(True)
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        ):
+            controller.requestApplicationExit()
+            self.assertEqual(len(callbacks), 1)
+
+            controller._set_settings_save_busy(False)
+            controller._begin_application_exit()
+            self.assertEqual(background_tasks, [])
+
+            callbacks.pop()()
+            self.assertEqual(len(background_tasks), 1)
+            self.assertEqual(
+                background_tasks[0][1],
+                "remote-mic-application-exit",
+            )
+
+            controller._continue_application_exit()
+            self.assertEqual(len(background_tasks), 1)
+
+    def test_full_exit_stays_open_when_an_in_progress_save_fails(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "CABLE Input"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE,
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+        endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+        deferred = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                deferred.append(target)
+            else:
+                target()
+
+        failures = []
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+            side_effect=audio_output.AudioOutputUnavailableError("cannot open"),
+        ):
+            model = self.Model()
+            controller = self._new_controller(
+                model,
+                background_task_runner=runner,
+            )
+            model.setActionTextAt(
+                model.index_of("mic"),
+                settings_ui._VOICE_HOLD_DISPLAY,
+            )
+            controller.applicationExitFailed.connect(failures.append)
+
+            self.assertTrue(controller.saveSettings())
+            self.assertTrue(controller.settingsSaveBusy)
+            self.assertEqual(len(deferred), 1)
+
+            controller.requestApplicationExit()
+
+            self.assertTrue(controller._application_exit_requested)
+            self.assertTrue(controller._application_exit_waiting_for_save)
+            self.assertFalse(controller._application_exit_intent.is_set())
+            deferred.pop()()
+
+        self.assertEqual(failures, ["设置保存未完成，程序没有退出。"])
+        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller._application_exit_requested)
+        self.assertFalse(controller._application_exit_waiting_for_save)
+        self.assertFalse(controller._application_exit_intent.is_set())
+
+    def test_full_exit_continues_after_a_real_async_save_succeeds(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "CABLE Input"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE,
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+        endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+        deferred = []
+        callbacks = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                deferred.append(target)
+            else:
+                target()
+
+        ready = []
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            model = self.Model()
+            controller = self._new_controller(
+                model,
+                background_task_runner=runner,
+            )
+            model.setActionTextAt(
+                model.index_of("mic"),
+                settings_ui._VOICE_HOLD_DISPLAY,
+            )
+            controller.applicationExitReady.connect(lambda: ready.append(True))
+
+            self.assertTrue(controller.saveSettings())
+            controller.requestApplicationExit()
+            deferred.pop()()
+
+            self.assertTrue(controller._application_exit_requested)
+            self.assertFalse(controller._application_exit_waiting_for_save)
+            self.assertTrue(controller._application_exit_intent.is_set())
+            self.assertEqual(ready, [])
+            callbacks.pop()()
+
+        self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_waits_for_detect_and_save_driver_action(self):
+        controller, _model = self._make_controller()
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        qt_settings_app._driver_action_active_event.set()
+
+        controller.requestApplicationExit()
+
+        self.assertEqual(ready, [])
+        self.assertTrue(controller._application_exit_requested)
+
+        qt_settings_app._driver_action_active_event.clear()
+        controller._continue_application_exit()
+
+        self.assertEqual(ready, [True])
+
+    def test_full_exit_waits_for_hid_helper_maintenance(self):
+        controller, _model = self._make_controller()
+        callbacks = []
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        controller._set_hid_helper_repair_busy(True)
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.requestApplicationExit()
+
+            self.assertEqual(ready, [])
+            self.assertTrue(controller._application_exit_requested)
+            self.assertEqual(len(callbacks), 1)
+
+            controller._set_hid_helper_repair_busy(False)
+            callbacks.pop()()
+
+        self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_save_settings_and_exit_waits_for_the_save_result(self):
+        controller, _model = self._make_controller()
+        completions = []
+        finished = []
+        controller.saveSettingsAndExitFinished.connect(finished.append)
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+        controller.requestApplicationExit = mock.Mock()
+
+        controller.saveSettingsAndExit()
+
+        controller.requestApplicationExit.assert_not_called()
+        self.assertEqual(len(completions), 1)
+        completions[0](True)
+        self.assertEqual(finished, [True])
+        controller.requestApplicationExit.assert_called_once_with()
+
+    def test_save_settings_and_exit_stays_open_when_save_fails(self):
+        controller, _model = self._make_controller()
+        completions = []
+        finished = []
+        controller.saveSettingsAndExitFinished.connect(finished.append)
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+        controller.requestApplicationExit = mock.Mock()
+
+        controller.saveSettingsAndExit()
+        completions[0](False)
+
+        self.assertEqual(finished, [False])
+        controller.requestApplicationExit.assert_not_called()
+
+    def test_save_settings_and_exit_waits_for_endpoint_preflight_before_mapping_save(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "Old Output"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        old_endpoint = audio_output.AudioEndpoint(
+            name="Old Output",
+            host_api="Windows WASAPI",
+        )
+        new_endpoint = audio_output.AudioEndpoint(
+            name="New Output",
+            host_api="Windows WASAPI",
+        )
+        deferred = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                deferred.append(target)
+            else:
+                target()
+
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[old_endpoint, new_endpoint],
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ):
+            model = self.Model()
+            controller = self._new_controller(
+                model,
+                background_task_runner=runner,
+            )
+            new_index = controller.endpointOptions.index(
+                settings_ui._endpoint_display(new_endpoint)
+            )
+            self.assertTrue(controller.selectAndPersistOutputEndpointIndex(new_index))
+            self.assertTrue(controller.endpointPreflightBusy)
+            model.setActionTextAt(model.index_of("power"), "ctrl+l")
+
+            callbacks = []
+            finished = []
+            controller.saveSettingsAndExitFinished.connect(finished.append)
+            controller.requestApplicationExit = mock.Mock()
+            with mock.patch(
+                "PySide6.QtCore.QTimer.singleShot",
+                side_effect=lambda _delay, callback: callbacks.append(callback),
+            ):
+                controller.saveSettingsAndExit()
+                self.assertEqual(finished, [])
+                controller.requestApplicationExit.assert_not_called()
+                self.assertEqual(len(callbacks), 1)
+
+                deferred.pop()()
+                self.assertFalse(controller.endpointPreflightBusy)
+                callbacks.pop()()
+
+        self.assertEqual(finished, [True])
+        controller.requestApplicationExit.assert_called_once_with()
+        persisted_config = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(persisted_config["output_endpoint_name"], "New Output")
+        persisted_bindings = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(
+            key_mapping.ButtonAction.from_dict(
+                persisted_bindings["bindings"]["power"]
+            ).keys,
+            ("ctrl", "l"),
+        )
+
+    def test_failed_async_mapping_save_and_exit_exposes_retry(self):
+        controller, model = self._make_controller()
+        model.setActionTextAt(model.index_of("power"), "ctrl+l")
+        completions = []
+        finished = []
+        controller._save_mapping = lambda completion=None: (
+            completions.append(completion) or True
+        )
+        controller.requestApplicationExit = mock.Mock()
+        controller.saveSettingsAndExitFinished.connect(finished.append)
+
+        controller.saveSettingsAndExit()
+        self.assertEqual(len(completions), 1)
+        completions[0](False)
+
+        self.assertEqual(finished, [False])
+        self.assertTrue(controller.mappingDirty)
+        self.assertTrue(controller.mappingAutoSaveRetryAvailable)
+        self.assertFalse(controller._mapping_auto_save_scheduled)
+        controller.requestApplicationExit.assert_not_called()
+
+    def test_full_exit_waits_for_the_bridge_to_stop(self):
+        controller, _model = self._make_controller()
+        ready = []
+        controller.applicationExitReady.connect(
+            lambda: ready.append(controller.applicationExitConfirmed)
+        )
+        with (
+            mock.patch.object(
+                qt_settings_app.single_instance,
+                "bridge_instance_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                qt_settings_app.bridge_control_windows,
+                "request_bridge_exit",
+                return_value=qt_settings_app.bridge_control_windows.BridgeExitResult(
+                    requested=True,
+                    stopped=True,
+                ),
+            ),
+        ):
+            controller.requestApplicationExit()
+
+        self.assertEqual(ready, [True])
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_full_exit_control_failure_is_visible_and_retryable(self):
+        controller, _model = self._make_controller()
+        failures = []
+        controller.applicationExitFailed.connect(failures.append)
+        with (
+            mock.patch.object(
+                qt_settings_app.single_instance,
+                "bridge_instance_running",
+                return_value=True,
+            ),
+            mock.patch.object(
+                qt_settings_app.bridge_control_windows,
+                "request_bridge_exit",
+                side_effect=RuntimeError("simulated control failure"),
+            ) as request_exit,
+        ):
+            controller.requestApplicationExit()
+            controller.requestApplicationExit()
+
+        self.assertEqual(request_exit.call_count, 2)
+        self.assertEqual(failures, ["完全退出失败：RuntimeError"] * 2)
+        self.assertFalse(controller._application_exit_requested)
+
+    def test_application_exit_ready_is_connected_to_qt_quit(self):
+        callbacks = []
+        quit_calls = []
+
+        class FakeSignal:
+            def connect(self, callback):
+                callbacks.append(callback)
+
+        class FakeController:
+            applicationExitReady = FakeSignal()
+
+        class FakeApplication:
+            def quit(self):
+                quit_calls.append(True)
+
+        qt_settings_app._connect_application_exit(
+            FakeApplication(), FakeController()
+        )
+        callbacks[0]()
+
+        self.assertEqual(quit_calls, [True])
+
+    def test_hotkey_text_defaults_to_the_configured_default(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.hotkeyText, "ralt")
+
+    def test_voice_program_management_defaults_to_optional_and_disabled(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.voiceProgramOptions[0], "请选择语音程序")
+        self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
+        self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
+        self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
+        self.assertEqual(len(controller.voiceProgramOptions), 5)
+        self.assertNotIn("自定义程序", controller.voiceProgramOptions)
+        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+        self.assertFalse(controller.voiceProgramSystemManaged)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramLaunchElevated)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+        self.assertEqual(controller.voiceProgramElevationStatus, "unknown")
+        self.assertIn("请选择语音程序", controller.voiceProgramStatusText)
+
+    def test_legacy_custom_load_and_failed_reselection_preserve_saved_settings(self):
+        saved = config.default_config()
+        saved["voice_program"] = {
+            "provider": "custom", "custom_executable": "C:/legacy/voice.exe",
+            "launch_on_bridge_start": True, "launch_elevated": False,
+        }
+        config.set_voice_hotkey_for_provider(saved, "custom", "ctrl+f8", source="manual")
+        path = config.config_path(config.config_root())
+        config.save_config(path, saved)
+        before = path.read_bytes()
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.selectedVoiceProgramIndex, 4)
+        self.assertTrue(controller.voiceProgramCustomSelected)
+        self.assertEqual(controller.voiceProgramCustomPath, "C:/legacy/voice.exe")
+        self.assertEqual(path.read_bytes(), before)
+        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
+            controller.selectedVoiceProgramIndex = 2
+        self.assertTrue(controller.voiceProgramCustomSelected)
+        self.assertEqual(path.read_bytes(), before)
+        controller.selectedVoiceProgramIndex = 2
+        stored = config.load_config(path)
+        self.assertEqual(stored["voice_program"]["provider"], "wetype")
+        self.assertEqual(stored["voice_program"]["custom_executable"], "C:/legacy/voice.exe")
+        self.assertEqual(config.voice_hotkey_for_provider(stored, "custom"), "ctrl+f8")
+        after = path.read_bytes()
+        controller.selectedVoiceProgramIndex = 4
+        self.assertEqual(controller.selectedVoiceProgramIndex, 2)
+        self.assertEqual(path.read_bytes(), after)
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 2)
+        self.assertEqual(path.read_bytes(), after)
+
+    def test_voice_program_status_exposes_actual_elevation_without_parsing_text(self):
+        controller, _ = self._make_controller()
+        for elevated, expected in (
+            (True, "elevated"),
+            (False, "standard"),
+            (None, "unknown"),
+        ):
+            status = voice_program_manager.VoiceProgramStatus(
+                provider_id="sogou",
+                display_name="搜狗输入法",
+                available=True,
+                running=True,
+                elevated=elevated,
+                executable=Path("C:/Program Files/Sogou/voice.exe"),
+                code="running",
+            )
+            with mock.patch.object(
+                qt_settings_app.voice_program_manager,
+                "inspect_voice_program",
+                return_value=status,
+            ):
+                controller._refresh_voice_program_status()
+            self.assertEqual(controller.voiceProgramElevationStatus, expected)
+
+    def test_voice_program_status_refresh_runs_in_a_worker_thread(self):
+        controller, _ = self._make_controller()
+        controller._background_task_runner = None
+        caller_thread = threading.get_ident()
+        worker_threads = []
+        completed = threading.Event()
+
+        def payload(settings):
+            worker_threads.append(threading.get_ident())
+            completed.set()
+            return "后台结果", "running", "standard"
+
+        with mock.patch.object(
+            controller, "_voice_program_status_payload", side_effect=payload
+        ):
+            controller._request_voice_program_status_refresh()
+            self.assertTrue(completed.wait(2.0))
+
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], caller_thread)
+
+    def test_background_shutdown_joins_workers_and_suppresses_all_results(self):
+        controller, _ = self._make_controller()
+        controller._background_task_runner = None
+        endpoint_started = threading.Event()
+        status_started = threading.Event()
+        hotkey_started = threading.Event()
+        release_workers = threading.Event()
+        hotkey_completions = []
+        original_options = list(controller.endpointOptions)
+        original_status = controller.voiceProgramStatusText
+
+        def endpoint_payload(_config_snapshot):
+            endpoint_started.set()
+            release_workers.wait(2.0)
+            return {
+                "options": ["关闭后结果"],
+                "values": [],
+                "recommended_index": -1,
+                "selected_index": -1,
+                "migration_message": "",
+            }
+
+        def status_payload(_settings_snapshot):
+            status_started.set()
+            release_workers.wait(2.0)
+            return "关闭后状态", "running", "standard"
+
+        def hotkey_payload():
+            hotkey_started.set()
+            release_workers.wait(2.0)
+            return "关闭后快捷键"
+
+        with mock.patch.object(
+            controller, "_endpoint_options_payload", side_effect=endpoint_payload
+        ), mock.patch.object(
+            controller, "_voice_program_status_payload", side_effect=status_payload
+        ):
+            controller._request_endpoint_options_refresh()
+            controller._request_voice_program_status_refresh()
+            controller._submit_voice_hotkey_step(
+                hotkey_payload,
+                lambda ok, payload: hotkey_completions.append((ok, payload)),
+            )
+            self.assertTrue(endpoint_started.wait(1.0))
+            self.assertTrue(status_started.wait(1.0))
+            self.assertTrue(hotkey_started.wait(1.0))
+
+            releaser = threading.Timer(0.05, release_workers.set)
+            releaser.start()
+            controller.shutdownBackgroundTasks()
+            releaser.join()
+
+        self.assertEqual(len(controller._background_threads), 0)
+        self.assertEqual(controller.endpointOptions, original_options)
+        self.assertEqual(controller.voiceProgramStatusText, original_status)
+        self.assertEqual(hotkey_completions, [])
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+        controller._on_endpoint_options_refresh_ready(
+            (
+                dict(controller._config),
+                {
+                    "options": ["迟到端点"],
+                    "values": [],
+                    "recommended_index": -1,
+                    "selected_index": -1,
+                    "migration_message": "",
+                },
+            )
+        )
+        controller._on_voice_program_status_refresh_ready(
+            (dict(controller._voice_program_settings), ("迟到状态", "running", "standard"))
+        )
+        controller._on_voice_hotkey_task_ready(
+            (controller._voice_hotkey_task_token, (True, "迟到快捷键"))
+        )
+        self.assertEqual(controller.endpointOptions, original_options)
+        self.assertEqual(controller.voiceProgramStatusText, original_status)
+        self.assertEqual(hotkey_completions, [])
+
+    def test_injected_background_runner_does_not_register_threads(self):
+        controller, _ = self._make_controller()
+
+        self.assertEqual(len(controller._background_threads), 0)
+
+        controller.shutdownBackgroundTasks()
+        self.assertTrue(controller._background_shutdown_event.is_set())
+
+    def test_voice_program_status_refresh_coalesces_repeated_requests(self):
+        controller, _ = self._make_controller()
+        controller._voice_program_status_refresh_running = True
+
+        with mock.patch.object(controller, "_schedule_voice_program_status_refresh") as schedule:
+            controller._request_voice_program_status_refresh()
+            controller._request_voice_program_status_refresh()
+            self.assertTrue(controller._voice_program_status_refresh_pending)
+            controller._on_voice_program_status_refresh_ready(
+                (
+                    dict(controller._voice_program_settings),
+                    ("后台结果", "running", "standard"),
+                )
+            )
+
+        self.assertFalse(controller._voice_program_status_refresh_pending)
+        self.assertEqual(controller.voiceProgramStatusText, "后台结果")
+        schedule.assert_called_once_with()
+
+    def test_stale_voice_program_status_result_is_discarded_and_refreshed(self):
+        controller, _ = self._make_controller()
+        old_settings = dict(controller._voice_program_settings)
+        controller._voice_program_settings = voice_program_manager.normalize_voice_program_settings(
+            {"provider": "sogou"}
+        )
+
+        with mock.patch.object(controller, "_schedule_voice_program_status_refresh") as schedule:
+            controller._voice_program_status_refresh_running = True
+            controller._on_voice_program_status_refresh_ready(
+                (old_settings, ("旧结果", "running", "standard"))
+            )
+
+        self.assertNotEqual(controller.voiceProgramStatusText, "旧结果")
+        schedule.assert_called_once_with()
+
+    def test_selecting_a_voice_program_enables_bridge_autostart_automatically(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 1
+
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+        self.assertFalse(controller.settingsDirty)
+        self.assertTrue(controller.voiceProgramLaunchElevated)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_program"]["provider"], "sogou")
+        self.assertTrue(saved["voice_program"]["launch_on_bridge_start"])
+        self.assertTrue(saved["voice_program"]["launch_elevated"])
+
+    def test_selecting_wetype_uses_windows_management_without_autostart(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self.assertTrue(controller.voiceProgramSystemManaged)
+        self.assertFalse(controller.voiceProgramLaunchable)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+
+    def test_selecting_chatterfly_uses_menu_mode_and_requires_own_shortcut(self):
+        controller, _ = self._make_controller()
+
+        controller.selectVoiceProgramMenuOption(3)
+
+        self.assertTrue(controller.voiceProgramChatterflySelected)
+        self.assertEqual(controller.selectedVoiceProgramIndex, 5)
+        self.assertEqual(controller.voiceProgramMenuIndex, 3)
+        self.assertTrue(controller.voiceProgramSystemManaged)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertEqual(controller.holdVoiceHotkeyText, "")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_program"]["provider"], "chatterfly")
+        self.assertEqual(config.voice_hotkey_for_provider(saved, "chatterfly"), "")
+
+    def test_selecting_doubao_uses_the_direct_adapter_without_autostart(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 3
+
+        self.assertTrue(controller.voiceProgramDoubaoSelected)
+        self.assertFalse(controller.voiceProgramSystemManaged)
+        self.assertFalse(controller.voiceProgramLaunchable)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_program"]["provider"], "doubao_ime")
+
+    def test_selecting_sogou_adopts_and_remembers_its_detected_shortcut(self):
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                True,
+                "read",
+                "lctrl+lshift+f9",
+                "read from Sogou",
+            )
+        )
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 1
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["sogou"]["hold"],
+            "lctrl+lshift+f9",
+        )
+
+    def test_selecting_sogou_launches_after_save_without_restarting_running_service(self):
+        controller, _ = self._make_controller()
+        controller._set_bridge_running(True)
+        def launch(settings):
+            saved = config.load_config(config.config_path(config.config_root()))
+            self.assertEqual(saved["voice_program"]["provider"], "sogou")
+            self.assertTrue(settings["launch_elevated"])
+            return voice_program_manager.VoiceProgramLaunchResult("sogou", True, False, "started")
+        self._voice_program_launch_mock.side_effect = launch
+        with mock.patch.object(controller, "_begin_bridge_restart") as restart:
+            controller.selectedVoiceProgramIndex = 1
+        self._voice_program_launch_mock.assert_called_once()
+        restart.assert_not_called()
+        self.assertTrue(controller._bridge_running)
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_selecting_sogou_reports_missing_failed_and_cancelled_launch(self):
+        for code, text in (("not_found", "未找到搜狗语音程序，请先安装或手动启动"),
+                           ("launch_failed", "启动失败，请手动启动"),
+                           ("cancelled", "已取消启动搜狗语音程序")):
+            with self.subTest(code=code):
+                controller, _ = self._make_controller()
+                controller.selectedVoiceProgramIndex = 2
+                self._voice_program_launch_mock.return_value = (
+                    voice_program_manager.VoiceProgramLaunchResult("sogou", False, False, code)
+                )
+                controller.selectedVoiceProgramIndex = 1
+                self.assertIn(text, controller.errorMessage + controller.statusMessage)
+                self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_failed_sogou_selection_save_never_launches(self):
+        controller, _ = self._make_controller()
+        with mock.patch.object(controller, "_update_and_persist_voice_program", return_value=False):
+            controller.selectedVoiceProgramIndex = 1
+        self._voice_program_launch_mock.assert_not_called()
+
+    def test_other_provider_selection_and_hotkey_refresh_do_not_launch(self):
+        controller, _ = self._make_controller()
+        for provider in (2, 3):
+            controller.selectedVoiceProgramIndex = provider
+        self._voice_program_launch_mock.assert_not_called()
+        controller.selectedVoiceProgramIndex = 1
+        self._voice_program_launch_mock.reset_mock()
+        controller.loadVoiceHotkeyFromProvider()
+        self._voice_program_launch_mock.assert_not_called()
+
+    def test_profile_selection_starts_after_save_and_holds_busy_until_finished(self):
+        controller, _ = self._make_controller()
+        pending = []
+        def begin(provider, **kwargs):
+            saved = config.load_config(config.config_path(config.config_root()))
+            self.assertEqual(saved["voice_program"]["provider"], provider)
+            self.assertTrue(controller.voiceHotkeyBusy)
+            return mock.Mock(result=lambda: True)
+        self._profile_selection_mock.side_effect = begin
+        original = controller._submit_voice_hotkey_step
+        def submit(callback, completion, **kwargs):
+            if kwargs.get("cancel_event") is not None:
+                pending.append((callback, completion))
+            else:
+                original(callback, completion, **kwargs)
+        with mock.patch.object(controller, "_submit_voice_hotkey_step", side_effect=submit):
+            controller.selectedVoiceProgramIndex = 3
+        self.assertTrue(controller.voiceHotkeyBusy)
+        controller.selectedVoiceProgramIndex = 2
+        self.assertTrue(controller.voiceProgramDoubaoSelected)
+        callback, completion = pending.pop()
+        completion(True, callback())
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_profile_selection_failure_keeps_saved_choice_and_unlocks(self):
+        controller, _ = self._make_controller()
+        self._profile_selection_mock.side_effect = OSError("busy")
+        controller.selectedVoiceProgramIndex = 3
+        self.assertTrue(controller.voiceProgramDoubaoSelected)
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("选择已保存", controller.errorMessage)
+
+    def test_failed_provider_save_does_not_switch_input_profile(self):
+        controller, _ = self._make_controller()
+        with mock.patch.object(controller, "_update_and_persist_voice_program", return_value=False):
+            controller.selectedVoiceProgramIndex = 3
+        self._profile_selection_mock.assert_not_called()
+
+    def test_profile_selection_does_not_switch_during_current_recording(self):
+        controller, _ = self._make_controller()
+        controller._voice_runtime_state = bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+        controller.selectedVoiceProgramIndex = 3
+        self.assertTrue(controller.voiceProgramDoubaoSelected)
+        self._profile_selection_mock.assert_not_called()
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_selecting_wetype_loads_its_saved_shortcut(self):
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lwin")
+        self.assertEqual(controller.errorMessage, "")
+
+    def test_empty_manual_wetype_value_falls_back_to_automatic_read(self):
+        path = config.config_path(config.config_root())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = config.default_config()
+        data["voice_hotkeys_by_provider"]["wetype"] = {
+            "hold": "",
+            "source": config.VOICE_HOTKEY_SOURCE_MANUAL,
+        }
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                True,
+                "read",
+                "lctrl+lwin",
+                "read from WeType",
+            )
+        )
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self._voice_hotkey_read_mock.assert_called_with("wetype")
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lwin")
+        self.assertEqual(controller.voiceHotkeySource, "auto")
+
+    def test_empty_wetype_value_stays_selected_when_automatic_read_fails(self):
+        path = config.config_path(config.config_root())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = config.default_config()
+        data["voice_hotkeys_by_provider"]["wetype"] = {
+            "hold": "",
+            "source": config.VOICE_HOTKEY_SOURCE_MANUAL,
+        }
+        path.write_text(json.dumps(data), encoding="utf-8")
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                False,
+                "read_failed",
+                message="automatic read failed",
+            )
+        )
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self.assertEqual(controller.selectedVoiceProgramIndex, 2)
+        self.assertEqual(controller.holdVoiceHotkeyText, "")
+        self.assertEqual(controller.voiceHotkeySource, "default")
+        self.assertIn("录入", controller.errorMessage)
+        self.assertNotIn("hotkey text must not be empty", controller.errorMessage)
+        saved = config.load_config(path)
+        self.assertEqual(saved["voice_program"]["provider"], "wetype")
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["wetype"],
+            {"hold": "", "source": config.VOICE_HOTKEY_SOURCE_DEFAULT},
+        )
+
+    def test_valid_manual_wetype_value_keeps_priority_and_is_identifiable(self):
+        data = config.default_config()
+        config.set_voice_hotkey_for_provider(
+            data,
+            "wetype",
+            "lctrl+lshift+f9",
+            source=config.VOICE_HOTKEY_SOURCE_MANUAL,
+        )
+        config.save_config(config.config_path(config.config_root()), data)
+        controller, _ = self._make_controller()
+        self._voice_hotkey_read_mock.reset_mock()
+
+        controller.selectedVoiceProgramIndex = 2
+
+        self._voice_hotkey_read_mock.assert_not_called()
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+        self.assertEqual(controller.voiceHotkeySource, "manual")
+
+    def test_selecting_doubao_adopts_and_saves_its_detected_shortcut(self):
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "doubao_ime",
+                True,
+                "read",
+                "ralt",
+                "read from Doubao",
+            )
+        )
+        controller, _ = self._make_controller()
+
+        controller.selectedVoiceProgramIndex = 3
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["doubao_ime"]["hold"],
+            "ralt",
+        )
+
+    def test_chatterfly_manual_value_requires_explicit_refresh_then_survives_reopen(self):
+        data = config.default_config()
+        config.set_voice_hotkey_for_provider(data, "chatterfly", "rctrl+rshift",
+                                            source=config.VOICE_HOTKEY_SOURCE_MANUAL)
+        path = config.config_path(config.config_root())
+        config.save_config(path, data)
+        controller, _ = self._make_controller()
+        self._voice_hotkey_read_mock.reset_mock()
+        controller.selectedVoiceProgramIndex = 5
+        controller.loadVoiceHotkeyFromProvider()
+        self._voice_hotkey_read_mock.assert_not_called()
+        self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift")
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "chatterfly", True, "read", "rctrl+rshift+0", "已读取"
+            )
+        )
+        controller.refreshVoiceHotkeyFromProvider()
+        self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift+0")
+        self.assertEqual(controller.voiceHotkeySource, "auto")
+        self.assertFalse(controller.voiceHotkeyBusy)
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.holdVoiceHotkeyText, "rctrl+rshift+0")
+        self.assertEqual(reopened.voiceHotkeySource, "auto")
+
+    def test_chatterfly_failed_refresh_preserves_manual_value_and_disk(self):
+        data = config.default_config()
+        config.set_voice_hotkey_for_provider(data, "chatterfly", "rctrl+rshift",
+                                            source=config.VOICE_HOTKEY_SOURCE_MANUAL)
+        path = config.config_path(config.config_root())
+        config.save_config(path, data)
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 5
+        before = path.read_bytes()
+        self._voice_hotkey_read_mock.side_effect = None
+        for code in ("not_found", "ambiguous_profile", "disabled", "read_failed"):
+            with self.subTest(code=code):
+                self._voice_hotkey_read_mock.return_value = (
+                    qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                        "chatterfly", False, code, message=code
+                    )
+                )
+                controller.refreshVoiceHotkeyFromProvider()
+                self.assertEqual(controller.holdVoiceHotkeyText, "rctrl+rshift")
+                self.assertEqual(controller.voiceHotkeySource, "manual")
+                self.assertEqual(path.read_bytes(), before)
+                self.assertIn("已保留当前快捷键", controller.errorMessage)
+                self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_wetype_saves_direct_shortcut_edits_locally(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        self._voice_hotkey_sync_mock.reset_mock()
+
+        controller.holdVoiceHotkeyText = "ctrl+shift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ctrl+shift+f9")
+        self.assertEqual(controller.voiceHotkeySaveState, "saved")
+        self._voice_hotkey_sync_mock.assert_called_once_with(
+            "wetype", "ctrl+shift+f9"
+        )
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            "ctrl+shift+f9",
+        )
+
+    def test_provider_sync_failure_restores_the_previous_shortcut(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.side_effect = None
+        self._voice_hotkey_sync_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                False,
+                "write_failed",
+                message="Sogou rejected shortcut",
+            )
+        )
+
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertIn("Sogou rejected", controller.errorMessage)
+        self.assertEqual(controller.voiceHotkeySaveState, "retry")
+
+    def test_reentering_the_current_provider_refreshes_its_shortcut(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        self._voice_hotkey_read_mock.reset_mock()
+
+        controller.selectedVoiceProgramIndex = 1
+
+        self._voice_hotkey_read_mock.assert_called_once_with("sogou")
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_reentering_the_same_hotkey_still_synchronizes_the_provider(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        current = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.reset_mock()
+
+        controller.holdVoiceHotkeyText = current
+
+        self._voice_hotkey_sync_mock.assert_called_once_with(
+            "sogou", current, cancel_event=mock.ANY
+        )
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertEqual(controller.voiceHotkeySaveState, "saved")
+
+    def test_provider_sync_exception_keeps_the_saved_shortcut_and_clears_busy(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.side_effect = OSError("provider unavailable")
+
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("provider unavailable", controller.errorMessage)
+        self.assertEqual(controller.voiceHotkeySaveState, "retry")
+
+    def test_failed_provider_value_adoption_restores_the_saved_display(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        previous = controller.holdVoiceHotkeyText
+        self._voice_hotkey_sync_mock.side_effect = None
+        self._voice_hotkey_sync_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                False,
+                "rollback_failed",
+                "lctrl+lshift+f8",
+                "provider remains changed",
+            )
+        )
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertIn("两边仍不一致", controller.errorMessage)
+
+    def test_readback_failure_restores_disk_ui_and_provider_to_previous_hotkey(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        previous = controller.holdVoiceHotkeyText
+        config_path = config.config_path(config.config_root())
+        previous_bytes = config_path.read_bytes()
+        receipt = (
+            qt_settings_app.voice_hotkey_sync_windows.SogouWriteReceipt(
+                b"provider-before",
+                b"provider-after",
+            )
+        )
+        self._voice_hotkey_sync_mock.side_effect = [
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                True,
+                "synced",
+                "lctrl+lshift+f9",
+                "shortcut synchronized",
+                written_sha256="new-digest",
+                write_receipt=receipt,
+            ),
+        ]
+        self._voice_hotkey_restore_mock.side_effect = None
+        self._voice_hotkey_restore_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou", True, "restored", previous, "shortcut restored"
+            )
+        )
+
+        with mock.patch.object(
+            config,
+            "load_config",
+            side_effect=config.ConfigFormatError("readback failed"),
+        ):
+            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(config_path.read_bytes(), previous_bytes)
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("语音程序快捷键已恢复原值", controller.errorMessage)
+        self.assertEqual(
+            self._voice_hotkey_sync_mock.call_args_list,
+            [
+                mock.call("sogou", "lctrl+lshift+f9", cancel_event=mock.ANY),
+            ],
+        )
+        self._voice_hotkey_restore_mock.assert_called_once_with(
+            "sogou",
+            receipt,
+            cancel_event=mock.ANY,
+        )
+
+    def test_failed_local_save_reports_when_provider_rollback_also_fails(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        previous = controller.holdVoiceHotkeyText
+        receipt = (
+            qt_settings_app.voice_hotkey_sync_windows.SogouWriteReceipt(
+                b"provider-before",
+                b"provider-after",
+            )
+        )
+        self._voice_hotkey_sync_mock.side_effect = [
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                True,
+                "synced",
+                "lctrl+lshift+f9",
+                "shortcut synchronized",
+                written_sha256="new-digest",
+                write_receipt=receipt,
+            ),
+        ]
+        self._voice_hotkey_restore_mock.side_effect = None
+        self._voice_hotkey_restore_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                False,
+                "write_failed",
+                message="rollback failed",
+            )
+        )
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertIn("语音设置保存失败", controller.errorMessage)
+        self.assertIn("第三方程序快捷键也未能恢复", controller.errorMessage)
+        self.assertEqual(
+            self._voice_hotkey_sync_mock.call_args_list,
+            [
+                mock.call("sogou", "lctrl+lshift+f9", cancel_event=mock.ANY),
+            ],
+        )
+        self._voice_hotkey_restore_mock.assert_called_once_with(
+            "sogou",
+            receipt,
+            cancel_event=mock.ANY,
+        )
+
+    def test_refresh_adopts_an_external_provider_change(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                True,
+                "read",
+                "lctrl+lshift+f9",
+                "read from Sogou",
+            )
+        )
+
+        controller.refreshVoiceHotkeyFromProvider()
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["sogou"]["hold"],
+            "lctrl+lshift+f9",
+        )
+        self.assertEqual(controller.voiceHotkeySaveState, "saved")
+
+    def test_refresh_reads_and_saves_an_external_wetype_change(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype",
+                True,
+                "read",
+                "lctrl+lshift+f9",
+                "read from WeType",
+            )
+        )
+
+        controller.refreshVoiceHotkeyFromProvider()
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_hotkeys_by_provider"]["wetype"]["hold"],
+            "lctrl+lshift+f9",
+        )
+        self.assertEqual(controller.voiceHotkeySaveState, "saved")
+        self.assertTrue(self._voice_hotkey_read_mock.call_args.kwargs["allow_settings_window"])
+
+    def test_wetype_automatic_load_and_reselection_do_not_open_settings(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        self.assertNotIn("正在读取", controller.statusMessage)
+        self._voice_hotkey_read_mock.reset_mock()
+        controller.loadVoiceHotkeyFromProvider()
+        controller.selectedVoiceProgramIndex = 2
+        self._voice_hotkey_read_mock.assert_not_called()
+
+    def test_wetype_refresh_failures_preserve_manual_value_source_and_disk(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+        path = config.config_path(config.config_root())
+        previous = path.read_bytes()
+        for code in ("open_failed", "timeout", "navigation_failed", "read_failed"):
+            with self.subTest(code=code):
+                self._voice_hotkey_read_mock.side_effect = None
+                self._voice_hotkey_read_mock.return_value = qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                    "wetype", False, code, message=code,
+                )
+                controller.refreshVoiceHotkeyFromProvider()
+                self.assertEqual(path.read_bytes(), previous)
+                self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+                self.assertEqual(controller.voiceHotkeySource, "manual")
+                self.assertIn("已保留当前快捷键", controller.errorMessage)
+                self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_wetype_refresh_page_change_cancels_and_discards_late_success(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        controller.activePageIndex = 2
+        path = config.config_path(config.config_root())
+        previous = path.read_bytes()
+
+        def read(_provider, **kwargs):
+            controller.activePageIndex = 0
+            self.assertTrue(kwargs["cancel_event"].is_set())
+            return qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "wetype", True, "read", "ralt", "read",
+            )
+
+        self._voice_hotkey_read_mock.side_effect = read
+        controller.refreshVoiceHotkeyFromProvider()
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertIn("刷新已取消", controller.errorMessage)
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_wetype_refresh_timeout_cancels_and_ignores_late_result(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        previous = controller.holdVoiceHotkeyText
+        pending = []
+        controller._background_task_runner = lambda callback, _name: pending.append(callback)
+        controller.refreshVoiceHotkeyFromProvider()
+        cancellation = controller._wetype_hotkey_refresh_cancel
+        controller._on_voice_hotkey_task_timeout()
+        self.assertTrue(cancellation.is_set())
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("超时", controller.errorMessage)
+        pending.pop()()
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("超时", controller.errorMessage)
+
+    def test_sogou_shutdown_reports_a_stalled_provider_transaction(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stalled_sync(provider_id, shortcut, **kwargs):
+            self.assertEqual(provider_id, "sogou")
+            entered.set()
+            release.wait(1.0)
+            return qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                provider_id,
+                False,
+                "cancelled",
+                message="cancelled",
+            )
+
+        self._voice_hotkey_sync_mock.side_effect = stalled_sync
+        controller._background_task_runner = None
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+        self.assertTrue(entered.wait(1.0))
+        with mock.patch.object(
+            qt_settings_app,
+            "_SETTINGS_BACKGROUND_JOIN_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            self.assertFalse(controller.shutdownBackgroundTasks())
+
+        self.assertTrue(controller.voiceHotkeyBusy)
+        self.assertTrue(
+            self._voice_hotkey_sync_mock.call_args.kwargs["cancel_event"].is_set()
+        )
+        release.set()
+        for thread in list(controller._background_threads):
+            thread.join(1.0)
+
+    def test_sogou_shutdown_does_not_treat_an_undelivered_result_as_settled(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        pending = []
+        controller._background_task_runner = (
+            lambda callback, _name: pending.append(callback)
+        )
+        controller._emit_background_result = mock.Mock(return_value=False)
+        self._voice_hotkey_sync_mock.return_value = (
+            qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+                "sogou",
+                True,
+                "synced",
+                "lctrl+lshift+f9",
+                "synced",
+                written_sha256="receipt",
+            )
+        )
+
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+        pending.pop()()
+
+        self.assertFalse(controller.shutdownBackgroundTasks())
+        self.assertTrue(controller.voiceHotkeyBusy)
+
+    def test_wetype_refresh_local_save_failure_restores_manual_value_and_source(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        controller.holdVoiceHotkeyText = "lctrl+lshift+f9"
+        path = config.config_path(config.config_root())
+        previous = path.read_bytes()
+        self._voice_hotkey_read_mock.side_effect = None
+        self._voice_hotkey_read_mock.return_value = qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+            "wetype", True, "read", "lctrl+lwin", "read",
+        )
+        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
+            controller.refreshVoiceHotkeyFromProvider()
+        self.assertEqual(path.read_bytes(), previous)
+        self.assertEqual(controller.holdVoiceHotkeyText, "lctrl+lshift+f9")
+        self.assertEqual(controller.voiceHotkeySource, "manual")
+        self.assertEqual(controller.voiceHotkeySaveState, "retry")
+        self.assertFalse(controller.voiceHotkeyBusy)
+
+    def test_wetype_refresh_does_not_open_during_confirmed_mic_or_audio(self):
+        for state in (bridge_runtime_status.VOICE_RUNTIME_MIC_CONFIRMED, bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO):
+            with self.subTest(state=state):
+                controller, _ = self._make_controller()
+                controller.selectedVoiceProgramIndex = 2
+                self._voice_hotkey_read_mock.reset_mock()
+                controller._voice_runtime_state = state
+                controller.refreshVoiceHotkeyFromProvider()
+                self._voice_hotkey_read_mock.assert_not_called()
+
+    def test_wetype_refresh_runtime_update_cancels_worker(self):
+        controller, _ = self._make_controller()
+        controller._wetype_hotkey_refresh_cancel = threading.Event()
+        status = bridge_runtime_status.BridgeRuntimeStatus(
+            schema=bridge_runtime_status.SCHEMA_VERSION,
+            state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=os.getpid(), updated_at=time.time(),
+            voice_runtime_state=bridge_runtime_status.VOICE_RUNTIME_RECEIVING_AUDIO,
+            voice_runtime_provider="wetype",
+        )
+        controller._set_bridge_input_states(status)
+        self.assertTrue(controller._wetype_hotkey_refresh_cancel.is_set())
+
+    def test_refreshing_local_only_provider_does_not_leave_processing_status(self):
+        controller, _ = self._make_controller()
+        controller._set_status_message("existing voice result", 2)
+
+        controller.refreshVoiceHotkeyFromProvider()
+
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertEqual(controller.statusMessage, "existing voice result")
+        self._voice_hotkey_read_mock.assert_not_called()
+
+    def test_refresh_is_blocked_while_capturing_or_voice_is_active(self):
+        blockers = (
+            (
+                "saving",
+                lambda controller: controller._set_settings_save_busy(True),
+            ),
+            (
+                "capture",
+                lambda controller: controller._set_input_operation_state(
+                    "hotkey", "active"
+                ),
+            ),
+            (
+                "speaking",
+                lambda controller: setattr(
+                    controller,
+                    "_voice_runtime_state",
+                    bridge_runtime_status.VOICE_RUNTIME_ACTIVE,
+                ),
+            ),
+            (
+                "finishing",
+                lambda controller: setattr(
+                    controller,
+                    "_voice_runtime_state",
+                    bridge_runtime_status.VOICE_RUNTIME_FINISHING,
+                ),
+            ),
+        )
+
+        for name, block in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                controller.selectedVoiceProgramIndex = 1
+                self._voice_hotkey_read_mock.reset_mock()
+                block(controller)
+
+                controller.refreshVoiceHotkeyFromProvider()
+
+                self.assertFalse(controller.voiceHotkeyBusy)
+                self._voice_hotkey_read_mock.assert_not_called()
+
+    def test_refresh_rechecks_runtime_before_starting_provider_read(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        self._voice_hotkey_read_mock.reset_mock()
+
+        def refresh_runtime():
+            controller._voice_runtime_state = (
+                bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+            )
+            return True
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+            side_effect=refresh_runtime,
+        ):
+            controller.refreshVoiceHotkeyFromProvider()
+
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self._voice_hotkey_read_mock.assert_not_called()
+
+    def test_refresh_fails_closed_when_live_runtime_cannot_be_read(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        self._voice_hotkey_read_mock.reset_mock()
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+            return_value=None,
+        ):
+            controller.refreshVoiceHotkeyFromProvider()
+
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self._voice_hotkey_read_mock.assert_not_called()
+
+    def test_refresh_discards_result_when_voice_starts_during_provider_read(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        previous = controller.holdVoiceHotkeyText
+        controller._set_voice_hotkey_busy(True)
+        result = qt_settings_app.voice_hotkey_sync_windows.VoiceHotkeySyncResult(
+            "sogou",
+            True,
+            "read",
+            "lctrl+lshift+f9",
+            "read from Sogou",
+        )
+
+        def refresh_runtime():
+            controller._voice_runtime_state = (
+                bridge_runtime_status.VOICE_RUNTIME_ACTIVE
+            )
+            return True
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+            side_effect=refresh_runtime,
+        ), mock.patch.object(controller, "_persist_voice_settings") as persist:
+            controller._on_voice_hotkey_refresh_ready(True, True, result)
+
+        self.assertEqual(controller.holdVoiceHotkeyText, previous)
+        self.assertFalse(controller.voiceHotkeyBusy)
+        self.assertIn("本次未刷新语音按键", controller.statusMessage)
+        persist.assert_not_called()
+
+    def test_voice_program_options_keep_missing_apps_and_mark_them(self):
+        controller, _ = self._make_controller()
+
+        def inspect(settings):
+            provider_id = settings["provider"]
+            return voice_program_manager.VoiceProgramStatus(
+                provider_id=provider_id,
+                display_name=voice_program_manager.VOICE_PROGRAM_PROVIDER_NAMES[
+                    provider_id
+                ],
+                available=provider_id != voice_program_manager.VOICE_PROGRAM_SOGOU,
+                running=False,
+                elevated=None,
+                executable=None,
+                code=(
+                    "not_found"
+                    if provider_id == voice_program_manager.VOICE_PROGRAM_SOGOU
+                    else "stopped"
+                ),
+            )
+
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "inspect_voice_program",
+            side_effect=inspect,
+        ):
+            controller.refreshVoiceProgramOptions()
+
+        self.assertEqual(controller.voiceProgramOptions[1], "搜狗语音输入（未安装）")
+        self.assertEqual(controller.voiceProgramOptions[2], "微信输入法")
+        self.assertEqual(controller.voiceProgramOptions[3], "豆包输入法")
+        self.assertEqual(controller.voiceProgramOptions[4], "Chatterfly")
+        self.assertEqual(len(controller.voiceProgramOptions), 5)
+
+    def test_unrelated_mapping_edit_does_not_mark_voice_program_dirty(self):
+        controller, model = self._make_controller()
+
+        model.setActionTextAt(model.index_of("power"), "f5")
+
+        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+
+    def test_retired_none_selection_cannot_disable_selected_program(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        controller.voiceProgramLaunchElevated = False
+
+        controller.selectedVoiceProgramIndex = 0
+
+        self.assertEqual(controller.selectedVoiceProgramIndex, 1)
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramLaunchElevated)
+
+    def test_rejected_none_selection_preserves_saved_program_after_reopen(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        controller.voiceProgramLaunchElevated = False
+        controller.selectedVoiceProgramIndex = 0
+
+        self.assertTrue(controller.saveSettings())
+
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
+        self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(reopened.voiceProgramLaunchElevated)
+
+    def test_sogou_and_custom_elevation_preferences_are_remembered_separately(self):
+        saved = config.default_config()
+        saved["voice_program"]["provider"] = "custom"
+        config.save_config(config.config_path(config.config_root()), saved)
+        controller, _ = self._make_controller()
+        self.assertFalse(controller.voiceProgramLaunchElevated)
+        controller.voiceProgramLaunchElevated = True
+        reopened, _ = self._make_controller()
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 4)
+        self.assertTrue(reopened.voiceProgramLaunchElevated)
+        reopened.selectedVoiceProgramIndex = 1
+        self.assertTrue(reopened.voiceProgramLaunchElevated)
+        reopened.voiceProgramLaunchElevated = False
+        self.assertFalse(reopened.voiceProgramLaunchElevated)
+        self.assertTrue(reopened._voice_program_settings["launch_elevated_by_provider"]["custom"])
+        reopened.selectedVoiceProgramIndex = 4
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
+
+    def test_existing_sogou_false_uses_automatic_start_without_changing_elevation(self):
+        saved = config.default_config()
+        saved["voice_program"] = {
+            "provider": "sogou",
+            "custom_executable": "",
+            "launch_on_bridge_start": False,
+            "launch_elevated": False,
+        }
+        config.save_config(config.config_path(config.config_root()), saved)
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(controller.voiceProgramLaunchElevated)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+        self.assertFalse(controller.settingsDirty)
+        self.assertNotIn("随桥接启动", controller.statusMessage)
+
+    def test_voice_program_settings_persist_without_the_mapping_save(self):
+        executable = Path(self._tmpdir.name) / "voice.exe"
+        executable.touch()
+        saved = config.default_config()
+        saved["voice_program"]["provider"] = "custom"
+        config.save_config(config.config_path(config.config_root()), saved)
+        controller, _ = self._make_controller()
+        controller.voiceProgramCustomPath = str(executable)
+        controller.voiceProgramLaunchOnBridgeStart = True
+        controller.voiceProgramLaunchElevated = True
+
+        self.assertFalse(controller.settingsDirty)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["voice_program"],
+            {
+                "provider": "custom",
+                "custom_executable": str(executable),
+                "launch_on_bridge_start": True,
+                "launch_on_bridge_start_by_provider": {"custom": True},
+                "launch_elevated": True,
+                "launch_elevated_by_provider": {
+                    "sogou": True,
+                    "custom": True,
+                },
+            },
+        )
+
+    def test_voice_auto_save_failure_restores_the_last_saved_values(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.selectedVoiceProgramIndex = 1
+
+        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+        self.assertFalse(controller.voiceProgramSettingsDirty)
+        self.assertIn("语音设置保存失败", controller.errorMessage)
+
+        with mock.patch.object(
+            config, "save_config", side_effect=OSError("settings file is locked")
+        ):
+            controller.holdVoiceHotkeyText = "ctrl+l"
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+        self.assertIn("语音设置保存失败", controller.errorMessage)
+
+    def test_voice_start_preferences_survive_program_switch_and_reopen(self):
+        saved = config.default_config()
+        saved["voice_program"] = {"provider": "custom",
+                                  "launch_on_bridge_start_by_provider": {"custom": True}}
+        config.save_config(config.config_path(config.config_root()), saved)
+        controller, _ = self._make_controller()
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
+            controller.voiceProgramLaunchOnBridgeStart = False
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        controller.voiceProgramLaunchOnBridgeStart = False
+        controller.selectedVoiceProgramIndex = 2
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        controller.selectedVoiceProgramIndex = 1
+        self.assertTrue(controller.voiceProgramLaunchOnBridgeStart)
+        reopened, _ = self._make_controller()
+        self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
+        reopened.selectedVoiceProgramIndex = 4
+        self.assertEqual(reopened.selectedVoiceProgramIndex, 1)
+        self.assertTrue(reopened.voiceProgramLaunchOnBridgeStart)
+        self.assertFalse(reopened._voice_program_settings["launch_on_bridge_start_by_provider"]["custom"])
+
+    def test_custom_path_paste_validation_and_save_failure_preserve_previous(self):
+        saved = config.default_config()
+        saved["voice_program"]["provider"] = "custom"
+        config.save_config(config.config_path(config.config_root()), saved)
+        controller, _ = self._make_controller()
+        executable = Path(self._tmpdir.name) / "语音 程序.exe"
+        executable.touch()
+        controller.voiceProgramCustomPath = '  "' + str(executable) + '"  '
+        self.assertEqual(controller.voiceProgramCustomPath, str(executable))
+        for invalid in (str(executable) + " --run", str(executable.with_suffix(".txt")),
+                        str(executable.parent / "missing.exe")):
+            controller.voiceProgramCustomPath = invalid
+            self.assertEqual(controller.voiceProgramCustomPath, str(executable))
+            self.assertIn("路径无效", controller.errorMessage)
+        another = executable.parent / "another.exe"
+        another.touch()
+        with mock.patch.object(config, "save_config", side_effect=OSError("locked")):
+            controller.voiceProgramCustomPath = str(another)
+        self.assertEqual(controller.voiceProgramCustomPath, str(executable))
+        controller.voiceProgramCustomPath = ""
+        self.assertEqual(controller.voiceProgramCustomPath, "")
+
+    def test_legacy_none_keeps_hotkey_and_path_without_selecting_or_launching(self):
+        saved = config.default_config()
+        saved["voice_program"] = {"provider": "none", "custom_executable": "old.exe",
+                                  "launch_on_bridge_start": True}
+        config.set_voice_hotkey_for_provider(saved, "none", "ctrl+f8", source="manual")
+        config.save_config(config.config_path(config.config_root()), saved)
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+        self.assertFalse(controller.voiceProgramLaunchOnBridgeStart)
+        self.assertEqual(controller.voiceProgramCustomPath, "old.exe")
+        controller.selectedVoiceProgramIndex = 2
+        result = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(config.voice_hotkey_for_provider(result, "none"), "ctrl+f8")
+        self.assertEqual(result["voice_program"]["custom_executable"], "old.exe")
+        for invalid in (-1, 0, 90):
+            controller.selectedVoiceProgramIndex = invalid
+            self.assertEqual(controller.selectedVoiceProgramIndex, 2)
+
+    def test_mapping_save_is_rejected_during_voice_hotkey_work(self):
+        controller, _ = self._make_controller()
+        controller._set_voice_hotkey_busy(True)
+
+        with mock.patch.object(config, "save_settings_pair") as save_pair:
+            self.assertFalse(controller.saveSettings())
+
+        save_pair.assert_not_called()
+        self.assertIn("语音快捷键正在处理", controller.errorMessage)
+
+    def test_voice_settings_do_not_start_during_conflicting_audio_work(self):
+        blockers = (
+            (
+                "channel_test",
+                lambda controller: qt_settings_app._vb_cable_test_active_event.set(),
+                lambda controller: qt_settings_app._vb_cable_test_active_event.clear(),
+            ),
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                self._voice_hotkey_read_mock.reset_mock()
+                self._voice_hotkey_sync_mock.reset_mock()
+                start(controller)
+                try:
+                    controller.holdVoiceHotkeyText = "ctrl+l"
+                    controller.selectedVoiceProgramIndex = 1
+                    controller.refreshVoiceHotkeyFromProvider()
+                finally:
+                    stop(controller)
+
+                self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+                self.assertEqual(controller.selectedVoiceProgramIndex, 0)
+                self._voice_hotkey_read_mock.assert_not_called()
+                self._voice_hotkey_sync_mock.assert_not_called()
+
+    def test_mapping_save_is_rejected_during_audio_configuration_work(self):
+        blockers = (
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                start(controller)
+                try:
+                    with mock.patch.object(controller, "_save") as save:
+                        self.assertFalse(controller.saveSettings())
+                finally:
+                    stop(controller)
+
+                save.assert_not_called()
+                self.assertIn("其它操作正在进行", controller.errorMessage)
+
+    def test_voice_program_launch_reports_a_normal_provider_result(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        result = voice_program_manager.VoiceProgramLaunchResult(
+            provider_id="sogou",
+            started=True,
+            already_running=False,
+            code="started",
+            elevated=True,
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+            return_value=result,
+        ):
+            controller.launchVoiceProgram()
+
+        self.assertIn("管理员权限", controller.statusMessage)
+        self.assertEqual(controller.errorMessage, "")
+
+    def test_existing_right_alt_hotkey_is_preserved_when_loading_saved_config(self):
+        saved = config.default_config()
+        saved["voice_hotkey"] = "ralt"
+        saved["voice_hotkeys"] = {"hold": "ralt"}
+        config.save_config(config.config_path(config.config_root()), saved)
+
+        controller, _ = self._make_controller()
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+
+    def test_voice_mapping_ready_reads_only_the_saved_mic_mapping(self):
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.voiceMappingReady)
+
+        controller._bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE
+        ).to_dict()
+        controller.voiceMappingReadyChanged.emit()
+
+        self.assertFalse(controller.voiceMappingReady)
+
+        controller._bindings["bindings"]["mic"] = {"kind": "broken"}
+        controller.voiceMappingReadyChanged.emit()
+
+        self.assertFalse(controller.voiceMappingReady)
+
+    def test_only_mic_primary_options_include_hold_to_talk(self):
+        controller, _ = self._make_controller()
+        self.assertNotIn(settings_ui._VOICE_HOLD_DISPLAY, controller.primaryActionOptions)
+        self.assertNotIn(
+            "开关型语音",
+            controller.primaryActionOptionsFor("mic"),
+        )
+        self.assertIn(
+            settings_ui._VOICE_HOLD_DISPLAY,
+            controller.primaryActionOptionsFor("mic"),
+        )
+        self.assertNotIn(
+            settings_ui._VOICE_HOLD_DISPLAY,
+            controller.primaryActionOptionsFor("up"),
+        )
+
+    def test_secondary_options_exclude_voice_lifecycles(self):
+        controller, _ = self._make_controller()
+        self.assertNotIn(
+            "开关型语音",
+            controller.secondaryActionOptions,
+        )
+        self.assertNotIn(
+            settings_ui._VOICE_HOLD_DISPLAY,
+            controller.secondaryActionOptions,
+        )
+        self.assertIn(
+            settings_ui.SECONDARY_UNCONFIGURED_DISPLAY,
+            controller.secondaryActionOptions,
+        )
+        self.assertNotIn("禁用", controller.secondaryActionOptions)
+
+    def test_element_navigation_is_available_to_every_mapping_entry(self):
+        controller, _ = self._make_controller()
+        self.assertIn("元素导航开关", controller.primaryActionOptions)
+        self.assertIn(
+            "元素导航开关",
+            controller.primaryActionOptionsFor("mic"),
+        )
+        self.assertIn("元素导航开关", controller.secondaryActionOptions)
+
+    def test_mouse_actions_are_available_to_every_mapping_entry(self):
+        controller, _ = self._make_controller()
+        mouse_actions = (
+            "鼠标左键单击",
+            "鼠标右键单击",
+            "鼠标中键单击",
+            "鼠标 X1 单击",
+            "鼠标 X2 单击",
+        )
+        for label in mouse_actions:
+            self.assertIn(label, controller.primaryActionOptions)
+            self.assertIn(label, controller.primaryActionOptionsFor("mic"))
+            self.assertIn(label, controller.secondaryActionOptions)
+        self.assertNotIn("滚轮向上", controller.primaryActionOptions)
+        self.assertNotIn("滚轮向下", controller.secondaryActionOptions)
+
+    def test_application_display_name_comes_from_product_identity(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(
+            controller.applicationDisplayName,
+            product_identity.DISPLAY_NAME,
+        )
+
+    def test_action_group_metadata_only_marks_real_group_starts(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.actionOptionGroupTitle("Escape"), "按键操作")
+        self.assertTrue(controller.actionOptionStartsGroup("Escape"))
+        self.assertEqual(
+            controller.actionOptionGroupTitle("鼠标左键单击"),
+            "鼠标操作",
+        )
+        self.assertFalse(controller.actionOptionStartsGroup("鼠标左键单击"))
+        self.assertEqual(
+            controller.actionOptionGroupTitle("元素导航开关"),
+            "鼠标操作",
+        )
+        self.assertTrue(controller.actionOptionStartsGroup("元素导航开关"))
+        self.assertEqual(controller.actionOptionGroupTitle("方向上"), "按键操作")
+        self.assertFalse(controller.actionOptionStartsGroup("方向上"))
+        self.assertEqual(controller.actionOptionGroupTitle("未设置"), "")
+        self.assertFalse(controller.actionOptionStartsGroup("未设置"))
+
+    def test_editor_lists_only_installed_external_applications(self):
+        controller, _ = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.action_executor,
+            "resolve_application_command",
+            side_effect=lambda action: ("C:/Apps/Claude.exe",)
+            if action.kind == key_mapping.ActionKind.OPEN_CLAUDE else None,
+        ):
+            primary = controller.primaryActionOptionsFor("up")
+            secondary = controller.secondaryActionOptionsFor("up")
+        self.assertIn("打开 Claude", primary)
+        self.assertIn("打开 Claude", secondary)
+        self.assertNotIn("打开 cmux 终端", primary)
+        self.assertNotIn("打开微信", secondary)
+        self.assertNotIn("滚轮向上", primary)
+        self.assertIn("元素导航开关", secondary)
+
+    def test_button_action_validation_slot_uses_the_save_model_rules(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(
+            controller.buttonActionValidationMessage(
+                "back",
+                "single_click",
+                "not_a_key",
+            ),
+            "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。",
+        )
+        self.assertEqual(
+            controller.buttonActionValidationMessage(
+                "back",
+                "single_click",
+                "ctrl+shift+p",
+            ),
+            "",
+        )
+
+    def test_hidden_legacy_combo_never_blocks_home_double_click_save(self):
+        legacy = config.default_key_bindings()
+        legacy["combo_bindings"] = {
+            "modifier": "tv",
+            "bindings": {
+                "up": {"kind": "key_combo", "keys": ["numpad1"]}
+            },
+            "display_notes": {},
+        }
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            legacy,
+        )
+        controller, model = self._make_controller()
+        model.setSecondaryActionTextAt(
+            model.index_of("home"),
+            "double_click",
+            "元素导航开关",
+        )
+
+        self.assertTrue(controller.saveSettings())
+        self.assertEqual(controller.errorMessage, "")
+
+        saved = config.load_key_bindings(config.key_bindings_path(config.config_root()))
+        self.assertEqual(
+            saved["secondary_bindings"]["home"]["double_click"]["kind"],
+            "element_navigation_toggle",
+        )
+        # The inert legacy combo is preserved as-is: its modifier ("tv") is not
+        # part of the Chromecast layout, so nothing can ever fire it, but the
+        # save path must not have to rewrite it either.
+        self.assertEqual(
+            saved["combo_bindings"]["bindings"],
+            {"up": {"kind": "key_combo", "keys": ["numpad1"]}},
+        )
+        self.assertFalse(hasattr(controller, "comboRows"))
+
+    def test_restore_mapping_defaults_auto_saves_and_preserves_hidden_legacy_combo(self):
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        legacy = config.default_key_bindings()
+        legacy_combo = {
+            "modifier": "tv",
+            "bindings": {
+                "up": {"kind": "key_combo", "keys": ["numpad1"]}
+            },
+            "display_notes": {},
+        }
+        legacy["combo_bindings"] = legacy_combo
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            legacy,
+        )
+        controller, _ = self._make_controller()
+
+        controller.restoreMappingDefaults()
+
+        self.assertTrue(controller.mappingDirty)
+        self._wait_for_qt(
+            app,
+            lambda: not controller.mappingDirty,
+            "restored mapping defaults did not auto-save",
+        )
+        saved = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(saved["combo_bindings"], legacy_combo)
+
+    def test_mapping_auto_save_does_not_persist_a_migrated_endpoint_draft(self):
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "Output (VB-Audio Point)"
+        saved_config["output_endpoint_host_api"] = "Windows WDM-KS"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[
+                audio_output.AudioEndpoint(
+                    name="CABLE Input (VB-Audio Virtual Cable)",
+                    host_api="Windows DirectSound",
+                ),
+                audio_output.AudioEndpoint(
+                    name="CABLE Input (VB-Audio Virtual Cable)",
+                    host_api="Windows WASAPI",
+                ),
+            ],
+        ):
+            controller, model = self._make_controller()
+            model.setActionTextAt(model.index_of("power"), "f5")
+            self.assertFalse(controller.canAutoSaveMappingBeforeExit())
+            self._wait_for_qt(
+                app,
+                lambda: not controller.mappingDirty,
+                "mapping auto-save did not finish",
+            )
+
+        persisted_config = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            persisted_config["output_endpoint_name"],
+            "Output (VB-Audio Point)",
+        )
+        self.assertEqual(
+            persisted_config["output_endpoint_host_api"],
+            "Windows WDM-KS",
+        )
+        self.assertTrue(controller.settingsDirty)
+        self.assertIn("其它设置仍未保存", controller.statusMessage)
+        saved = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        power_action = key_mapping.ButtonAction.from_dict(
+            saved["bindings"]["power"]
+        )
+        self.assertEqual(power_action.kind, key_mapping.ActionKind.KEY_COMBO)
+        self.assertEqual(power_action.keys, ("f5",))
+
+    def test_recording_a_hotkey_does_not_change_trigger_semantics(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        controller._on_hotkey_capture_result(
+            (controller._input_operation_token, "lctrl+lwin")
+        )
+        self.assertEqual(captured, ["lctrl+lwin"])
+        controller.hotkeyText = "lctrl+lwin"
+        self.assertEqual(controller.hotkeyText, "lctrl+lwin")
+
+    def test_qt_fallback_records_a_shortcut_when_low_level_hook_has_no_edge(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+
+        control = self.Qt.KeyboardModifier.ControlModifier.value
+        shift = self.Qt.KeyboardModifier.ShiftModifier.value
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Control.value, control, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Shift.value, control | shift, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_F9.value, control | shift, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_F9.value, control | shift, "", False, False
+        )
+
+        self.assertEqual(captured, ["ctrl+shift+f9"])
+        self.assertEqual(controller._qt_hotkey_tokens, [])
+
+    def test_qt_capture_keeps_punctuation_keypad_and_backtab_identity(self):
+        controller, model = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        C = self.Qt.KeyboardModifier.ControlModifier.value
+        S = self.Qt.KeyboardModifier.ShiftModifier.value
+        K = self.Qt.KeyboardModifier.KeypadModifier.value
+        cases = [
+            (self.Qt.Key.Key_BracketLeft, "\x1b", C, 0xDB, 0x1A, "left_bracket"),
+            (self.Qt.Key.Key_BracketLeft, "", C, 0, 0, "left_bracket"),
+            (self.Qt.Key.Key_Backtab, "\t", S, 0, 0, "tab"),
+            (self.Qt.Key.Key_Plus, "+", K, 0, 0, "numpad_add"),
+            (self.Qt.Key.Key_Minus, "-", K, 0, 0, "numpad_subtract"),
+            (self.Qt.Key.Key_Asterisk, "*", K, 0, 0, "numpad_multiply"),
+            (self.Qt.Key.Key_Slash, "/", K, 0, 0, "numpad_divide"),
+            (self.Qt.Key.Key_Period, ".", K, 0, 0, "numpad_decimal"),
+            (self.Qt.Key.Key_Enter, "\r", K, 0x0D, 0xE01C, "numpad_enter"),
+            (self.Qt.Key.Key_Enter, "\r", 0, 0, 0, "numpad_enter"),
+            (self.Qt.Key.Key_Return, "\r", K, 0, 0, "numpad_enter"),
+            (self.Qt.Key.Key_Left, "", K, 0, 0, "numpad_left"),
+            (self.Qt.Key.Key_Left, "", K, 0x25, 0, "numpad_left"),
+            (self.Qt.Key.Key_Left, "", 0, 0x25, 0x4B, "numpad_left"),
+            (self.Qt.Key.Key_Left, "", 0, 0x25, 0xE04B, "left"),
+            (self.Qt.Key.Key_Left, "", 0, 0, 0, "left"),
+            (self.Qt.Key.Key_Delete, "", K, 0, 0, "numpad_delete"),
+            (self.Qt.Key.Key_Clear, "", K, 0, 0, "numpad_clear"),
+            (self.Qt.Key.Key_Equal, "=", K, 0, 0, "unsupported_key"),
+            (self.Qt.Key.Key_unknown, "", C, 0xE2, 0x56, "vk_e2"),
+            (self.Qt.Key.Key_unknown, "", C, 0xE7, 0, "vk_e7"),
+            (self.Qt.Key.Key_unknown, "", C, 0, 0, "unsupported_key"),
+        ]
+        for key, text, mods, vk, scan, expected in cases:
+            with self.subTest(key=key, expected=expected):
+                controller._hotkey_capture = mock.Mock()
+                controller._set_input_operation_state("hotkey", "active")
+                controller._reset_qt_hotkey_capture_state()
+                for pressed in (True, False):
+                    controller._capture_hotkey_qt_event(
+                        key.value, mods, text, pressed, False,
+                        native_virtual_key=vk, native_scan_code=scan,
+                    )
+                chord = captured[-1]
+                self.assertEqual(chord.split("+")[-1], expected)
+                result = controller.normalizeMappingHotkeyText(chord)
+                self.assertEqual(result["ok"], expected in {
+                    "left_bracket", "tab", "numpad_add", "numpad_subtract",
+                    "numpad_multiply", "numpad_divide", "numpad_decimal", "left", "vk_e2",
+                })
+
+    def test_qt_capture_does_not_reintroduce_forwarded_chatterfly_probe(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = mock.Mock()
+        controller._set_input_operation_state("hotkey", "active")
+        control = self.Qt.KeyboardModifier.ControlModifier.value
+        shift = self.Qt.KeyboardModifier.ShiftModifier.value
+        controller._capture_hotkey_qt_event(
+            self.Qt.Key.Key_Control.value, control, "", True, False,
+            native_virtual_key=0xA3, native_scan_code=0xE01D)
+        before = list(controller._qt_hotkey_tokens)
+        for pressed in (True, False):
+            self.assertFalse(controller._capture_hotkey_qt_event(
+                self.Qt.Key.Key_unknown.value, control, "", pressed, False,
+                native_virtual_key=0xFC, native_scan_code=0))
+        self.assertEqual(controller._qt_hotkey_tokens, before)
+        self.assertEqual(captured, [])
+        controller._capture_hotkey_qt_event(
+            self.Qt.Key.Key_Shift.value, control | shift, "", True, False,
+            native_virtual_key=0xA1, native_scan_code=0x36)
+        for pressed in (True, False):
+            controller._capture_hotkey_qt_event(
+                self.Qt.Key.Key_0.value, control | shift, "", pressed, False,
+                native_virtual_key=0x30, native_scan_code=0x0B)
+        self.assertEqual(captured, ["rctrl+rshift+0"])
+
+    def test_readable_mapping_labels_never_replace_the_stored_key_tokens(self):
+        controller, model = self._make_controller()
+        row = model.index_of("up")
+        model.setActionTextAt(row, "左 Ctrl + [")
+        model.setSecondaryActionTextAt(row, "double_click", "Ctrl + 小键盘加号")
+        self.assertEqual(model.to_display_map()["up"], "lctrl+left_bracket")
+        self.assertEqual(model.data(model.index(row, 0), model.ActionTextRole), "左 Ctrl + [")
+        self.assertEqual(model.to_secondary_display_map()["up"]["double_click"], "ctrl+numpad_add")
+        self.assertEqual(controller.formatHotkeyText("lctrl+left_bracket"), "左 Ctrl + [")
+        self.assertEqual(controller._qt_hotkey_pressed_keys, set())
+
+    def test_qt_fallback_keeps_modifier_only_shortcuts_representable(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+
+        control = self.Qt.KeyboardModifier.ControlModifier.value
+        shift = self.Qt.KeyboardModifier.ShiftModifier.value
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Control.value, control, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Shift.value, control | shift, "", True, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Shift.value, control, "", False, False
+        )
+        controller.captureHotkeyQtEvent(
+            self.Qt.Key.Key_Control.value, 0, "", False, False
+        )
+
+        self.assertEqual(captured, ["ctrl+shift"])
+
+    def _record_qt_native_edge(
+        self, controller, key, pressed, vk=0, scan=0, modifiers=0, auto_repeat=False
+    ):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+
+        event = QKeyEvent(
+            QEvent.Type.KeyPress if pressed else QEvent.Type.KeyRelease,
+            key.value,
+            self.Qt.KeyboardModifier(modifiers),
+            scan,
+            vk,
+            0,
+            "",
+            auto_repeat,
+        )
+        with mock.patch.object(qt_settings_app.sys, "platform", "win32"):
+            return controller.eventFilter(None, event)
+
+    def test_navigation_leaves_qt_keyboard_alone_but_accepts_remote_mapping(self):
+        from PySide6.QtWidgets import QApplication
+        from ovb import element_navigation_runtime
+        app = QApplication.instance() or QApplication([])
+        host = element_navigation_runtime._load_prototype()._load_element_navigation_windows_host()
+        control = qt_settings_app.element_navigation_control_windows
+        controller, _ = self._make_controller()
+        self.addCleanup(app.removeEventFilter, controller)
+        actions = []
+        client = control.EmbeddedElementNavigationClient()
+        client.bind(host.EmbeddedElementNavigationRuntime(
+            mock.Mock(), mock.Mock(), mock.Mock(), mapped_input=lambda vk: actions.append(vk) or True,
+        ))
+        with mock.patch.object(control, "_DEFAULT_CLIENT", client):
+            self.assertFalse(self._record_qt_native_edge(controller, self.Qt.Key.Key_Up, True))
+            self.assertFalse(self._record_qt_native_edge(controller, self.Qt.Key.Key_Up, False))
+            self.assertTrue(control.route_mapped_navigation_key(host.VK_UP))
+            self.assertEqual(actions, [host.VK_UP])
+            self.assertFalse(self._record_qt_native_edge(controller, self.Qt.Key.Key_A, True))
+
+    def test_navigation_qt_fallback_preserves_shortcut_capture_priority(self):
+        controller, _ = self._make_controller()
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        with mock.patch.object(qt_settings_app.element_navigation_control_windows,
+                               "route_local_navigation_key", return_value=True) as route:
+            self._record_qt_native_edge(controller, self.Qt.Key.Key_Up, True)
+            self._record_qt_native_edge(controller, self.Qt.Key.Key_Up, False)
+            route.assert_not_called()
+
+    def test_qt_fallback_preserves_native_modifier_sides(self):
+        cases = (
+            ("ralt", self.Qt.Key.Key_Alt, 0xA5, 0, "AltModifier"),
+            ("ralt", self.Qt.Key.Key_Alt, 0x12, 0xE038, "AltModifier"),
+            ("ralt", self.Qt.Key.Key_AltGr, 0x12, 0xE038, "GroupSwitchModifier"),
+            ("lalt", self.Qt.Key.Key_Alt, 0x12, 0x38, "AltModifier"),
+            ("rctrl", self.Qt.Key.Key_Control, 0x11, 0xE01D, "ControlModifier"),
+            ("lctrl", self.Qt.Key.Key_Control, 0x11, 0x1D, "ControlModifier"),
+            ("rshift", self.Qt.Key.Key_Shift, 0x10, 0x36, "ShiftModifier"),
+            ("lshift", self.Qt.Key.Key_Shift, 0x10, 0x2A, "ShiftModifier"),
+            ("rwin", self.Qt.Key.Key_Meta, 0x5C, 0xE05C, "MetaModifier"),
+            ("lwin", self.Qt.Key.Key_Meta, 0x5B, 0xE05B, "MetaModifier"),
+        )
+        for token, key, vk, scan, flag_name in cases:
+            with self.subTest(token=token, vk=vk, scan=scan):
+                controller, _ = self._make_controller()
+                captured = []
+                controller.hotkeyCaptured.connect(captured.append)
+                controller._hotkey_capture = object()
+                controller._set_input_operation_state("hotkey", "active")
+                flags = getattr(self.Qt.KeyboardModifier, flag_name).value
+                self.assertTrue(self._record_qt_native_edge(
+                    controller, key, True, vk, scan, flags
+                ))
+                self.assertEqual(captured, [])
+                self.assertTrue(self._record_qt_native_edge(
+                    controller, key, False, vk, scan
+                ))
+                self.assertEqual(captured, [token])
+                self.assertEqual(hotkey.HotkeySpec.parse(captured[0]).key, token)
+
+    def test_qt_fallback_right_alt_space_does_not_add_generic_alt(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        alt = self.Qt.KeyboardModifier.AltModifier.value
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, True, 0x12, 0xE038)
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Space, True, 0x20, 0x39, alt)
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Space, False, 0x20, 0x39, alt)
+        self.assertEqual(captured, ["ralt+space"])
+
+    def test_qt_fallback_waits_for_both_alt_sides_to_be_released(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        alt = self.Qt.KeyboardModifier.AltModifier.value
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, True, 0x12, 0x38)
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, True, 0x12, 0xE038, alt)
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, False, 0x12, 0xE038, alt)
+        self.assertEqual(captured, [])
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, False, 0x12, 0x38)
+        self.assertEqual(captured, ["lalt+ralt"])
+
+    def test_qt_fallback_replaces_flag_only_alt_with_its_native_edge(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        alt = self.Qt.KeyboardModifier.AltModifier.value
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Shift, True, 0x10, 0x2A, alt)
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, True, 0x12, 0xE038)
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Shift, False, 0x10, 0x2A, alt)
+        self.assertEqual(captured, [])
+        self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, False, 0x12, 0xE038)
+        self.assertEqual(captured, ["ralt+lshift"])
+
+    def test_qt_fallback_does_not_guess_alt_side_without_native_identity(self):
+        for vk, scan in ((0, 0), (0x12, 0)):
+            with self.subTest(vk=vk, scan=scan):
+                controller, _ = self._make_controller()
+                captured = []
+                controller.hotkeyCaptured.connect(captured.append)
+                controller._hotkey_capture = object()
+                controller._set_input_operation_state("hotkey", "active")
+                self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, True, vk, scan)
+                self._record_qt_native_edge(controller, self.Qt.Key.Key_Alt, False, vk, scan)
+                self.assertEqual(captured, ["alt"])
+                with self.assertRaises(hotkey.HotkeyParseError):
+                    hotkey.HotkeySpec.parse(captured[0])
+
+    def test_qt_fallback_ignores_auto_repeat_and_events_outside_recording(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        key = self.Qt.Key.Key_Alt
+        self.assertFalse(self._record_qt_native_edge(controller, key, True, 0x12, 0xE038))
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        self._record_qt_native_edge(controller, key, True, 0x12, 0xE038)
+        self._record_qt_native_edge(controller, key, False, 0x12, 0xE038, auto_repeat=True)
+        self.assertEqual(captured, [])
+        self._record_qt_native_edge(controller, key, True, 0x12, 0xE038, auto_repeat=True)
+        self._record_qt_native_edge(controller, key, False, 0x12, 0xE038)
+        self.assertEqual(captured, ["ralt"])
+        self.assertEqual(controller._qt_hotkey_tokens, [])
+        self.assertEqual(controller._qt_hotkey_pressed_keys, set())
+
+    def test_late_hotkey_results_are_ignored_after_cleanup_or_exit_begins(self):
+        cases = (
+            "stopping",
+            "cleanup",
+            "hide",
+            "exit_requested",
+            "exit_confirmed",
+            "exit_intent",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                controller, _ = self._make_controller()
+                captured = []
+                controller.hotkeyCaptured.connect(captured.append)
+                controller._hotkey_capture = object()
+                controller._set_input_operation_state("hotkey", "active")
+                if case == "stopping":
+                    controller._set_input_operation_state("hotkey", "stopping")
+                elif case == "cleanup":
+                    controller._input_cleanup_requested = True
+                elif case == "hide":
+                    controller._window_hide_requested = True
+                elif case == "exit_requested":
+                    controller._application_exit_requested = True
+                elif case == "exit_confirmed":
+                    controller._application_exit_confirmed = True
+                else:
+                    controller._application_exit_intent.set()
+
+                controller._on_hotkey_capture_result(
+                    (controller._input_operation_token, "ctrl+alt+n")
+                )
+
+                self.assertEqual(captured, [])
+
+    def test_hotkey_captured_during_start_is_delivered_after_hook_start_finishes(self):
+        controller, _ = self._make_controller()
+        captured = []
+        instances = []
+
+        class ImmediateCapture:
+            def __init__(self, callback, *, accept_injected=False, isolated=False, on_error=None):
+                self._callback = callback
+                self.accept_injected = accept_injected
+                self.is_running = False
+                instances.append(self)
+
+            def start(self):
+                self._callback("lctrl+lshift+f8")
+
+            def stop(self):
+                self.is_running = False
+
+        def on_captured(chord):
+            captured.append(chord)
+            controller.stopHotkeyCapture()
+
+        controller.hotkeyCaptured.connect(on_captured)
+        with mock.patch.object(
+            qt_settings_app.hotkey_capture_windows,
+            "HotkeyCapture",
+            ImmediateCapture,
+        ):
+            controller.startHotkeyCapture()
+
+        self.assertEqual(captured, ["lctrl+lshift+f8"])
+        self.assertTrue(instances[0].accept_injected)
+        self.assertFalse(controller.hotkeyCaptureReady)
+        self.assertFalse(controller.hotkeyCaptureActive)
+        self.assertIsNone(controller._hotkey_capture)
+        self.assertIsNone(controller._pending_hotkey_capture_result)
+
+    def test_hotkey_cancel_or_child_failure_wins_over_late_start_and_result(self):
+        for failed in (False, True):
+            with self.subTest(child_failed=failed):
+                controller, _ = self._make_controller()
+                captured, errors = [], []
+                controller.hotkeyCaptured.connect(captured.append)
+                controller.hotkeyCaptureError.connect(errors.append)
+                controller._set_input_operation_state("hotkey", "starting")
+                controller._input_operation_cancel_event = threading.Event()
+                token = controller._input_operation_token
+                capture = mock.Mock()
+                if failed:
+                    controller._on_hotkey_capture_failed((token, "录入已中断"))
+                else:
+                    controller.stopHotkeyCapture()
+                controller._on_hotkey_capture_result((token, "rctrl+rshift+0"))
+                controller._on_input_operation_ready((
+                    token, "start", qt_settings_app._InputStartResult(
+                        "hotkey", True, hotkey_capture=capture,
+                    ),
+                ))
+                self.assertEqual(captured, [])
+                self.assertEqual(errors, ["录入已中断"] if failed else [])
+                self.assertEqual(controller._input_operation_phase, "idle")
+                self.assertIsNone(controller._pending_hotkey_capture_result)
+                capture.stop.assert_called_once_with()
+
+    def test_stale_hotkey_child_failure_cannot_stop_a_new_recording(self):
+        controller, _ = self._make_controller()
+        controller._set_input_operation_state("hotkey", "active")
+        with mock.patch.object(controller, "_request_input_stop") as stop:
+            controller._on_hotkey_capture_failed((controller._input_operation_token - 1, "旧错误"))
+        stop.assert_not_called()
+
+    def test_hotkey_capture_ready_only_after_the_hook_is_active(self):
+        controller, _ = self._make_controller()
+
+        controller._set_input_operation_state("hotkey", "starting")
+        self.assertTrue(controller.hotkeyCaptureActive)
+        self.assertFalse(controller.hotkeyCaptureReady)
+
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+        self.assertTrue(controller.hotkeyCaptureReady)
+
+        controller._set_input_operation_state("hotkey", "stopping")
+        self.assertFalse(controller.hotkeyCaptureReady)
+
+    def test_hotkey_result_from_an_older_operation_is_ignored(self):
+        controller, _ = self._make_controller()
+        captured = []
+        controller.hotkeyCaptured.connect(captured.append)
+        controller._input_operation_token = 4
+        controller._hotkey_capture = object()
+        controller._set_input_operation_state("hotkey", "active")
+
+        controller._on_hotkey_capture_result((3, "ctrl+alt+n"))
+
+        self.assertEqual(captured, [])
+
+    def test_launch_status_starts_as_the_not_started_constant(self):
+        controller, _ = self._make_controller()
+        self.assertEqual(controller.launchStatusText, settings_ui.LAUNCH_NOT_STARTED_TEXT)
+        self.assertFalse(controller.bridgeRunning)
+
+    def test_other_windows_session_status_is_not_shown_or_restarted(self):
+        other_identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__,
+            frozen=False,
+            source_root=Path(self._tmpdir.name) / "other-session",
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=2222,
+            identity=other_identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_active=True,
+            session_id=2,
+        )
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+
+        with mock.patch.object(
+            bridge_runtime_status.sys,
+            "platform",
+            "win32",
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "_default_status_scope",
+            bridge_runtime_status._STATUS_SCOPE_UNSET,
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "current_process_session_id",
+            return_value=1,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
+
+    def test_launch_status_recognizes_an_existing_bridge(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("服务运行中", controller.launchStatusText)
+        self.assertIn("状态未知", controller.launchStatusText)
+
+    def test_launch_status_reads_the_bridge_reported_connected_state(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertTrue(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "connected")
+        self.assertIn("谷歌 Chromecast 遥控器 已连接", controller.launchStatusText)
+
+    def test_retry_wait_status_is_exposed_as_a_connection_failure(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.RETRY_WAIT,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeConnectionState, "retry_wait")
+        self.assertTrue(controller.bridgeReconnectAvailable)
+        self.assertIn("连接失败，等待重试", controller.launchStatusText)
+
+    def test_waiting_current_bridge_exposes_immediate_reconnect(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertTrue(controller.bridgeReconnectAvailable)
+        self.assertFalse(controller.bridgeReconnectBusy)
+
+    def test_connecting_current_bridge_does_not_expose_immediate_reconnect(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTING,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeConnectionState, "connecting")
+        self.assertFalse(controller.bridgeReconnectAvailable)
+
+    def test_immediate_reconnect_wakes_worker_and_throttles_repeated_clicks(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        callbacks = []
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ), mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reconnect_in_process_bridge_now",
+            return_value=True,
+        ) as reconnect, mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda delay, callback: callbacks.append((delay, callback)),
+        ):
+            controller, _ = self._make_controller()
+            controller.reconnectBridgeNow()
+            controller.reconnectBridgeNow()
+
+        reconnect.assert_called_once_with()
+        self.assertTrue(controller.bridgeReconnectBusy)
+        self.assertEqual(controller.bridgeLaunchPhase, "reconnecting")
+        self.assertIn("正在立即连接", controller.launchStatusText)
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(
+            callbacks[0][0],
+            qt_settings_app._BRIDGE_RECONNECT_BUSY_TIMEOUT_MS,
+        )
+
+        with mock.patch.object(controller, "_refresh_bridge_status") as refresh:
+            callbacks[0][1]()
+
+        self.assertFalse(controller.bridgeReconnectBusy)
+        refresh.assert_called_once_with()
+
+    def test_reconnect_feedback_yields_to_a_restart_recommendation(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        path = bridge_runtime_status.status_path(config.config_root())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"schema":1,"state":"waiting_for_device","pid":4321,'
+            '"updated_at":1}',
+            encoding="utf-8",
+        )
+
+        controller, _ = self._make_controller()
+        controller._set_bridge_reconnect_busy(True)
+        controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertFalse(controller.bridgeReconnectBusy)
+        self.assertNotEqual(controller.bridgeLaunchPhase, "reconnecting")
+
+    def test_bridge_status_error_clears_immediate_reconnect_state(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+        controller._set_bridge_reconnect_busy(True)
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "status unavailable"
+            ),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertFalse(controller.bridgeReconnectBusy)
+        self.assertEqual(controller.bridgeLaunchPhase, "unknown")
+
+    def test_immediate_reconnect_accepts_an_already_recovered_connection(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+            bridge_runtime_status.publish_status(
+                config.config_root(),
+                bridge_runtime_status.BridgeConnectionState.CONNECTED,
+                pid=4321,
+                identity=identity,
+                raw_input_state="ready",
+                hid_tap_state=frida_compat.HidTapState.READY.value,
+            )
+            with mock.patch.object(
+                qt_settings_app.bridge_launcher,
+                "reconnect_in_process_bridge_now",
+            ) as reconnect:
+                controller.reconnectBridgeNow()
+
+        reconnect.assert_not_called()
+        self.assertTrue(controller.bridgeConnected)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertEqual(controller.errorMessage, "")
+
+    def test_immediate_reconnect_reports_when_the_service_already_stopped(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ):
+            controller.reconnectBridgeNow()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertIn("启动服务", controller.errorMessage)
+        self.assertNotIn("重新启动", controller.errorMessage)
+
+    def test_immediate_reconnect_delivery_failure_asks_to_retry_later(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ), mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reconnect_in_process_bridge_now",
+            return_value=False,
+        ):
+            controller, _ = self._make_controller()
+            controller.reconnectBridgeNow()
+
+        self.assertFalse(controller.bridgeReconnectAvailable)
+        self.assertIn("稍后再试", controller.errorMessage)
+        self.assertNotIn("重新启动", controller.errorMessage)
+
+    def test_current_bridge_status_exposes_version_channels_and_recent_button(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
+            last_button_at=time.time(),
+            last_button_source="hid",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertIn("当前版本", controller.launchStatusText)
+        self.assertIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn("刚收到按键", controller.launchStatusText)
+        self.assertEqual(controller.rawInputState, "ready")
+        self.assertEqual(controller.hidTapState, frida_compat.HidTapState.READY.value)
+        self.assertFalse(controller.bridgeRestartRecommended)
+
+    def test_bridge_refresh_updates_input_states_after_the_remote_wakes(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            identity=identity,
+            raw_input_state="no_device",
+            hid_tap_state=frida_compat.HidTapState.WAITING_HOST.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "in_process_bridge_running",
+            return_value=True,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertEqual(controller.rawInputState, "no_device")
+        self.assertEqual(
+            controller.hidTapState,
+            frida_compat.HidTapState.WAITING_HOST.value,
+        )
+        changes = []
+        controller.bridgeInputStateChanged.connect(
+            lambda: changes.append(
+                (controller.rawInputState, controller.hidTapState)
+            )
+        )
+
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+        controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeConnected)
+        self.assertEqual(controller.rawInputState, "ready")
+        self.assertEqual(controller.hidTapState, frida_compat.HidTapState.READY.value)
+        self.assertEqual(
+            changes,
+            [("ready", frida_compat.HidTapState.READY.value)],
+        )
+
+    def test_bridge_stop_clears_live_input_states(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
+
+    def test_unknown_voice_shortcut_channel_is_not_reported_as_all_normal(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="unknown",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertNotIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn("语音快捷键通道正在检查", controller.launchStatusText)
+
+    def test_recovering_voice_shortcut_channel_is_not_reported_as_all_normal(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="recovering",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertNotIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn(
+            "自定义按键映射可用；语音快捷键通道正在恢复",
+            controller.launchStatusText,
+        )
+
+    def test_failed_voice_shortcut_channel_is_reported_directly(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="failed",
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertNotIn("两个按键通道正常", controller.launchStatusText)
+        self.assertIn(
+            "自定义按键映射可用；语音快捷键通道异常",
+            controller.launchStatusText,
+        )
+        self.assertEqual(controller.voiceKeyPhysicalizerState, "failed")
+        self.assertTrue(controller.bridgeRestartRecommended)
+
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
+        )
+        controller.refreshBridgeState()
+
+        self.assertEqual(controller.voiceKeyPhysicalizerState, "ready")
+        self.assertFalse(controller.bridgeRestartRecommended)
+
+    def test_missing_bridge_status_requires_restart_after_the_bounded_wait(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        started_at = 120.0
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            return_value=started_at,
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+
+        with mock.patch.object(
+            qt_settings_app.time,
+            "monotonic",
+            return_value=(
+                started_at + qt_settings_app._BRIDGE_STATUS_MISSING_AFTER_SECONDS
+            ),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("服务状态异常", controller.launchStatusText)
+
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
+        )
+        controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeConnected)
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "connected")
+        self.assertIsNone(controller._bridge_status_missing_since)
+
+    def test_raw_input_ready_with_failed_tap_reports_all_custom_mapping_disabled(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.FAILED.value,
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertIn(
+            "Windows 原始按键可用；自定义按键映射已停用",
+            controller.launchStatusText,
+        )
+
+    def test_voice_runtime_failure_refreshes_settings_properties(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=bridge_runtime_status.current_runtime_identity(
+                qt_settings_app.__version__
+            ),
+            voice_runtime_state=(
+                bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED
+            ),
+            voice_runtime_provider="wetype",
+            voice_runtime_updated_at=42.0,
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertEqual(
+            controller.voiceRuntimeState,
+            bridge_runtime_status.VOICE_RUNTIME_HOST_START_FAILED,
+        )
+        self.assertEqual(controller.voiceRuntimeProvider, "wetype")
+
+    def test_unknown_wetype_capture_is_shown_without_start_failure(self):
+        from ovb import remote_selection
+        controller, _ = self._make_controller()
+        status = bridge_runtime_status.BridgeRuntimeStatus(
+            schema=bridge_runtime_status.SCHEMA_VERSION,
+            state=bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321, updated_at=time.time(),
+            voice_runtime_state=bridge_runtime_status.VOICE_RUNTIME_HOST_UNCONFIRMED,
+            voice_runtime_provider="wetype", voice_active=False)
+        with mock.patch.object(remote_selection, "active_profile",
+                               return_value=remote_selection.CHROMECAST_PROFILE):
+            text = controller._describe_runtime_status(status)
+            self.assertIn("已收到声音，未确认微信开麦", text)
+            self.assertIn("若未输入文字，请松开后重试", text)
+            self.assertNotIn("启动失败", text)
+
+    def test_legacy_bridge_recommends_manual_restart_without_auto_stopping(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        path = bridge_runtime_status.status_path(config.config_root())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"schema":1,"state":"connected","pid":4321,"updated_at":1}',
+            encoding="utf-8",
+        )
+
+        controller, _ = self._make_controller()
+        callbacks = []
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertEqual(callbacks, [])
+
+    def test_mismatched_idle_bridge_schedules_only_one_controlled_recovery(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__,
+            frozen=False,
+            source_root=Path(self._tmpdir.name) / "other-build",
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+        )
+        controller, _ = self._make_controller()
+        callbacks = []
+        recoveries = []
+
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.refreshBridgeState()
+            controller.refreshBridgeState()
+            self.assertEqual(len(callbacks), 1)
+            with mock.patch.object(
+                controller,
+                "_begin_bridge_restart",
+                side_effect=lambda **kwargs: recoveries.append(kwargs),
+            ):
+                callbacks.pop()()
+
+        self.assertEqual(recoveries, [{"automatic": True}])
+
+    def test_manual_restart_refuses_to_interrupt_active_voice(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        identity = bridge_runtime_status.current_runtime_identity(
+            qt_settings_app.__version__
+        )
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=identity,
+            voice_active=True,
+        )
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+        ) as request_exit:
+            controller.restartBridge()
+
+        request_exit.assert_not_called()
+        self.assertIn("正在语音输入", controller.errorMessage)
+
+    def test_legacy_handoff_still_stops_when_stale_status_reports_active_voice(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            config.config_root(),
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            identity=bridge_runtime_status.current_runtime_identity(
+                qt_settings_app.__version__
+            ),
+            voice_active=True,
+        )
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+            return_value=qt_settings_app.bridge_control_windows.BridgeExitResult(
+                True,
+                False,
+                "test stop failed",
+            ),
+        ) as request_exit:
+            controller._begin_bridge_restart(
+                automatic=True,
+                allow_active_voice=True,
+            )
+
+        request_exit.assert_called_once_with(reason="automatic_restart")
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("test stop failed", controller.launchStatusText)
+
+    def test_live_bridge_refresh_tracks_external_start_and_exit(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        ):
+            controller.refreshBridgeState()
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("状态未知", controller.launchStatusText)
+
+        controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(
+            controller.launchStatusText,
+            settings_ui.LAUNCH_NOT_STARTED_TEXT,
+        )
+
+    def test_bridge_refresh_does_not_mistake_active_loopback_guard_for_bridge(self):
+        controller, _ = self._make_controller()
+        qt_settings_app._vb_cable_test_active_event.set()
+        try:
+            with mock.patch.object(
+                qt_settings_app.single_instance,
+                "bridge_instance_running",
+            ) as status_probe:
+                running = controller._refresh_bridge_status()
+        finally:
+            qt_settings_app._vb_cable_test_active_event.clear()
+
+        self.assertFalse(running)
+        self.assertFalse(controller.bridgeRunning)
+        status_probe.assert_not_called()
+
+    def test_live_bridge_refresh_recovers_after_an_unknown_initial_state(self):
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "status unavailable"
+            ),
+        )
+        self._bridge_status_patch.start()
+        controller, _ = self._make_controller()
+        self.assertEqual(
+            controller.launchStatusText,
+            settings_ui.LAUNCH_STATUS_UNKNOWN_TEXT,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(
+            controller.launchStatusText,
+            settings_ui.LAUNCH_NOT_STARTED_TEXT,
+        )
+
+    def test_unsupported_saved_wdmks_endpoint_preselects_preferred_cable_input(self):
+        saved = config.default_config()
+        saved["output_endpoint_name"] = "Output (VB-Audio Point)"
+        saved["output_endpoint_host_api"] = "Windows WDM-KS"
+        config.save_config(config.config_path(config.config_root()), saved)
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows DirectSound",
+            ),
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows WASAPI",
+            ),
+        ]
+
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        selected = controller.endpointOptions[controller.selectedEndpointIndex]
+        self.assertIn("CABLE Input", selected)
+        self.assertIn("Windows WASAPI", selected)
+        self.assertIn("WDM-KS", controller.statusMessage)
+        self.assertIn("重新选择该端点以自动保存", controller.statusMessage)
+        self.assertTrue(controller.settingsDirty)
+
+    def test_endpoint_recommendation_prefers_unique_cable_input_wasapi(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows DirectSound",
+            ),
+            audio_output.AudioEndpoint(
+                name="Speakers",
+                host_api="Windows WASAPI",
+            ),
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows WASAPI",
+            ),
+        ]
+
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertEqual(
+            controller.endpointOptions[controller.recommendedEndpointIndex],
+            settings_ui._endpoint_display(endpoints[2]),
+        )
+        self.assertTrue(
+            all("推荐" not in option for option in controller.endpointOptions),
+            "the display-only recommendation must never pollute saved endpoint text",
+        )
+
+    def test_endpoint_recommendation_falls_back_to_unique_directsound_cable_input(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="Speakers",
+                host_api="Windows WASAPI",
+            ),
+            audio_output.AudioEndpoint(
+                name="CABLE Input",
+                host_api="Windows DirectSound",
+            ),
+        ]
+
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertGreaterEqual(controller.recommendedEndpointIndex, 0)
+        self.assertEqual(
+            controller.endpointOptions[controller.recommendedEndpointIndex],
+            settings_ui._endpoint_display(endpoints[1]),
+        )
+
+    def test_endpoint_recommendation_fails_closed_for_unsupported_or_ambiguous_matches(self):
+        cases = (
+            [
+                audio_output.AudioEndpoint(
+                    name="CABLE Input",
+                    host_api="MME",
+                )
+            ],
+            [
+                audio_output.AudioEndpoint(
+                    name="CABLE Input",
+                    host_api="Windows WASAPI",
+                ),
+                audio_output.AudioEndpoint(
+                    name="CABLE Input",
+                    host_api="Windows WASAPI",
+                ),
+            ],
+            [
+                audio_output.AudioEndpoint(
+                    name="CABLE Input Splitter Pro",
+                    host_api="Windows WASAPI",
+                )
+            ],
+        )
+
+        for endpoints in cases:
+            with self.subTest(endpoints=endpoints), mock.patch.object(
+                audio_output, "enumerate_output_endpoints", return_value=endpoints
+            ):
+                controller, _ = self._make_controller()
+                self.assertEqual(controller.recommendedEndpointIndex, -1)
+
+    def test_missing_saved_endpoint_is_not_recommended_and_does_not_hide_live_recommendation(self):
+        saved = config.default_config()
+        saved["output_endpoint_name"] = "Missing Speakers"
+        saved["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved)
+        live_endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[live_endpoint],
+        ):
+            controller, _ = self._make_controller()
+
+        self.assertEqual(controller.selectedEndpointIndex, 0)
+        self.assertEqual(controller.recommendedEndpointIndex, 1)
+        self.assertIn("Missing Speakers", controller.endpointOptions[0])
+        self.assertEqual(
+            controller.endpointOptions[1],
+            settings_ui._endpoint_display(live_endpoint),
+        )
+
+    def test_photo_available_and_source_are_consistent(self):
+        controller, _ = self._make_controller()
+        # This repository ships Resources/Chromecast-remote-photo.png, so this
+        # should be true in every real checkout - but the assertion is
+        # written to hold either way (never a stretched/fake image, see
+        # task DoD): availability and a non-empty source string must agree.
+        self.assertEqual(controller.photoAvailable, bool(controller.photoSource))
+
+    def test_device_selector_defaults_to_the_only_shipped_profile(self):
+        # A default selection (or a persisted id this build does not ship)
+        # must land on the only profile it does ship instead of pointing at an
+        # absent catalog entry.
+        controller, _ = self._make_controller()
+        self.assertEqual(
+            controller.selectedDeviceIndex,
+            controller._DEVICE_ORDER.index(device_catalog.DEFAULT_ID),
+        )
+        self.assertEqual(
+            controller.deviceOptions,
+            [device_catalog.DEFAULT_DISPLAY_NAME],
+        )
+        self.assertEqual(controller.mappingPageTitle, "按键映射")
+
+    def test_unrecognized_selection_lands_on_the_shipped_profile_and_is_not_rewritten(self):
+        # A pre-existing config can carry an id this build never shipped.
+        # Opening settings must land on the only shipped profile and must NOT
+        # rewrite the saved file: normalization is a read-time decision, so an
+        # old build can still open the same config unchanged.
+        saved = config.default_config()
+        saved["selected_device_profile"] = "not-a-shipped-profile"
+        path = config.config_path(config.config_root())
+        config.save_config(path, saved)
+
+        controller, _ = self._make_controller()
+
+        self.assertEqual(controller.deviceOptions, [device_catalog.DEFAULT_DISPLAY_NAME])
+        self.assertEqual(
+            controller.selectedDeviceIndex,
+            controller._DEVICE_ORDER.index(device_catalog.DEFAULT_ID),
+        )
+        self.assertEqual(
+            config.load_config(path)["selected_device_profile"],
+            "not-a-shipped-profile",
+        )
+        self.assertFalse(controller.settingsDirty)
+
+    def test_save_settings_persists_and_clears_error_message(self):
+        controller, model = self._make_controller()
+        model.setActionTextAt(model.index_of("power"), "escape")
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.saveSettings())
+        self.assertFalse(controller.settingsDirty)
+        self.assertEqual(controller.errorMessage, "")
+        self.assertIn("已保存", controller.statusMessage)
+
+        model.setActionTextAt(model.index_of("power"), "Return")
+        self.assertTrue(controller.settingsDirty)
+        self.assertIn("自动保存", controller.statusMessage)
+
+    def test_mapping_edit_auto_saves_after_the_event_loop_turn(self):
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller, model = self._make_controller()
+
+        model.setActionTextAt(model.index_of("power"), "ctrl+l")
+
+        self.assertTrue(controller.mappingDirty)
+        self.assertTrue(controller.canAutoSaveMappingBeforeExit())
+        self._wait_for_qt(
+            app,
+            lambda: not controller.mappingDirty,
+            "mapping edit did not auto-save",
+        )
+        saved = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        action = key_mapping.ButtonAction.from_dict(saved["bindings"]["power"])
+        self.assertEqual(action.keys, ("ctrl", "l"))
+        self.assertFalse(controller.settingsDirty)
+        self.assertFalse(controller.mappingAutoSaveRetryAvailable)
+        self.assertIn("按键映射已自动保存", controller.statusMessage)
+
+    def test_mapping_auto_save_coalesces_one_editor_batch(self):
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller, model = self._make_controller()
+        power_row = model.index_of("power")
+
+        with mock.patch.object(
+            config,
+            "save_settings_pair",
+            wraps=config.save_settings_pair,
+        ) as save_pair:
+            model.setActionTextAt(power_row, "ctrl+c")
+            model.setSecondaryActionTextAt(power_row, "double_click", "Escape")
+            model.setSecondaryActionTextAt(power_row, "long_press", "Return")
+            model.setDisplayNoteAt(power_row, "single_click", "复制")
+            model.setDisplayNoteAt(power_row, "double_click", "取消")
+            model.setDisplayNoteAt(power_row, "long_press", "确认")
+            self._wait_for_qt(
+                app,
+                lambda: not controller.mappingDirty,
+                "mapping editor batch did not auto-save",
+            )
+
+        save_pair.assert_called_once()
+
+    def test_failed_mapping_auto_save_keeps_the_edit_and_can_retry(self):
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        controller, model = self._make_controller()
+
+        with mock.patch.object(
+            config,
+            "save_settings_pair",
+            side_effect=OSError("settings file is locked"),
+        ):
+            model.setActionTextAt(model.index_of("power"), "ctrl+l")
+            self._wait_for_qt(
+                app,
+                lambda: controller.mappingAutoSaveRetryAvailable,
+                "failed auto-save did not expose retry",
+            )
+
+        self.assertTrue(controller.mappingDirty)
+        self.assertIn("保存失败", controller.errorMessage)
+        self.assertFalse(controller.canAutoSaveMappingBeforeExit())
+        self.assertTrue(controller.retryMappingAutoSave())
+        self._wait_for_qt(
+            app,
+            lambda: not controller.mappingDirty,
+            "mapping retry did not save the retained edit",
+        )
+        self.assertEqual(controller.errorMessage, "")
+
+    def test_mapping_auto_save_waits_for_conflicting_configuration_work(self):
+        from PySide6.QtCore import QCoreApplication
+
+        app = QCoreApplication.instance() or QCoreApplication([])
+        blockers = (
+            (
+                "settings_save",
+                lambda controller: controller._set_settings_save_busy(True),
+                lambda controller: controller._set_settings_save_busy(False),
+            ),
+            (
+                "voice_hotkey",
+                lambda controller: controller._set_voice_hotkey_busy(True),
+                lambda controller: controller._set_voice_hotkey_busy(False),
+            ),
+            (
+                "channel_test",
+                lambda _controller: qt_settings_app._vb_cable_test_active_event.set(),
+                lambda _controller: qt_settings_app._vb_cable_test_active_event.clear(),
+            ),
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+            (
+                "driver_action",
+                lambda _controller: qt_settings_app._driver_action_active_event.set(),
+                lambda _controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for index, (name, start, stop) in enumerate(blockers):
+            with self.subTest(name=name):
+                controller, model = self._make_controller()
+                with mock.patch.object(
+                    config,
+                    "save_settings_pair",
+                    wraps=config.save_settings_pair,
+                ) as save_pair:
+                    start(controller)
+                    try:
+                        model.setActionTextAt(
+                            model.index_of("power"),
+                            f"ctrl+{chr(ord('a') + index)}",
+                        )
+                        app.processEvents()
+                        self.assertTrue(controller.mappingDirty)
+                        save_pair.assert_not_called()
+                    finally:
+                        stop(controller)
+                    self._wait_for_qt(
+                        app,
+                        lambda: not controller.mappingDirty,
+                        f"mapping auto-save did not resume after {name}",
+                    )
+                save_pair.assert_called_once()
+
+    def test_display_note_persists_after_save_and_reopen(self):
+        controller, model = self._make_controller()
+        power_row = model.index_of("power")
+        model.setActionTextAt(power_row, "ctrl+c")
+        model.setDisplayNoteAt(power_row, "single_click", "复制")
+
+        self.assertTrue(controller.saveSettings())
+
+        _, reopened_model = self._make_controller()
+        self.assertEqual(
+            reopened_model.to_display_note_map()["power"]["single_click"],
+            "复制",
+        )
+        self.assertEqual(reopened_model.to_display_map()["power"], "ctrl+c")
+
+    def test_failed_save_keeps_the_last_persisted_display_note(self):
+        controller, model = self._make_controller()
+        power_row = model.index_of("power")
+        model.setDisplayNoteAt(power_row, "single_click", "复制")
+        self.assertTrue(controller.saveSettings())
+
+        model.setDisplayNoteAt(power_row, "single_click", "粘贴")
+        with mock.patch.object(
+            config,
+            "save_settings_pair",
+            side_effect=OSError("settings file is locked"),
+        ):
+            self.assertFalse(controller.saveSettings())
+
+        persisted = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(
+            persisted["display_notes"]["power"]["single_click"],
+            "复制",
+        )
+
+    def test_save_settings_reports_a_persistence_failure(self):
+        controller, model = self._make_controller()
+        model.setActionTextAt(model.index_of("power"), "ctrl+l")
+        self.assertTrue(controller.settingsDirty)
+        with mock.patch.object(
+            config, "save_settings_pair", side_effect=OSError("settings file is locked")
+        ):
+            self.assertFalse(controller.saveSettings())
+        self.assertTrue(controller.settingsDirty)
+        self.assertIn("保存失败", controller.errorMessage)
+        self.assertIn("settings file is locked", controller.errorMessage)
+
+    def test_voice_controls_auto_save_without_clearing_mapping_edits(self):
+        controller, model = self._make_controller()
+        self.assertFalse(controller.settingsDirty)
+
+        model.setSecondaryActionTextAt(
+            model.index_of("power"), "long_press", "f5"
+        )
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.saveSettings())
+        self.assertFalse(controller.settingsDirty)
+
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        self.assertFalse(controller.settingsDirty)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_hotkeys"], {"hold": "ctrl+l"})
+
+        model.setActionTextAt(model.index_of("power"), "escape")
+        self.assertTrue(controller.settingsDirty)
+
+        controller.selectedVoiceProgramIndex = 1
+        self.assertTrue(controller.settingsDirty)
+        self.assertIn("按键映射正在自动保存", controller.statusMessage)
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_program"]["provider"], "sogou")
+
+    def test_feedback_is_scoped_to_the_page_that_owns_the_action(self):
+        controller, model = self._make_controller()
+
+        controller.activePageIndex = 0
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        self.assertEqual(controller.feedbackPageIndex, 2)
+
+        controller.activePageIndex = 2
+        model.setActionTextAt(model.index_of("power"), "escape")
+        self.assertTrue(controller.saveSettings())
+        self.assertEqual(controller.feedbackPageIndex, 1)
+
+        opened = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPENED,
+            target=shell_targets.BLUETOOTH_SETTINGS_URI,
+            error="",
+        )
+        with mock.patch.object(
+            shell_targets,
+            "open_external_target",
+            return_value=opened,
+        ):
+            controller.openBluetoothSettings()
+        self.assertEqual(controller.feedbackPageIndex, 0)
+
+        controller.activePageIndex = 0
+        with mock.patch.object(
+            shell_targets,
+            "open_external_target",
+            return_value=opened,
+        ):
+            controller.openMicrophonePrivacySettings()
+        self.assertEqual(controller.feedbackPageIndex, 2)
+
+    def test_output_endpoint_selection_auto_saves_without_mapping_changes(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input (VB-Audio Virtual Cable)",
+                host_api="Windows WASAPI",
+            ),
+            audio_output.AudioEndpoint(
+                name="Speakers",
+                host_api="Windows WASAPI",
+            ),
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ) as preflight:
+            controller, _ = self._make_controller()
+            self.assertFalse(controller.settingsDirty)
+            controller.selectedEndpointIndex = 0
+
+        self.assertFalse(controller.settingsDirty)
+        preflight.assert_called_once_with(
+            "CABLE Input (VB-Audio Virtual Cable)",
+            "Windows WASAPI",
+            cancel_event=mock.ANY,
+        )
+        cancel_event = preflight.call_args.kwargs["cancel_event"]
+        self.assertFalse(cancel_event.is_set())
+        controller._application_exit_intent.set()
+        self.assertTrue(cancel_event.is_set())
+        controller._application_exit_intent.clear()
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(
+            saved["output_endpoint_name"],
+            "CABLE Input (VB-Audio Virtual Cable)",
+        )
+
+    def test_changing_a_saved_endpoint_does_not_leave_settings_dirty(self):
+        saved = config.default_config()
+        saved["output_endpoint_name"] = "Old Output"
+        saved["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved)
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="Old Output",
+                host_api="Windows WASAPI",
+            ),
+            audio_output.AudioEndpoint(
+                name="New Output",
+                host_api="Windows WASAPI",
+            ),
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ):
+            controller, _ = self._make_controller()
+            controller.selectedEndpointIndex = controller.endpointOptions.index(
+                settings_ui._endpoint_display(endpoints[1])
+            )
+
+        self.assertFalse(controller.settingsDirty)
+        persisted = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(persisted["output_endpoint_name"], "New Output")
+
+    def test_output_endpoint_auto_save_failure_keeps_the_saved_selection(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input",
+                host_api="Windows WASAPI",
+            )
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ), mock.patch.object(
+            config, "save_config", side_effect=OSError("disk full")
+        ):
+            controller.selectedEndpointIndex = 0
+
+        self.assertEqual(controller.selectedEndpointIndex, -1)
+        self.assertIn("输出端点保存失败", controller.errorMessage)
+
+    def test_async_save_does_not_overwrite_an_edit_made_during_preflight(self):
+        saved_config = config.default_config()
+        saved_config["output_endpoint_name"] = "CABLE Input"
+        saved_config["output_endpoint_host_api"] = "Windows WASAPI"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.ESCAPE,
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+        endpoint = audio_output.AudioEndpoint(
+            name="CABLE Input",
+            host_api="Windows WASAPI",
+        )
+        deferred = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                deferred.append(target)
+            else:
+                target()
+
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+            return_value=[endpoint],
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ), mock.patch.object(config, "save_settings_pair") as save_pair:
+            model = self.Model()
+            controller = self._new_controller(
+                model,
+                background_task_runner=runner,
+            )
+            model.setActionTextAt(
+                model.index_of("mic"),
+                settings_ui._VOICE_HOLD_DISPLAY,
+            )
+            completion = []
+
+            self.assertTrue(controller._save(completion=completion.append))
+            self.assertTrue(controller.settingsSaveBusy)
+            self.assertEqual(len(deferred), 1)
+
+            model.setActionTextAt(model.index_of("power"), "f5")
+            deferred.pop()()
+
+        save_pair.assert_not_called()
+        self.assertEqual(model.to_display_map()["power"], "f5")
+        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller.settingsSaveBusy)
+        self.assertEqual(completion, [False])
+        self.assertIn("避免覆盖新修改", controller.errorMessage)
+
+    def test_restore_defaults_marks_unsaved_changes(self):
+        controller, _ = self._make_controller()
+        self.assertFalse(controller.settingsDirty)
+
+        controller.restoreDefaults()
+
+        self.assertTrue(controller.settingsDirty)
+        self.assertIn("尚未保存", controller.statusMessage)
+
+    def test_legacy_toggle_error_uses_the_chinese_button_name(self):
+        config_file = config.config_path(config.config_root())
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "voice_trigger_mode": "toggle",
+                    "voice_hotkey": "lalt+space",
+                    "voice_hotkeys": {
+                        "toggle": "lalt+space",
+                        "hold": "ralt+space",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        bindings = config.default_key_bindings()
+        bindings["bindings"]["mic"] = {"kind": "voice_toggle", "keys": []}
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()), bindings
+        )
+
+        controller, _ = self._make_controller()
+
+        self.assertTrue(controller.settingsDirty)
+        self.assertFalse(controller.saveSettings())
+        self.assertIn("「话筒键」映射无效", controller.errorMessage)
+        self.assertNotIn("「mic」", controller.errorMessage)
+        self.assertTrue(controller.settingsDirty)
+
+    def test_save_settings_uses_hold_to_talk_on_the_mic_button(self):
+        controller, model = self._make_controller()
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        model.setActionTextAt(
+            model.index_of("mic"),
+            settings_ui._VOICE_HOLD_DISPLAY,
+        )
+
+        self.assertTrue(controller.saveSettings())
+
+        saved = config.load_config(config.config_path(config.config_root()))
+        self.assertEqual(saved["voice_trigger_mode"], "hold")
+        self.assertEqual(saved["voice_hotkey"], "ctrl+l")
+        self.assertEqual(saved["voice_hotkeys"], {"hold": "ctrl+l"})
+        saved_bindings = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(saved_bindings["bindings"]["mic"]["kind"], "voice_hold")
+
+    def test_legacy_generic_voice_mapping_saves_as_explicit_selected_mode(self):
+        saved_config = config.default_config()
+        saved_config["voice_trigger_mode"] = "hold"
+        saved_config["voice_hotkey"] = "ctrl+l"
+        saved_config["voice_hotkeys"]["hold"] = "ctrl+l"
+        config.save_config(config.config_path(config.config_root()), saved_config)
+        saved_bindings = config.default_key_bindings()
+        saved_bindings["bindings"]["mic"] = key_mapping.ButtonAction(
+            key_mapping.ActionKind.VOICE
+        ).to_dict()
+        config.save_key_bindings(
+            config.key_bindings_path(config.config_root()),
+            saved_bindings,
+        )
+
+        controller, model = self._make_controller()
+
+        mic_index = model.index(model.index_of("mic"), 0)
+        self.assertEqual(
+            model.data(mic_index, model.ActionTextRole),
+            settings_ui._VOICE_HOLD_DISPLAY,
+        )
+        self.assertTrue(controller.saveSettings())
+        reloaded = config.load_key_bindings(
+            config.key_bindings_path(config.config_root())
+        )
+        self.assertEqual(reloaded["bindings"]["mic"]["kind"], "voice_hold")
+
+    def test_ordinary_primary_and_secondary_actions_persist_and_reload(self):
+        # Was "mic": the Chromecast profile keeps the Assistant key voice-only
+        # (build_save_model rejects any non-voice primary action for "mic"), so
+        # the ordinary-action coverage uses "ok" instead.
+        controller, model = self._make_controller()
+        row = model.index_of("ok")
+        model.setActionTextAt(row, "Escape")
+        model.setSecondaryActionTextAt(row, "double_click", "f5")
+        model.setSecondaryActionTextAt(row, "long_press", "系统音量 +")
+
+        self.assertTrue(controller.saveSettings())
+
+        reloaded_controller, reloaded_model = self._make_controller()
+        del reloaded_controller
+        reloaded_index = reloaded_model.index(reloaded_model.index_of("ok"), 0)
+        self.assertEqual(reloaded_model.data(reloaded_index, reloaded_model.ActionTextRole), "Escape")
+        self.assertEqual(reloaded_model.data(reloaded_index, reloaded_model.DoubleClickTextRole), "F5")
+        self.assertEqual(
+            reloaded_model.data(reloaded_index, reloaded_model.LongPressTextRole),
+            "系统音量 +",
+        )
+
+    def test_save_settings_with_empty_hotkey_fails_and_reports_error(self):
+        controller, _ = self._make_controller()
+        controller._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = ""
+        self.assertFalse(controller.saveSettings())
+        self.assertNotEqual(controller.errorMessage, "")
+
+    def test_save_and_launch_never_launches_when_save_fails(self):
+        controller, _ = self._make_controller()
+        controller._voice_hotkeys[key_mapping.VoiceTriggerMode.HOLD] = ""
+        with mock.patch.object(bridge_launcher, "start_bridge_launch") as fake_launch:
+            controller.saveAndLaunch()
+            self.assertEqual(controller.bridgeLaunchPhase, "saving")
+            self.assertTrue(controller.bridgeLaunchBusy)
+            self._continue_save_and_launch(controller)
+        fake_launch.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertFalse(controller.bridgeLaunchBusy)
+        self.assertIn("保存未完成", controller.launchStatusText)
+
+    def test_save_and_launch_waits_for_async_endpoint_preflight(self):
+        controller, _ = self._make_controller()
+        completions = []
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+        controller._start_bridge_process = mock.Mock()
+
+        controller.saveAndLaunch()
+        self._continue_save_and_launch(controller)
+
+        controller._start_bridge_process.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "saving")
+        completions[0](True)
+        controller._start_bridge_process.assert_called_once_with()
+
+    def test_save_and_launch_launches_and_reports_started_when_save_succeeds(self):
+        controller, _ = self._make_controller()
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED, command=("exe",), pid=4321
+        )
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=fake_result
+        ) as start_launch, mock.patch.object(
+            bridge_launcher,
+            "launch_bridge",
+            side_effect=AssertionError("GUI must not call the blocking launch wrapper"),
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+        ) as launch_voice_program:
+            controller.saveAndLaunch()
+            self.assertEqual(controller.bridgeLaunchPhase, "saving")
+            self.assertFalse(start_launch.called)
+            self._continue_save_and_launch(controller)
+        launch_voice_program.assert_not_called()
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("服务运行中", controller.launchStatusText)
+        self.assertIn("约 1 分钟", controller.launchStatusText)
+        self.assertNotIn("已连接", controller.launchStatusText)
+
+        controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("服务已退出", controller.launchStatusText)
+
+    def test_device_page_start_bridge_does_not_save_unrelated_dirty_edits(self):
+        controller, model = self._make_controller(selected_remote=True)
+        model.setActionTextAt(model.index_of("power"), "f5")
+        callbacks = []
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("exe",),
+            pid=4321,
+        )
+
+        with mock.patch.object(controller, "_save") as save, mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=fake_result
+        ), mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ):
+            controller.startBridge()
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            self.assertEqual(len(callbacks), 1)
+            callbacks.pop()()
+
+        save.assert_not_called()
+        self.assertEqual(callbacks, [])
+        self.assertTrue(controller.settingsDirty)
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
+
+    def test_start_bridge_double_press_queues_only_one_launch(self):
+        controller, _ = self._make_controller(selected_remote=True)
+        callbacks = []
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("exe",),
+            pid=4321,
+        )
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+            return_value=fake_result,
+        ) as start_launch:
+            controller.startBridge()
+            controller.startBridge()
+
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            self.assertEqual(len(callbacks), 1)
+            callbacks.pop()()
+
+        start_launch.assert_called_once_with()
+
+    def test_external_bridge_request_starts_the_existing_desktop_process_once(self):
+        controller, _ = self._make_controller()
+        single_instance.write_bridge_start_request(
+            controller._config_root,
+            session_scoped=True,
+        )
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+            return_value=False,
+        ), mock.patch.object(controller, "startBridge") as start_bridge:
+            controller.refreshBridgeState()
+            controller.refreshBridgeState()
+
+        start_bridge.assert_called_once_with()
+
+    def test_external_application_exit_request_preempts_bridge_refresh_once(self):
+        controller, _ = self._make_controller()
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+            session_scoped=True,
+        )
+        single_instance.write_bridge_start_request(
+            controller._config_root,
+            session_scoped=True,
+        )
+        exit_requests = []
+        controller.maintenanceExitRequested.connect(
+            lambda: exit_requests.append(True)
+        )
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+        ) as refresh_status:
+            controller.refreshBridgeState()
+
+        self.assertEqual(exit_requests, [True])
+        refresh_status.assert_not_called()
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                controller._config_root
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                controller._config_root,
+                session_scoped=True,
+            )
+        )
+
+    def test_external_window_restore_request_uses_the_qml_restore_signal(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+        restore_requests = []
+        controller.windowRestoreRequested.connect(
+            lambda: restore_requests.append(True)
+        )
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_restore_request",
+            return_value=True,
+        ) as restore_request:
+            controller.pollWindowRestoreRequest()
+
+        restore_request.assert_called_once_with(4321)
+        self.assertEqual(restore_requests, [True])
+
+    def test_window_exit_signal_uses_the_normal_full_exit_flow(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+        exit_requests = []
+        controller.maintenanceExitRequested.connect(
+            lambda: exit_requests.append(True)
+        )
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            return_value=731,
+        ) as window_request, mock.patch.object(
+            single_instance,
+            "consume_and_acknowledge_application_exit_request",
+        ) as file_request:
+            controller.refreshBridgeState()
+
+        window_request.assert_called_once_with(4321)
+        file_request.assert_not_called()
+        self.assertEqual(exit_requests, [True])
+        self.assertTrue(controller._maintenance_exit_pending)
+        self.assertIsNone(controller._maintenance_exit_request.request_id)
+        self.assertEqual(controller._maintenance_exit_request.window_token, 731)
+
+    def test_maintenance_exit_cancels_an_async_window_hide(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+        controller._window_hide_requested = True
+        controller._input_cleanup_requested = True
+        input_ready = []
+        hide_ready = []
+        controller.inputCleanupReady.connect(lambda: input_ready.append(True))
+        controller.windowHideReady.connect(lambda: hide_ready.append(True))
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            return_value=731,
+        ), mock.patch.object(
+            controller,
+            "_get_input_capture_in_use",
+            return_value=False,
+        ):
+            controller.refreshBridgeState()
+            controller._after_input_operation_change()
+
+        self.assertFalse(controller._window_hide_requested)
+        self.assertEqual(input_ready, [True])
+        self.assertEqual(hide_ready, [])
+
+    def test_cancelled_window_exit_signal_returns_its_token(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            return_value=731,
+        ), mock.patch.object(
+            single_instance,
+            "publish_settings_window_exit_rejection",
+            return_value=True,
+        ) as reject:
+            controller.refreshBridgeState()
+            controller.cancelPendingMaintenanceExit()
+
+        reject.assert_called_once_with(4321, 731)
+        self.assertFalse(controller._maintenance_exit_pending)
+
+    def test_pending_exit_is_not_replaced_until_the_first_request_is_cancelled(self):
+        controller, _ = self._make_controller()
+        controller._settings_window_hwnd = 4321
+        second_request = single_instance.ApplicationExitRequest(
+            "second-request",
+            session_scoped=True,
+        )
+
+        with mock.patch.object(
+            single_instance,
+            "consume_settings_window_exit_request",
+            side_effect=(731, None),
+        ) as window_request, mock.patch.object(
+            single_instance,
+            "consume_and_acknowledge_application_exit_request",
+            return_value=second_request,
+        ) as file_request, mock.patch.object(
+            single_instance,
+            "publish_settings_window_exit_rejection",
+            return_value=True,
+        ):
+            controller.refreshBridgeState()
+            first_request = controller._maintenance_exit_request
+            controller.refreshBridgeState()
+
+            self.assertIs(controller._maintenance_exit_request, first_request)
+            self.assertEqual(window_request.call_count, 1)
+            file_request.assert_not_called()
+
+            controller.cancelPendingMaintenanceExit()
+            controller.refreshBridgeState()
+
+        self.assertEqual(window_request.call_count, 2)
+        file_request.assert_called_once_with(controller._config_root)
+        self.assertIs(controller._maintenance_exit_request, second_request)
+
+    def test_exit_in_progress_never_consumes_a_second_exit_request(self):
+        blockers = (
+            (
+                "request retained",
+                lambda controller: setattr(
+                    controller,
+                    "_maintenance_exit_request",
+                    single_instance.ApplicationExitRequest(
+                        "active-request",
+                        session_scoped=True,
+                    ),
+                ),
+            ),
+            (
+                "exit requested",
+                lambda controller: setattr(
+                    controller, "_application_exit_requested", True
+                ),
+            ),
+            (
+                "exit confirmed",
+                lambda controller: setattr(
+                    controller, "_application_exit_confirmed", True
+                ),
+            ),
+            (
+                "exit intent",
+                lambda controller: controller._application_exit_intent.set(),
+            ),
+        )
+
+        for label, block in blockers:
+            with self.subTest(label=label):
+                controller, _ = self._make_controller()
+                block(controller)
+                with mock.patch.object(
+                    single_instance,
+                    "consume_settings_window_exit_request",
+                ) as window_request, mock.patch.object(
+                    single_instance,
+                    "consume_and_acknowledge_application_exit_request",
+                ) as file_request, mock.patch.object(
+                    single_instance,
+                    "consume_bridge_start_request",
+                    return_value=False,
+                ) as bridge_request, mock.patch.object(
+                    controller,
+                    "_refresh_bridge_status",
+                ) as refresh_status:
+                    controller.refreshBridgeState()
+
+                window_request.assert_not_called()
+                file_request.assert_not_called()
+                bridge_request.assert_called_once_with(
+                    controller._config_root,
+                    session_scoped=True,
+                )
+                refresh_status.assert_not_called()
+
+    def test_session_request_probe_failure_does_not_break_periodic_refresh(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            single_instance,
+            "consume_and_acknowledge_application_exit_request",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "session unavailable"
+            ),
+        ), mock.patch.object(
+            single_instance,
+            "consume_bridge_start_request",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "session unavailable"
+            ),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller._maintenance_exit_pending)
+
+    def test_cancelled_external_exit_notifies_the_waiting_copy(self):
+        controller, _ = self._make_controller()
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+            session_scoped=True,
+        )
+
+        controller.refreshBridgeState()
+        self.assertTrue(controller._maintenance_exit_pending)
+        self.assertEqual(
+            controller._maintenance_exit_request.request_id,
+            "handoff-request",
+        )
+        self.assertTrue(controller._maintenance_exit_request.session_scoped)
+
+        controller.cancelPendingMaintenanceExit()
+
+        self.assertFalse(controller._maintenance_exit_pending)
+        self.assertIsNone(controller._maintenance_exit_request)
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                controller._config_root,
+                "handoff-request",
+                session_scoped=True,
+            )
+        )
+
+    def test_failed_save_rejects_an_external_exit_request(self):
+        controller, _ = self._make_controller()
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+            session_scoped=True,
+        )
+        controller.refreshBridgeState()
+        completions = []
+        controller._save = lambda completion=None: (
+            completions.append(completion) or True
+        )
+
+        controller.saveSettingsAndExit()
+        completions[0](False)
+
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                controller._config_root,
+                "handoff-request",
+                session_scoped=True,
+            )
+        )
+
+    def test_external_exit_blocks_an_already_queued_bridge_start_until_cancelled(self):
+        controller, _ = self._make_controller()
+        controller._start_bridge_requested = True
+        single_instance.write_application_exit_request(
+            controller._config_root,
+            request_id="handoff-request",
+            session_scoped=True,
+        )
+
+        with mock.patch.object(
+            controller,
+            "_refresh_bridge_status",
+            return_value=False,
+        ) as refresh_status, mock.patch.object(
+            controller, "startBridge"
+        ) as start_bridge:
+            controller.refreshBridgeState()
+            single_instance.write_bridge_start_request(
+                controller._config_root,
+                session_scoped=True,
+            )
+            controller.refreshBridgeState()
+
+        start_bridge.assert_not_called()
+        refresh_status.assert_not_called()
+        self.assertTrue(controller._maintenance_exit_pending)
+        self.assertFalse(controller._start_bridge_requested)
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                controller._config_root,
+                session_scoped=True,
+            )
+        )
+
+        with mock.patch("PySide6.QtCore.QTimer.singleShot") as single_shot:
+            controller.startBridge()
+
+        single_shot.assert_not_called()
+
+        controller.cancelPendingMaintenanceExit()
+
+        self.assertFalse(controller._maintenance_exit_pending)
+
+    def test_maintenance_exit_pending_blocks_every_bridge_start_path(self):
+        controller, _ = self._make_controller()
+        controller._maintenance_exit_pending = True
+        controller._start_bridge_requested = True
+        controller._launch_bridge_on_app_start = True
+        controller._set_bridge_running(True)
+
+        with mock.patch.object(controller, "_begin_bridge_restart") as restart:
+            controller.startBridgeOnApplicationStart()
+        restart.assert_not_called()
+
+        with mock.patch.object(
+            qt_settings_app.bridge_control_windows,
+            "request_bridge_exit",
+        ) as request_exit:
+            controller.restartBridge()
+        request_exit.assert_not_called()
+
+        controller._set_bridge_launch_phase("starting")
+        with mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+        ) as start_launch:
+            controller._start_bridge_process()
+        start_launch.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "idle")
+
+        with mock.patch("PySide6.QtCore.QTimer.singleShot") as single_shot:
+            controller.startBridge()
+        single_shot.assert_not_called()
+
+    def test_start_bridge_rejects_output_configuration_work(self):
+        blockers = (
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller(selected_remote=True)
+                start(controller)
+                try:
+                    with mock.patch("PySide6.QtCore.QTimer.singleShot") as single_shot:
+                        controller.startBridge()
+                finally:
+                    stop(controller)
+
+                single_shot.assert_not_called()
+                self.assertEqual(controller.bridgeLaunchPhase, "idle")
+                self.assertIn("输出端点正在处理", controller.errorMessage)
+
+    def test_queued_bridge_start_is_cancelled_after_exit_confirmation(self):
+        controller, _ = self._make_controller(selected_remote=True)
+        callbacks = []
+        ready = []
+        controller.applicationExitReady.connect(lambda: ready.append(True))
+        with mock.patch(
+            "PySide6.QtCore.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callbacks.append(callback),
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+        ) as start_launch:
+            controller.startBridge()
+            self.assertEqual(len(callbacks), 1)
+
+            controller.requestApplicationExit()
+            self.assertEqual(ready, [True])
+            self.assertTrue(controller.applicationExitConfirmed)
+            callbacks.pop()()
+
+        start_launch.assert_not_called()
+        self.assertEqual(controller.bridgeLaunchPhase, "idle")
+
+    def test_existing_bridge_applies_the_saved_voice_program_without_restart(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        bridge_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            command=("exe",),
+            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
+        )
+        voice_result = voice_program_manager.VoiceProgramLaunchResult(
+            provider_id="sogou",
+            started=True,
+            already_running=False,
+            code="started",
+        )
+
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=bridge_result
+        ), mock.patch.object(
+            bridge_launcher, "in_process_bridge_running", return_value=True
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+            return_value=voice_result,
+        ) as launch_voice_program:
+            controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
+
+        launch_voice_program.assert_called_once_with(controller._voice_program_settings)
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("已启动语音程序", controller.statusMessage)
+
+    def test_existing_bridge_survives_an_unexpected_voice_program_launch_error(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        bridge_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            command=("exe",),
+            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
+        )
+
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=bridge_result
+        ), mock.patch.object(
+            bridge_launcher, "in_process_bridge_running", return_value=True
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "launch_voice_program",
+            side_effect=RuntimeError("unexpected launch failure"),
+        ):
+            controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
+
+        self.assertTrue(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertIn("遥控器服务不受影响", controller.errorMessage)
+
+    def test_external_bridge_winning_launch_race_gets_one_automatic_handoff(self):
+        controller, _ = self._make_controller()
+        bridge_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.ALREADY_RUNNING,
+            command=("in-process",),
+            exit_code=bridge_launcher.ALREADY_RUNNING_EXIT_CODE,
+        )
+
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            controller,
+            "_begin_bridge_restart",
+        ) as restart, mock.patch.object(
+            controller,
+            "_sync_bridge_connection_status",
+        ) as sync_status:
+            controller._finish_bridge_launch(bridge_result)
+            controller._finish_bridge_launch(bridge_result)
+
+        restart.assert_called_once_with(
+            automatic=True,
+            allow_active_voice=True,
+        )
+        sync_status.assert_not_called()
+        self.assertTrue(controller.bridgeRunning)
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertIn("完全退出旧版", controller.launchStatusText)
+
+    def test_pending_launch_stays_in_starting_until_poll_finishes(self):
+        controller, _ = self._make_controller()
+        pending = bridge_launcher.PendingBridgeLaunch(
+            command=("exe",),
+            process=object(),
+            pid=4321,
+            checks_remaining=3,
+        )
+        started = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("exe",),
+            pid=4321,
+        )
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=pending
+        ), mock.patch.object(
+            bridge_launcher, "poll_bridge_launch", side_effect=[None, started]
+        ) as poll_launch:
+            controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            self.assertTrue(controller.bridgeLaunchBusy)
+            controller.pollBridgeLaunch()
+            self.assertEqual(controller.bridgeLaunchPhase, "starting")
+            controller.pollBridgeLaunch()
+
+        self.assertEqual(poll_launch.call_count, 2)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertFalse(controller.bridgeLaunchBusy)
+
+    def test_new_bridge_ignores_a_stopped_bridge_status_file(self):
+        controller, _ = self._make_controller()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=9876,
+            identity=controller._current_runtime_identity,
+            raw_input_state="ready",
+            hid_tap_state=frida_compat.HidTapState.READY.value,
+            voice_key_physicalizer_state="ready",
+        )
+        started = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("in-process",),
+            pid=os.getpid(),
+        )
+        controller._set_bridge_launch_phase("starting")
+
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+            return_value=started,
+        ):
+            controller._start_bridge_process()
+
+        self.assertIsNone(
+            bridge_runtime_status.read_status(controller._config_root)
+        )
+        self.assertTrue(controller.bridgeRunning)
+        self.assertFalse(controller.bridgeConnected)
+        self.assertEqual(controller.bridgeLaunchPhase, "waiting")
+        self.assertFalse(controller.bridgeRestartRecommended)
+        self.assertEqual(controller.rawInputState, "unknown")
+        self.assertEqual(controller.hidTapState, "unknown")
+        self.assertEqual(controller.voiceKeyPhysicalizerState, "unknown")
+
+    def test_bridge_does_not_start_when_its_stale_status_cannot_be_cleared(self):
+        controller, _ = self._make_controller()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=9876,
+            identity=controller._current_runtime_identity,
+        )
+        controller._set_bridge_launch_phase("starting")
+
+        with mock.patch.object(
+            bridge_launcher,
+            "in_process_bridge_running",
+            return_value=False,
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=False,
+        ), mock.patch.object(
+            bridge_runtime_status,
+            "clear_status",
+            side_effect=OSError("simulated cleanup failure"),
+        ), mock.patch.object(
+            bridge_launcher,
+            "start_bridge_launch",
+        ) as start_launch:
+            controller._start_bridge_process()
+
+        start_launch.assert_not_called()
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(controller.bridgeLaunchPhase, "failed")
+        self.assertTrue(controller.bridgeRestartRecommended)
+        self.assertIn("完全退出", controller.launchStatusText)
+
+    def test_bridge_does_not_start_when_mutex_status_cannot_be_queried(self):
+        for error in (
+            single_instance.SingleInstanceUnavailableError("status unavailable"),
+            single_instance.MutexCleanupError("close failed"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                controller, _ = self._make_controller()
+                bridge_runtime_status.publish_status(
+                    controller._config_root,
+                    bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+                    pid=9876,
+                    identity=controller._current_runtime_identity,
+                )
+                controller._set_bridge_launch_phase("starting")
+
+                with mock.patch.object(
+                    bridge_launcher,
+                    "in_process_bridge_running",
+                    return_value=False,
+                ), mock.patch.object(
+                    qt_settings_app.single_instance,
+                    "bridge_instance_running",
+                    side_effect=error,
+                ), mock.patch.object(
+                    bridge_launcher,
+                    "start_bridge_launch",
+                ) as start_launch:
+                    controller._start_bridge_process()
+
+                start_launch.assert_not_called()
+                self.assertFalse(controller.bridgeRunning)
+                self.assertEqual(controller.bridgeLaunchPhase, "failed")
+                self.assertTrue(controller.bridgeRestartRecommended)
+                self.assertIn("完全退出", controller.launchStatusText)
+
+    def test_failed_launch_keeps_the_bridge_warning_active(self):
+        controller, _ = self._make_controller()
+        fake_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+            command=("exe",),
+            error="missing executable",
+        )
+
+        with mock.patch.object(
+            bridge_launcher, "start_bridge_launch", return_value=fake_result
+        ):
+            controller.saveAndLaunch()
+            self._continue_save_and_launch(controller)
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertIn("启动失败", controller.launchStatusText)
+
+        launch_text = controller.launchStatusText
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "status unavailable"
+            ),
+        ):
+            controller.refreshBridgeState()
+
+        self.assertFalse(controller.bridgeRunning)
+        self.assertEqual(controller.launchStatusText, launch_text)
+
+    def test_restore_defaults_resets_voice_settings_and_mic_mapping(self):
+        controller, model = self._make_controller()
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        model.setActionTextAt(model.index_of("mic"), "Escape")
+        controller.restoreDefaults()
+        self.assertEqual(controller.holdVoiceHotkeyText, "ralt")
+        mic_index = model.index(model.index_of("mic"), 0)
+        self.assertEqual(
+            model.data(mic_index, model.ActionTextRole),
+            settings_ui._VOICE_HOLD_DISPLAY,
+        )
+
+    def test_restore_mapping_defaults_does_not_change_voice_program_or_hotkey(self):
+        controller, model = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        controller.holdVoiceHotkeyText = "ctrl+l"
+        controller.voiceProgramLaunchElevated = True
+        power_row = model.index_of("power")
+        model.setActionTextAt(power_row, "f5")
+        model.setDisplayNoteAt(power_row, "single_click", "刷新")
+
+        controller.restoreMappingDefaults()
+
+        self.assertEqual(controller.holdVoiceHotkeyText, "ctrl+l")
+        self.assertEqual(controller.selectedVoiceProgramIndex, 1)
+        self.assertTrue(controller.voiceProgramLaunchElevated)
+        power_index = model.index(power_row, 0)
+        self.assertNotEqual(model.data(power_index, model.ActionTextRole), "f5")
+        self.assertEqual(model.data(power_index, model.SingleNoteRole), "")
+
+    def test_select_button_updates_both_the_controller_and_the_model(self):
+        controller, model = self._make_controller()
+        controller.selectButton("power")
+        self.assertEqual(controller.selectedButtonId, "power")
+        self.assertEqual(model.selected_button_id(), "power")
+
+    def test_real_key_detection_selects_captured_button_without_executing_mapping(self):
+        controller, model = self._make_controller(selected_remote=True)
+        receiver = mock.Mock()
+        controller._key_detection_listener = receiver
+        controller._set_key_detection_active_state(True)
+        controller._set_input_operation_state("key_detection", "active")
+
+        controller._on_raw_key_detected("power", "Windows 按键事件：键值=0xFF")
+        self.assertIn("已检测 1 个", controller.keyDetectionText)
+        # Detection stays open: a second press is still accepted.
+        controller._on_raw_key_detected("back", "Windows 按键事件：键值=0x0D")
+        self.assertIn("已检测 2 个", controller.keyDetectionText)
+
+        controller.stopKeyDetection()
+
+        self.assertFalse(controller.keyDetectionActive)
+        receiver.stop.assert_called_once_with()
+        self.assertEqual(controller.selectedButtonId, "back")
+        self.assertEqual(model.selected_button_id(), "back")
+        self.assertIn("已检测 2 个", controller.keyDetectionText)
+        self.assertIn("停止检测", controller.keyDetectionText)
+
+    def test_closed_supplemental_key_channel_explains_temporary_limit(self):
+        controller, _ = self._make_controller()
+        controller._key_detection_active = True
+        controller._set_input_operation_state("key_detection", "active")
+
+        controller._on_hid_tap_detection_status(
+            frida_compat.HidTapState.UNHEALTHY.value,
+            "gadget_connection_closed",
+        )
+
+        self.assertIn("补充按键通道暂不可用", controller.keyDetectionText)
+        self.assertIn("返回键、音量键", controller.keyDetectionText)
+        self.assertIn("正在重连", controller.keyDetectionText)
+        self.assertNotIn("gadget_connection_closed", controller.keyDetectionText)
+        self.assertNotIn("Raw Input", controller.keyDetectionText)
+        self.assertNotIn("HID tap", controller.keyDetectionText)
+
+    def test_tap_detection_ignores_unknown_or_empty_reports(self):
+        controller, _ = self._make_controller()
+        controller._key_detection_active = True
+
+        controller._on_key_detection_hid_report(1, bytes.fromhex("000000000000"))
+        controller._on_key_detection_hid_report(1, bytes.fromhex("990000000000"))
+        controller._on_key_detection_hid_report(1, bytes.fromhex("7f0000000000"))
+        controller._on_key_detection_hid_report(2, bytes.fromhex("520000000000"))
+        controller._on_key_detection_hid_report(1, bytes.fromhex("52000000"))
+
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertEqual(controller.selectedButtonId, "ok")
+
+    def test_receiver_detection_times_out_and_releases_the_channel(self):
+        controller, _ = self._make_controller(selected_remote=True)
+        receiver = mock.Mock()
+        receiver_type = mock.Mock(return_value=receiver)
+
+        with mock.patch(
+            "ovb.chromecast_client.Client", receiver_type
+        ):
+            controller.startKeyDetection()
+
+        controller._key_detection_started_at -= (
+            controller._KEY_DETECTION_TIMEOUT_SECONDS + 1.0
+        )
+        controller.pollKeyDetectionBridge()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertIsNone(controller._key_detection_listener)
+        self.assertIsNone(controller._key_detection_tap)
+        receiver.stop.assert_called_once_with()
+        self.assertIn("未检测到按键", controller.keyDetectionText)
+
+    def test_local_detection_timeout_preserves_a_cleanup_error(self):
+        controller, _ = self._make_controller()
+        listener = mock.Mock()
+        listener.stop.side_effect = RuntimeError("listener stop failed")
+        controller._key_detection_listener = listener
+        controller._key_detection_active = True
+        controller._key_detection_started_at = (
+            time.monotonic() - controller._KEY_DETECTION_TIMEOUT_SECONDS - 1.0
+        )
+
+        controller.pollKeyDetectionBridge()
+
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertIs(controller._key_detection_listener, listener)
+        self.assertIn("停止 Windows 按键通道时出错", controller.keyDetectionText)
+        self.assertNotIn("等待真实按键超时", controller.keyDetectionText)
+
+    def test_real_key_detection_stops_when_bridge_status_is_unavailable(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.SingleInstanceUnavailableError(
+                "status unavailable"
+            ),
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "enumerate_matching_device_paths",
+        ) as enumerate_paths, mock.patch.object(
+            qt_settings_app.frida_compat,
+            "ChromecastHidReportTap",
+        ) as tap:
+            controller.startKeyDetection()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertIn("无法确认后台服务状态", controller.keyDetectionText)
+        enumerate_paths.assert_not_called()
+        tap.assert_not_called()
+
+    def test_real_key_detection_stops_when_bridge_status_cleanup_fails(self):
+        controller, _ = self._make_controller()
+
+        with mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            side_effect=single_instance.MutexCleanupError("close failed"),
+        ), mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "enumerate_matching_device_paths",
+        ) as enumerate_paths, mock.patch.object(
+            qt_settings_app.frida_compat,
+            "ChromecastHidReportTap",
+        ) as tap:
+            controller.startKeyDetection()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertIn("无法确认后台服务状态", controller.keyDetectionText)
+        enumerate_paths.assert_not_called()
+        tap.assert_not_called()
+
+    def test_failed_receiver_start_retains_the_owner(self):
+        controller, _ = self._make_controller(selected_remote=True)
+        instances = []
+
+        class StuckReceiver:
+            def __init__(self, _entity, *, mode, on_edge, on_voice=None):
+                instances.append(self)
+
+            def start(self, *, cancel_event=None):
+                raise RuntimeError("start failed")
+
+            def stop(self):
+                raise RuntimeError("stop failed")
+
+        with mock.patch.object(
+            qt_settings_app.frida_compat,
+            "ChromecastHidReportTap",
+        ) as tap, mock.patch(
+            "ovb.chromecast_client.Client", StuckReceiver
+        ):
+            controller.startKeyDetection()
+
+        self.assertIs(controller._key_detection_listener, instances[0])
+        self.assertTrue(controller.keyDetectionActive)
+        # The receiver is the only button source now; the retired profile's
+        # HID tap must never be built.
+        tap.assert_not_called()
+
+    def test_stop_key_detection_retains_each_owner_that_failed_to_stop(self):
+        controller, _ = self._make_controller()
+        listener = mock.Mock()
+        tap = mock.Mock()
+        listener.stop.side_effect = RuntimeError("listener stop failed")
+        tap.stop.side_effect = RuntimeError("tap stop failed")
+        controller._key_detection_listener = listener
+        controller._key_detection_tap = tap
+        controller._key_detection_active = True
+
+        controller.stopKeyDetection()
+
+        self.assertIs(controller._key_detection_listener, listener)
+        self.assertIs(controller._key_detection_tap, tap)
+        self.assertTrue(controller.keyDetectionActive)
+
+    def test_detected_key_keeps_detection_open_without_requesting_stop(self):
+        controller, _ = self._make_controller()
+        listener = mock.Mock()
+        controller._key_detection_listener = listener
+        controller._set_key_detection_active_state(True)
+        controller._set_input_operation_state("key_detection", "active")
+
+        # Continuous detection never asks for a stop, so a background task
+        # that cannot start must not be able to strand the session.
+        with mock.patch.object(
+            controller,
+            "_start_background_task",
+            side_effect=RuntimeError("simulated stop start failure"),
+        ):
+            controller._on_raw_key_detected("up", "")
+
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertIs(controller._key_detection_listener, listener)
+        self.assertEqual(controller._key_detection_press_count, 1)
+        self.assertIn("已检测 1 个", controller.keyDetectionText)
+        self.assertIn("停止检测", controller.keyDetectionText)
+
+    def test_hotkey_start_failure_retains_a_still_running_capture(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        capture.is_running = True
+        capture.start.side_effect = RuntimeError("start failed")
+
+        with mock.patch.object(
+            qt_settings_app.hotkey_capture_windows,
+            "HotkeyCapture",
+            return_value=capture,
+        ):
+            self.assertTrue(controller.startHotkeyCapture())
+
+        self.assertIs(controller._hotkey_capture, capture)
+
+    def test_hotkey_start_returns_false_while_another_input_operation_is_active(self):
+        controller, _ = self._make_controller()
+        errors = []
+        controller.hotkeyCaptureError.connect(errors.append)
+        controller._set_input_operation_state("key_detection", "active")
+
+        self.assertFalse(controller.startHotkeyCapture())
+
+        self.assertEqual(controller._input_operation_kind, "key_detection")
+        self.assertEqual(controller._input_operation_phase, "active")
+        self.assertEqual(errors, ["另一项按键输入操作正在进行，请先结束。"])
+
+    def test_hotkey_start_is_available_for_wetype(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+
+        with mock.patch.object(
+            controller,
+            "_begin_input_operation_start",
+            return_value=True,
+        ) as begin:
+            self.assertTrue(controller.startHotkeyCapture())
+
+        begin.assert_called_once_with("hotkey", controller._start_hotkey_capture_worker)
+
+    def test_mapping_hotkey_capture_stays_available_for_wetype(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+
+        with mock.patch.object(
+            controller,
+            "_begin_input_operation_start",
+            return_value=True,
+        ) as begin:
+            self.assertTrue(controller.startMappingHotkeyCapture())
+
+        begin.assert_called_once_with("hotkey", controller._start_hotkey_capture_worker)
+
+    def test_mapping_hotkey_manual_text_is_normalized_without_voice_capture(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+
+        with mock.patch.object(controller, "_begin_input_operation_start") as begin:
+            result = controller.normalizeMappingHotkeyText(
+                "Lctrl+Win+左箭头"
+            )
+
+        self.assertEqual(
+            result,
+            {"ok": True, "text": "win+lctrl+left", "message": ""},
+        )
+        begin.assert_not_called()
+
+    def test_mapping_hotkey_manual_text_returns_a_secure_key_error(self):
+        controller, _ = self._make_controller()
+
+        result = controller.normalizeMappingHotkeyText("Ctrl+Alt+Delete")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["text"], "")
+        self.assertIn("Windows 安全按键", result["message"])
+
+    def test_hotkey_stop_failure_retains_capture_for_retry(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        capture.stop.side_effect = RuntimeError("stop failed")
+        controller._hotkey_capture = capture
+
+        controller.stopHotkeyCapture()
+
+        self.assertIs(controller._hotkey_capture, capture)
+
+    def test_window_hide_waits_for_active_input_capture_to_stop(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+        ready = []
+        failed = []
+        controller.windowHideReady.connect(lambda: ready.append(True))
+        controller.windowHideFailed.connect(failed.append)
+
+        controller.prepareForWindowHide()
+
+        capture.stop.assert_called_once_with()
+        self.assertIsNone(controller._hotkey_capture)
+        self.assertEqual(controller._input_operation_phase, "idle")
+        self.assertEqual(ready, [True])
+        self.assertEqual(failed, [])
+
+    def test_window_hide_failure_keeps_input_capture_for_retry(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        capture.stop.side_effect = RuntimeError("stop failed")
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+        ready = []
+        failed = []
+        controller.windowHideReady.connect(lambda: ready.append(True))
+        controller.windowHideFailed.connect(failed.append)
+
+        controller.prepareForWindowHide()
+
+        capture.stop.assert_called_once_with()
+        self.assertIs(controller._hotkey_capture, capture)
+        self.assertEqual(controller._input_operation_phase, "active")
+        self.assertEqual(ready, [])
+        self.assertEqual(len(failed), 1)
+        self.assertIn("停止", failed[0])
+
+    def test_input_stop_worker_owns_the_resource_during_process_shutdown(self):
+        controller, _ = self._make_controller()
+        controller._background_task_runner = None
+        entered = threading.Event()
+        release = threading.Event()
+        capture = mock.Mock()
+
+        def stop_capture():
+            entered.set()
+            self.assertTrue(release.wait(timeout=2.0))
+
+        capture.stop.side_effect = stop_capture
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+
+        self.assertTrue(controller.stopHotkeyCapture())
+        self.assertTrue(entered.wait(timeout=2.0))
+        release.set()
+        controller.shutdownForProcessExit()
+
+        capture.stop.assert_called_once_with()
+        self.assertIsNone(controller._hotkey_capture)
+
+    def test_stop_worker_start_failure_restores_the_transferred_resource(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+
+        def runner(_target, name):
+            if name == "hotkey-stop":
+                raise RuntimeError("worker unavailable")
+            _target()
+
+        controller._background_task_runner = runner
+
+        self.assertFalse(controller.stopHotkeyCapture())
+        self.assertIs(controller._hotkey_capture, capture)
+        self.assertEqual(controller._input_operation_phase, "active")
+        capture.stop.assert_not_called()
+
+    def test_process_exit_still_releases_input_after_worker_shutdown_failure(self):
+        controller, _ = self._make_controller()
+        capture = mock.Mock()
+        controller._hotkey_capture = capture
+        controller._set_input_operation_state("hotkey", "active")
+        controller.shutdownBackgroundTasks = mock.Mock(
+            side_effect=RuntimeError("worker shutdown failed")
+        )
+
+        with self.assertRaises(RuntimeError):
+            controller.shutdownForProcessExit()
+
+        capture.stop.assert_called_once_with()
+        self.assertIsNone(controller._hotkey_capture)
+
+    def test_running_bridge_detection_returns_button_without_starting_local_hid(self):
+        controller, model = self._make_controller(selected_remote=True)
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            # Only the Chromecast receiver's own state can claim a ready
+            # channel; the retired profile's plain "ready" cannot.
+            raw_input_state="chromecast_ready",
+            hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.raw_input_windows,
+            "RawInputButtonListener",
+        ) as raw_listener, mock.patch.object(
+            qt_settings_app.frida_compat,
+            "ChromecastHidReportTap",
+        ) as tap:
+            controller.startKeyDetection()
+
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertIsNotNone(controller._key_detection_bridge_request)
+        self.assertEqual(
+            controller.keyDetectionText,
+            "请按下要检测的遥控器按键；检测时不执行映射",
+        )
+        raw_listener.assert_not_called()
+        tap.assert_not_called()
+
+        self.assertTrue(
+            key_detection_bridge.publish_next_button(
+                controller._config_root,
+                "volume_down",
+            )
+        )
+        controller.pollKeyDetectionBridge()
+
+        # Continuous: still open, and the consumed request was re-armed so a
+        # second press is not silently dropped.
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertEqual(controller.selectedButtonId, "volume_down")
+        self.assertEqual(model.selected_button_id(), "volume_down")
+        self.assertIn("已检测 1 个", controller.keyDetectionText)
+        self.assertIsNotNone(controller._key_detection_bridge_request)
+
+        self.assertTrue(
+            key_detection_bridge.publish_next_button(
+                controller._config_root,
+                "power",
+            )
+        )
+        controller.pollKeyDetectionBridge()
+
+        self.assertTrue(controller.keyDetectionActive)
+        self.assertEqual(controller.selectedButtonId, "power")
+        self.assertEqual(model.selected_button_id(), "power")
+        self.assertIn("已检测 2 个", controller.keyDetectionText)
+        controller.stopKeyDetection()
+        self.assertFalse(controller.keyDetectionActive)
+
+    def test_running_bridge_detection_times_out_cleanly(self):
+        controller, _ = self._make_controller(selected_remote=True)
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.CONNECTED,
+            pid=4321,
+            # Only the Chromecast receiver's own state can claim a ready
+            # channel; the retired profile's plain "ready" cannot.
+            raw_input_state="chromecast_ready",
+            hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
+        )
+        controller.startKeyDetection()
+        request = controller._key_detection_bridge_request
+        controller._key_detection_started_at -= (
+            controller._KEY_DETECTION_TIMEOUT_SECONDS + 1.0
+        )
+
+        controller.pollKeyDetectionBridge()
+
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertFalse(request.request_path.exists())
+        self.assertIn("未检测到按键", controller.keyDetectionText)
+
+    def test_running_bridge_without_a_ready_input_channel_fails_immediately(self):
+        controller, _ = self._make_controller()
+        self._bridge_status_patch.stop()
+        self._bridge_status_patch = mock.patch.object(
+            qt_settings_app.single_instance,
+            "bridge_instance_running",
+            return_value=True,
+        )
+        self._bridge_status_patch.start()
+        bridge_runtime_status.publish_status(
+            controller._config_root,
+            bridge_runtime_status.BridgeConnectionState.WAITING_FOR_DEVICE,
+            pid=4321,
+            raw_input_state="failed",
+            hid_tap_state=frida_compat.HidTapState.UNAVAILABLE.value,
+        )
+
+        with mock.patch.object(
+            qt_settings_app.key_detection_bridge,
+            "request_detection",
+        ) as request_detection:
+            controller.startKeyDetection()
+
+        request_detection.assert_not_called()
+        self.assertFalse(controller.keyDetectionActive)
+        self.assertIn("没有可用的按键通道", controller.keyDetectionText)
+
+    def test_usage_guide_opens_repository_readme_and_reports_failure(self):
+        controller, _ = self._make_controller()
+        target = "https://github.com/ZSTDJan/windows-remote-mic-app#readme"
+        for outcome in qt_settings_app.shell_targets.ExternalTargetOutcome:
+            with self.subTest(outcome=outcome), mock.patch.object(
+                qt_settings_app.shell_targets,
+                "open_external_target",
+                return_value=qt_settings_app.shell_targets.ExternalTargetResult(
+                    outcome, target, "浏览器不可用"
+                ),
+            ) as opener:
+                self.assertEqual(
+                    controller.openUsageGuide(),
+                    outcome is qt_settings_app.shell_targets.ExternalTargetOutcome.OPENED,
+                )
+                opener.assert_called_once_with(target)
+                if outcome is qt_settings_app.shell_targets.ExternalTargetOutcome.OPEN_FAILED:
+                    self.assertIn("浏览器不可用", controller.errorMessage)
+
+    def test_export_logs_reports_honestly_when_never_run(self):
+        controller, _ = self._make_controller()
+        destination = Path(self._tmpdir.name) / '日志.zip'
+        controller.exportLogs(destination.as_uri())
+        self.assertIn("暂无可导出", controller.statusMessage)
+        self.assertFalse(destination.exists())
+        self.assertFalse(controller.logExportBusy)
+
+    def test_open_log_location_reports_outcomes_and_works_with_diagnostics_off(self):
+        controller, _ = self._make_controller()
+        controller._diagnostic_trace_enabled = False
+        location = qt_settings_app.logging_setup.describe_log_location(controller._config_root)
+        for outcome, message in (
+            (qt_settings_app.logging_setup.LogOpenOutcome.OPENED, '已打开日志文件夹'),
+            (qt_settings_app.logging_setup.LogOpenOutcome.DIRECTORY_MISSING, '日志文件夹尚未生成'),
+            (qt_settings_app.logging_setup.LogOpenOutcome.OPEN_FAILED, '无法打开日志文件夹'),
+        ):
+            with self.subTest(outcome=outcome), mock.patch.object(
+                qt_settings_app.logging_setup, 'open_log_location', return_value=
+                    qt_settings_app.logging_setup.LogOpenResult(outcome, location, 'private error')) as opener:
+                self.assertEqual(controller.openLogLocation(), outcome is qt_settings_app.logging_setup.LogOpenOutcome.OPENED)
+                opener.assert_called_once_with(controller._config_root)
+                self.assertIn(message, controller.statusMessage + controller.errorMessage)
+                self.assertNotIn('private error', controller.statusMessage + controller.errorMessage)
+        controller.shutdownBackgroundTasks()
+        with mock.patch.object(qt_settings_app.logging_setup, 'open_log_location') as opener:
+            self.assertFalse(controller.openLogLocation())
+            opener.assert_not_called()
+
+    def test_export_logs_with_diagnostics_off_and_repeated_clicks(self):
+        import zipfile
+        controller, _ = self._make_controller()
+        controller._diagnostic_trace_enabled = False
+        directory = qt_settings_app.logging_setup.log_dir(controller._config_root)
+        directory.mkdir(parents=True)
+        (directory / 'app.log').write_bytes(b'event\n')
+        queued = []
+        controller._background_task_runner = lambda target, name: queued.append(target)
+        destination = Path(self._tmpdir.name) / '日志.zip'
+        self.assertTrue(controller.exportLogs(destination.as_uri()))
+        self.assertTrue(controller.logExportBusy)
+        self.assertFalse(controller.exportLogs(destination.as_uri()))
+        self.assertEqual(len(queued), 1)
+        queued[0]()
+        self.assertFalse(controller.logExportBusy)
+        self.assertIn('已导出 1 个', controller.statusMessage)
+        with zipfile.ZipFile(destination) as archive:
+            self.assertEqual(archive.read('app.log'), b'event\n')
+
+    def test_export_cancel_invalid_url_and_worker_start_failure(self):
+        controller, _ = self._make_controller()
+        with mock.patch.object(qt_settings_app.log_export, 'export_logs') as export:
+            self.assertFalse(controller.exportLogs(''))
+            self.assertFalse(controller.exportLogs('https://example.invalid/logs.zip'))
+            export.assert_not_called()
+        controller._background_task_runner = mock.Mock(side_effect=RuntimeError('private'))
+        self.assertFalse(controller.exportLogs((Path(self._tmpdir.name) / '日志.zip').as_uri()))
+        self.assertFalse(controller.logExportBusy)
+        self.assertIn('导出失败', controller.errorMessage)
+        self.assertNotIn('private', controller.errorMessage)
+
+    def test_export_shutdown_cancels_queued_work_and_ignores_late_result(self):
+        controller, _ = self._make_controller()
+        queued = []
+        controller._background_task_runner = lambda target, name: queued.append(target)
+        destination = Path(self._tmpdir.name) / '日志.zip'
+        controller.exportLogs(destination.as_uri())
+        controller.shutdownBackgroundTasks()
+        queued[0]()
+        self.assertFalse(destination.exists())
+        self.assertNotIn('已导出', controller.statusMessage)
+
+    def test_open_bluetooth_settings_reports_the_uri_it_opened(self):
+        controller, _ = self._make_controller()
+        controller._set_error_message("stale error")
+        fake_result = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPENED,
+            target=shell_targets.BLUETOOTH_SETTINGS_URI,
+        )
+        with mock.patch.object(
+            shell_targets, "open_external_target", return_value=fake_result
+        ) as fake_open:
+            controller.openBluetoothSettings()
+        fake_open.assert_called_once_with(shell_targets.BLUETOOTH_SETTINGS_URI)
+        self.assertIn(shell_targets.BLUETOOTH_SETTINGS_URI, controller.statusMessage)
+        self.assertEqual(controller.errorMessage, "")
+
+    def test_open_microphone_privacy_settings_uses_the_windows_privacy_uri(self):
+        controller, _ = self._make_controller()
+        fake_result = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPENED,
+            target=shell_targets.MICROPHONE_PRIVACY_SETTINGS_URI,
+        )
+        with mock.patch.object(
+            shell_targets, "open_external_target", return_value=fake_result
+        ) as fake_open:
+            controller.openMicrophonePrivacySettings()
+        fake_open.assert_called_once_with(
+            shell_targets.MICROPHONE_PRIVACY_SETTINGS_URI
+        )
+
+    def test_open_sound_settings_uses_the_windows_sound_uri(self):
+        controller, _ = self._make_controller()
+        fake_result = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPENED,
+            target=shell_targets.SOUND_SETTINGS_URI,
+        )
+        with mock.patch.object(
+            shell_targets, "open_external_target", return_value=fake_result
+        ) as fake_open:
+            controller.openSoundSettings()
+        fake_open.assert_called_once_with(shell_targets.SOUND_SETTINGS_URI)
+
+    def test_open_speech_settings_reports_a_failure_honestly(self):
+        controller, _ = self._make_controller()
+        fake_result = shell_targets.ExternalTargetResult(
+            outcome=shell_targets.ExternalTargetOutcome.OPEN_FAILED,
+            target=shell_targets.SPEECH_SETTINGS_URI,
+            error="no handler registered",
+        )
+        with mock.patch.object(
+            shell_targets, "open_external_target", return_value=fake_result
+        ):
+            controller.openSpeechSettings()
+        self.assertEqual(controller.statusMessage, "")
+        self.assertIn("no handler registered", controller.errorMessage)
+
+    def test_installed_sogou_settings_use_manual_tray_guidance(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        executable = Path(
+            r"C:\Program Files\SogouInput\sogou_voice_assistant.exe"
+        )
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "sogou",
+            "搜狗语音输入",
+            "sogou_manual",
+            str(executable),
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ):
+            controller.openVoiceProgramSettings()
+
+        self.assertEqual(controller.errorMessage, "")
+        self.assertIn("展开隐藏图标", controller.statusMessage)
+        self.assertIn("右键搜狗语音图标", controller.statusMessage)
+
+    def test_missing_sogou_voice_opens_the_ai_toolbox(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        toolbox = Path(r"C:\Program Files\SogouInput\SOGOUSmartAssistant.exe")
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "sogou",
+            "搜狗语音输入",
+            "sogou_toolbox",
+            str(toolbox),
+            "--from=menutool",
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "open_voice_program_settings",
+        ) as open_settings:
+            controller.openVoiceProgramSettings()
+
+        open_settings.assert_called_once_with(toolbox, "--from=menutool")
+        self.assertEqual(controller.errorMessage, "")
+        self.assertIn("请手动安装", controller.statusMessage)
+
+    def test_missing_sogou_toolbox_uses_the_status_bar(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 1
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "sogou",
+            "搜狗语音输入",
+            "missing",
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ):
+            controller.openVoiceProgramSettings()
+
+        self.assertEqual(controller.errorMessage, "")
+        self.assertIn("AI 工具箱中手动安装", controller.statusMessage)
+
+    def test_open_wetype_settings_uses_the_installed_settings_program(self):
+        controller, _ = self._make_controller()
+        controller.selectedVoiceProgramIndex = 2
+        executable = Path(r"C:\Program Files\Tencent\WeType\wetype_update.exe")
+        target = voice_program_manager.VoiceProgramSettingsTarget(
+            "wetype",
+            "微信输入法",
+            "executable",
+            str(executable),
+            "-showsetting",
+        )
+        with mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "resolve_voice_program_settings_target",
+            return_value=target,
+        ), mock.patch.object(
+            qt_settings_app.voice_program_manager,
+            "open_voice_program_settings",
+        ) as open_settings:
+            controller.openVoiceProgramSettings()
+
+        open_settings.assert_called_once_with(executable, "-showsetting")
+        self.assertIn("已打开微信输入法设置", controller.statusMessage)
+
+    def test_select_and_persist_output_endpoint_succeeds_and_updates_options(self):
+        controller, _ = self._make_controller()
+        persisted = []
+        controller.outputEndpointPersisted.connect(lambda: persisted.append(True))
+        with mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ) as preflight:
+            result = controller.selectAndPersistOutputEndpoint(
+                "CABLE Input", "Windows WASAPI"
+            )
+        self.assertTrue(result)
+        preflight.assert_called_once_with(
+            "CABLE Input",
+            "Windows WASAPI",
+            cancel_event=mock.ANY,
+        )
+        cancel_event = preflight.call_args.kwargs["cancel_event"]
+        self.assertFalse(cancel_event.is_set())
+        controller._application_exit_intent.set()
+        self.assertTrue(cancel_event.is_set())
+        controller._application_exit_intent.clear()
+        reloaded = config.load_config(config.config_path(controller._config_root))
+        self.assertEqual(reloaded["output_endpoint_name"], "CABLE Input")
+        self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
+        self.assertEqual(persisted, [True])
+
+    def test_output_endpoint_change_rejects_bridge_and_driver_actions(self):
+        blockers = (
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "driver_action",
+                lambda controller: qt_settings_app._driver_action_active_event.set(),
+                lambda controller: qt_settings_app._driver_action_active_event.clear(),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                controller, _ = self._make_controller()
+                start(controller)
+                try:
+                    with mock.patch.object(
+                        qt_settings_app.windows_diagnostics,
+                        "preflight_output_endpoint_isolated",
+                    ) as preflight:
+                        result = controller.selectAndPersistOutputEndpoint(
+                            "CABLE Input", "Windows WASAPI"
+                        )
+                finally:
+                    stop(controller)
+
+                self.assertFalse(result)
+                preflight.assert_not_called()
+
+    def test_select_and_persist_output_endpoint_returns_false_on_persistence_failure(self):
+        # A config-save failure (disk full,
+        # permission denied, ...) must never raise out of this Slot and
+        # must never be reported as a successful save.
+        controller, _ = self._make_controller()
+        original_config = dict(controller._config)
+        with mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ), mock.patch.object(config, "save_config", side_effect=OSError("disk full")):
+            result = controller.selectAndPersistOutputEndpoint("CABLE Input", "Windows WASAPI")
+        self.assertFalse(result)
+        # The in-memory config must not look saved when it was not.
+        self.assertEqual(controller._config, original_config)
+
+    def test_select_and_persist_output_endpoint_never_raises_on_unexpected_error(self):
+        controller, _ = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ), mock.patch.object(config, "save_config", side_effect=RuntimeError("boom")):
+            result = controller.selectAndPersistOutputEndpoint("CABLE Input", "")
+        self.assertFalse(result)
+
+    def test_select_and_persist_output_endpoint_rejects_failed_preflight(self):
+        controller, _ = self._make_controller()
+        original_config = dict(controller._config)
+        with mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+            side_effect=audio_output.AudioOutputUnavailableError("cannot open"),
+        ), mock.patch.object(config, "save_config") as save_config:
+            result = controller.selectAndPersistOutputEndpoint(
+                "CABLE Input", "Windows WASAPI"
+            )
+        self.assertFalse(result)
+        save_config.assert_not_called()
+        self.assertEqual(controller._config, original_config)
+
+    def test_output_endpoint_preflight_cancelled_by_exit_reports_exit_reason(self):
+        model = self.Model()
+        background_tasks = []
+        completions = []
+
+        def runner(target, name):
+            if name == "audio-endpoint-preflight":
+                background_tasks.append((target, name))
+            else:
+                target()
+
+        controller = self._new_controller(
+            model,
+            background_task_runner=runner,
+        )
+        original_config = dict(controller._config)
+
+        with mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+            side_effect=audio_output.AudioOutputUnavailableError("cancelled"),
+        ), mock.patch.object(config, "save_config") as save_config:
+            self.assertTrue(
+                controller._select_and_persist_output_endpoint(
+                    "CABLE Input",
+                    "Windows WASAPI",
+                    lambda ok, message: completions.append((ok, message)),
+                )
+            )
+            self.assertEqual(len(background_tasks), 1)
+
+            controller.requestApplicationExit()
+            background_tasks.pop()[0]()
+
+        self.assertEqual(
+            completions,
+            [(False, "程序正在退出，未保存输出端点。")],
+        )
+        save_config.assert_not_called()
+        self.assertEqual(controller._config, original_config)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class DiagnosticsControllerTests(unittest.TestCase):
+    """DiagnosticsController runs every check on a background
+    thread and delivers results via a cross-thread Qt signal - unlike
+    SettingsControllerTests above, these tests need a real (offscreen)
+    QGuiApplication instance so ``processEvents()`` can actually pump the
+    queued cross-thread delivery; constructing one here never touches
+    QQuickStyle/QML, so it does not conflict with the separate
+    once-per-process QQuickStyle constraint the QML-engine subprocess tests
+    below work around.
+    """
+
+    def setUp(self):
+        classes = qt_settings_app._load_qt_classes()
+        self.Model = classes["ButtonMappingModel"]
+        self.SettingsController = classes["SettingsController"]
+        self.DiagnosticsController = classes["DiagnosticsController"]
+        QGuiApplication = classes["QGuiApplication"]
+        self.app = QGuiApplication.instance() or QGuiApplication([])
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(os.environ, {"LOCALAPPDATA": self._tmpdir.name})
+        self._env_patch.start()
+        # Matches config_root() with the SAME LOCALAPPDATA-derived path
+        # SettingsController itself computes internally (config.config_root()),
+        # NOT the bare tmpdir - otherwise DiagnosticsController would read/
+        # write a different directory than the one SettingsController's own
+        # config actually lives in.
+        self._config_root = config.config_root()
+        # Defensive: this is process-global, persistent
+        # state - never start a test with it left set by a previous
+        # test/failure, and never leave it set for the next one.
+        qt_settings_app._diagnostics_shutdown_event.clear()
+        qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
+
+    def tearDown(self):
+        qt_settings_app._diagnostics_shutdown_event.clear()
+        qt_settings_app._vb_cable_test_active_event.clear()
+        qt_settings_app._driver_action_active_event.clear()
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def _make_settings_controller(self):
+        model = self.Model()
+        return self.SettingsController(
+            model,
+            background_task_runner=lambda target, _name: target(),
+        )
+
+    def _pump_until(self, predicate, timeout_seconds=5.0):
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            self.app.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_initial_construction_starts_a_refresh_that_completes(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self.assertTrue(diag.isRefreshing)
+        self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+        self.assertEqual(len(diag.checkResults), 4)
+        ids = {row["checkId"] for row in diag.checkResults}
+        self.assertNotIn("dictation", ids)
+        self.assertTrue(all("resultCode" in row for row in diag.checkResults))
+
+    def test_persisted_endpoint_rechecks_and_discards_an_inflight_stale_result(self):
+        old_refresh_started = threading.Event()
+        release_old_refresh = threading.Event()
+        calls = []
+        failed_report = windows_diagnostics.DiagnosticsReport(
+            checks=(
+                windows_diagnostics.CheckResult(
+                    "output_endpoint",
+                    "输出端点",
+                    windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                    windows_diagnostics.CheckStatus.FAIL,
+                    "未选择输出端点",
+                    "failed",
+                ),
+            )
+        )
+        passed_report = windows_diagnostics.DiagnosticsReport(
+            checks=(
+                windows_diagnostics.CheckResult(
+                    "output_endpoint",
+                    "输出端点",
+                    windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                    windows_diagnostics.CheckStatus.PASS,
+                    "已选择 CABLE Input",
+                    "ready",
+                ),
+            )
+        )
+
+        def run_diagnostics(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                old_refresh_started.set()
+                release_old_refresh.wait(timeout=5.0)
+                return failed_report
+            return passed_report
+
+        settings_controller = self._make_settings_controller()
+        with mock.patch.object(
+            windows_diagnostics,
+            "run_diagnostics",
+            side_effect=run_diagnostics,
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ):
+            diag = self.DiagnosticsController(
+                settings_controller,
+                self._config_root,
+            )
+            try:
+                self.assertTrue(old_refresh_started.wait(timeout=1.0))
+                self.assertTrue(
+                    settings_controller.selectAndPersistOutputEndpoint(
+                        "CABLE Input",
+                        "Windows WASAPI",
+                    )
+                )
+            finally:
+                release_old_refresh.set()
+
+            self.assertTrue(
+                self._pump_until(
+                    lambda: len(calls) >= 2 and not diag.isRefreshing
+                )
+            )
+
+        self.assertEqual(calls[-1]["saved_output_name"], "CABLE Input")
+        self.assertEqual(calls[-1]["saved_output_host_api"], "Windows WASAPI")
+        output_result = next(
+            row
+            for row in diag.checkResults
+            if row["checkId"] == "output_endpoint"
+        )
+        self.assertEqual(output_result["status"], "pass")
+
+    def test_check_results_never_contain_a_placeholder_raw_path_or_address(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        for row in diag.checkResults:
+            self.assertNotIn("VID_", row["detail"])
+            self.assertNotIn("\\\\?\\", row["detail"])
+
+    def test_unexpected_report_failure_clears_stale_results_and_shows_a_page_error(self):
+        # A background-thread report failure (e.g.
+        # windows_diagnostics.run_diagnostics() itself raising, despite its
+        # own per-check isolation) must never leave a PREVIOUS successful
+        # run's rows on screen looking current, and must surface a clear,
+        # page-level error - not only a driver-card message below the fold.
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+        self.assertEqual(len(diag.checkResults), 4)  # a real prior run populated these
+        self.assertEqual(diag.diagnosticsErrorMessage, "")
+
+        with mock.patch.object(
+            windows_diagnostics, "run_diagnostics", side_effect=RuntimeError("boom")
+        ):
+            diag.refreshDiagnostics()
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+
+        self.assertEqual(diag.checkResults, [])
+        self.assertNotEqual(diag.diagnosticsErrorMessage, "")
+        self.assertIn("重新检测", diag.diagnosticsErrorMessage)
+
+    def test_successful_refresh_after_a_failure_clears_the_page_error(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            windows_diagnostics, "run_diagnostics", side_effect=RuntimeError("boom")
+        ):
+            diag.refreshDiagnostics()
+            self._pump_until(lambda: not diag.isRefreshing)
+        self.assertNotEqual(diag.diagnosticsErrorMessage, "")
+
+        diag.refreshDiagnostics()
+        self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+        self.assertEqual(diag.diagnosticsErrorMessage, "")
+        self.assertEqual(len(diag.checkResults), 4)
+
+    def test_worker_thread_is_deregistered_once_finished(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        self.assertTrue(
+            self._pump_until(lambda: len(qt_settings_app._diagnostics_threads) == 0)
+        )
+
+    def test_repeated_refresh_click_is_ignored_while_a_check_is_already_running(self):
+        release_event = threading.Event()
+        call_count = {"n": 0}
+
+        def _blocking_run_diagnostics(**kwargs):
+            call_count["n"] += 1
+            release_event.wait(timeout=5.0)
+            return windows_diagnostics.DiagnosticsReport(checks=())
+
+        settings_controller = self._make_settings_controller()
+        with mock.patch.object(
+            windows_diagnostics, "run_diagnostics", side_effect=_blocking_run_diagnostics
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            # __init__ already started one worker, currently blocked on
+            # release_event - both of these must be no-ops, never a second
+            # concurrent call into the (blocking) fake.
+            diag.refreshDiagnostics()
+            diag.refreshDiagnostics()
+            release_event.set()
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+        self.assertEqual(call_count["n"], 1)
+
+    def test_bridge_connection_automatically_refreshes_stale_diagnostics(self):
+        call_count = {"n": 0}
+
+        def _run_diagnostics(**kwargs):
+            call_count["n"] += 1
+            return windows_diagnostics.DiagnosticsReport(checks=())
+
+        settings_controller = self._make_settings_controller()
+        with mock.patch.object(
+            windows_diagnostics,
+            "run_diagnostics",
+            side_effect=_run_diagnostics,
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+            self.assertEqual(call_count["n"], 1)
+
+            settings_controller._set_bridge_connected(True)
+            self.assertTrue(
+                self._pump_until(
+                    lambda: call_count["n"] == 2 and not diag.isRefreshing
+                )
+            )
+
+        self.assertEqual(call_count["n"], 2)
+
+    def test_bridge_connection_refresh_waits_for_the_active_check(self):
+        release_first = threading.Event()
+        state = {"calls": 0, "active": 0, "max_active": 0}
+
+        def _run_diagnostics(**kwargs):
+            state["calls"] += 1
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                if state["calls"] == 1:
+                    release_first.wait(timeout=5.0)
+                return windows_diagnostics.DiagnosticsReport(checks=())
+            finally:
+                state["active"] -= 1
+
+        settings_controller = self._make_settings_controller()
+        with mock.patch.object(
+            windows_diagnostics,
+            "run_diagnostics",
+            side_effect=_run_diagnostics,
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            self.assertTrue(diag.isRefreshing)
+            settings_controller._set_bridge_connected(True)
+            self.app.processEvents()
+            self.assertEqual(state["calls"], 1)
+
+            release_first.set()
+            self.assertTrue(
+                self._pump_until(
+                    lambda: state["calls"] == 2 and not diag.isRefreshing
+                )
+            )
+
+        self.assertEqual(state["calls"], 2)
+        self.assertEqual(state["max_active"], 1)
+
+    def test_no_worker_thread_survives_after_completion(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        self._pump_until(lambda: len(qt_settings_app._diagnostics_threads) == 0)
+        for thread in list(qt_settings_app._diagnostics_threads):
+            self.assertFalse(thread.is_alive())
+
+    def test_refresh_diagnostics_refuses_to_start_once_shutdown_has_begun(self):
+        # Once process shutdown is flagged, a "重新检测"
+        # click (or anything else calling refreshDiagnostics()) must be a
+        # no-op - there is nothing left alive to usefully deliver a result
+        # to, and starting a new thread this late only works against the
+        # atexit hook's own bounded join.
+        settings_controller = self._make_settings_controller()
+        empty_report = windows_diagnostics.DiagnosticsReport(checks=())
+        with mock.patch.object(
+            windows_diagnostics, "run_diagnostics", return_value=empty_report
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+            self.assertTrue(
+                self._pump_until(
+                    lambda: len(qt_settings_app._diagnostics_threads) == 0
+                )
+            )
+
+        qt_settings_app._diagnostics_shutdown_event.set()
+        diag.refreshDiagnostics()
+        # Give any (incorrectly) started worker a real chance to flip
+        # isRefreshing/register itself before asserting neither happened.
+        self.app.processEvents()
+        self.assertFalse(diag.isRefreshing)
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+
+    def test_worker_already_running_skips_emit_once_shutdown_begins_mid_run(self):
+        # A worker that was already running when shutdown
+        # began must notice the flag and skip delivering its result,
+        # rather than emitting into a DiagnosticsController/Qt runtime that
+        # may already be mid-teardown by the time it finishes.
+        release_event = threading.Event()
+
+        def _blocking_run_diagnostics(**kwargs):
+            release_event.wait(timeout=5.0)
+            return windows_diagnostics.DiagnosticsReport(checks=())
+
+        settings_controller = self._make_settings_controller()
+        with mock.patch.object(
+            windows_diagnostics, "run_diagnostics", side_effect=_blocking_run_diagnostics
+        ):
+            diag = self.DiagnosticsController(settings_controller, self._config_root)
+            # __init__ already started one worker, currently blocked.
+            self.assertTrue(diag.isRefreshing)
+
+            qt_settings_app._diagnostics_shutdown_event.set()
+            release_event.set()
+            # The worker still finishes and deregisters itself (proven via
+            # the registry, since the - correctly skipped - emit means
+            # isRefreshing/checkResults are never touched by
+            # _on_diagnostics_ready and so cannot be used as the signal
+            # here).
+            self.assertTrue(
+                self._pump_until(lambda: len(qt_settings_app._diagnostics_threads) == 0)
+            )
+        # The skipped emit is exactly why these are still in their
+        # constructed-but-never-updated state.
+        self.assertTrue(diag.isRefreshing)
+        self.assertEqual(diag.checkResults, [])
+
+    def test_registry_is_cleaned_up_even_if_emit_raises(self):
+        # A receiver/Qt runtime that is already tearing
+        # down could still make the emit call itself raise (the shutdown-
+        # flag check narrows this window but cannot close it perfectly) -
+        # the worker thread must still deregister itself from
+        # _diagnostics_threads regardless, via its `finally` block.
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        self._pump_until(lambda: len(qt_settings_app._diagnostics_threads) == 0)
+
+        with mock.patch.object(
+            diag, "_emit_diagnostics_ready", side_effect=RuntimeError("boom")
+        ):
+            diag.refreshDiagnostics()
+            self.assertTrue(
+                self._pump_until(lambda: len(qt_settings_app._diagnostics_threads) == 0)
+            )
+        # The worker thread itself never crashed the process/left a
+        # dangling registry entry despite the injected emit failure.
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+
+
+    def test_shutdown_helper_kills_a_hanging_vb_cable_child(self):
+        hang_script = "import time\ntime.sleep(120)\n"
+
+        def _fake_command(request_path, result_path, **kwargs):
+            return [sys.executable, "-c", hang_script]
+
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+
+        with mock.patch.object(
+            settings_controller, "_get_bridge_launch_busy", return_value=False
+        ), mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=False
+        ), mock.patch.object(
+            windows_diagnostics,
+            "build_vb_cable_loopback_subprocess_command",
+            _fake_command,
+        ):
+            diag.testVbCableChannel()
+            self.assertTrue(diag.vbCableTestRunning)
+            time.sleep(0.2)
+
+            started = time.monotonic()
+            qt_settings_app._shutdown_diagnostics_workers()
+            elapsed = time.monotonic() - started
+
+        self.assertLess(
+            elapsed,
+            qt_settings_app._DIAGNOSTICS_THREAD_JOIN_TIMEOUT_SECONDS + 1.0,
+        )
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+        self.assertFalse(qt_settings_app._vb_cable_test_active_event.is_set())
+        # Shutdown suppresses the result signal, so the now-closing UI is
+        # never updated from the worker after Qt teardown has begun.
+        self.assertTrue(diag.vbCableTestRunning)
+
+    def test_select_detected_cable_input_persists_via_settings_controller(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        endpoint = audio_output.AudioEndpoint(name="CABLE Input", host_api="Windows WASAPI")
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=[endpoint]
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ):
+            result = diag.selectDetectedCableInputAsOutput()
+
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
+        self.assertIn("CABLE Input", diag.driverStatusMessage)
+        # Persisted for real - reloading config from disk shows the change.
+        reloaded = config.load_config(config.config_path(self._config_root))
+        self.assertEqual(reloaded["output_endpoint_name"], "CABLE Input")
+        self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
+
+    def test_select_detected_cable_input_fails_closed_when_none_found(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(audio_output, "enumerate_output_endpoints", return_value=[]):
+            result = diag.selectDetectedCableInputAsOutput()
+
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
+        self.assertIn("未找到", diag.driverErrorMessage)
+
+    def test_select_detected_cable_input_refuses_to_start_during_exit(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        settings_controller._application_exit_intent.set()
+
+        with mock.patch.object(
+            audio_output,
+            "enumerate_output_endpoints",
+        ) as enumerate_endpoints:
+            self.assertFalse(diag.selectDetectedCableInputAsOutput())
+
+        enumerate_endpoints.assert_not_called()
+        self.assertFalse(diag.driverActionRunning)
+        self.assertFalse(qt_settings_app._driver_action_active_event.is_set())
+
+    def test_select_detected_cable_input_refuses_bridge_and_endpoint_work(self):
+        blockers = (
+            (
+                "bridge_launch",
+                lambda controller: controller._set_bridge_launch_phase("starting"),
+                lambda controller: controller._set_bridge_launch_phase("idle"),
+            ),
+            (
+                "endpoint_preflight",
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", True),
+                lambda controller: setattr(controller, "_endpoint_preflight_busy", False),
+            ),
+        )
+
+        for name, start, stop in blockers:
+            with self.subTest(name=name):
+                settings_controller = self._make_settings_controller()
+                diag = self.DiagnosticsController(
+                    settings_controller, self._config_root
+                )
+                self._pump_until(lambda: not diag.isRefreshing)
+                start(settings_controller)
+                try:
+                    with mock.patch.object(
+                        audio_output, "enumerate_output_endpoints"
+                    ) as enumerate_endpoints:
+                        self.assertFalse(diag.selectDetectedCableInputAsOutput())
+                finally:
+                    stop(settings_controller)
+
+                enumerate_endpoints.assert_not_called()
+                self.assertFalse(diag.driverActionRunning)
+
+    def test_select_detected_cable_input_reports_an_honest_error_on_persistence_failure(self):
+        # A config persistence failure must never
+        # raise out of this Slot, must never be reported as a successful
+        # save, and must never expose a local path/device identifier.
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        endpoint = audio_output.AudioEndpoint(name="CABLE Input", host_api="Windows WASAPI")
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=[endpoint]
+        ):
+            with mock.patch.object(
+                settings_controller,
+                "_select_and_persist_output_endpoint",
+                side_effect=RuntimeError("boom"),
+            ):
+                result = diag.selectDetectedCableInputAsOutput()
+
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
+        self.assertNotIn("boom", diag.driverErrorMessage)
+        self.assertEqual(diag.driverStatusMessage, "")
+        error_lower = diag.driverErrorMessage.lower()
+        self.assertNotIn(str(self._config_root).lower(), error_lower)
+
+    def test_select_detected_cable_input_reports_an_honest_error_when_persistence_returns_false(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        endpoint = audio_output.AudioEndpoint(name="CABLE Input", host_api="Windows WASAPI")
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=[endpoint]
+        ):
+            with mock.patch.object(
+                settings_controller,
+                "_select_and_persist_output_endpoint",
+                return_value=False,
+            ):
+                result = diag.selectDetectedCableInputAsOutput()
+
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
+        self.assertNotEqual(diag.driverErrorMessage, "")
+        self.assertEqual(diag.driverStatusMessage, "")
+
+    def test_select_detected_cable_input_fails_closed_when_ambiguous(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        endpoints = [
+            audio_output.AudioEndpoint(name="CABLE Input", host_api="A"),
+            audio_output.AudioEndpoint(name="CABLE Input", host_api="B"),
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ):
+            result = diag.selectDetectedCableInputAsOutput()
+
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
+        self.assertIn("请在语音页", diag.driverErrorMessage)
+
+    def test_select_detected_cable_input_prefers_wasapi_over_directsound(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input", host_api="Windows DirectSound"
+            ),
+            audio_output.AudioEndpoint(name="CABLE Input", host_api="Windows WASAPI"),
+        ]
+        with mock.patch.object(
+            audio_output, "enumerate_output_endpoints", return_value=endpoints
+        ), mock.patch.object(
+            qt_settings_app.windows_diagnostics,
+            "preflight_output_endpoint_isolated",
+        ):
+            result = diag.selectDetectedCableInputAsOutput()
+
+        self.assertTrue(result)
+        self.assertTrue(self._pump_until(lambda: not diag.driverActionRunning))
+        reloaded = config.load_config(config.config_path(self._config_root))
+        self.assertEqual(reloaded["output_endpoint_host_api"], "Windows WASAPI")
+
+    def test_vb_cable_channel_test_delivers_success_back_to_the_gui_thread(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        result = windows_diagnostics.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+            windows_diagnostics.CheckStatus.PASS,
+            "测试信号已到达；不代表输入法已经识别文字。",
+        )
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=False
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated", return_value=result
+        ):
+            diag.testVbCableChannel()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "pass")
+        self.assertIn("不代表输入法", diag.vbCableTestMessage)
+
+    def test_refresh_invalidates_an_old_vb_cable_success(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        diag._on_vb_cable_test_ready(
+            windows_diagnostics.CheckResult(
+                "vb_cable_loopback",
+                "VB-CABLE 本地通道",
+                windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                windows_diagnostics.CheckStatus.PASS,
+                "OLD_PASS",
+            )
+        )
+        self.assertEqual(diag.vbCableTestStatus, "pass")
+
+        with mock.patch.object(
+            windows_diagnostics,
+            "run_diagnostics",
+            return_value=windows_diagnostics.DiagnosticsReport(checks=()),
+        ):
+            diag.refreshDiagnostics()
+            self.assertEqual(diag.vbCableTestStatus, "idle")
+            self.assertEqual(diag.vbCableTestMessage, "")
+            self.assertTrue(self._pump_until(lambda: not diag.isRefreshing))
+
+    def test_endpoint_selection_change_invalidates_an_old_vb_cable_success(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        diag._on_vb_cable_test_ready(
+            windows_diagnostics.CheckResult(
+                "vb_cable_loopback",
+                "VB-CABLE 本地通道",
+                windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                windows_diagnostics.CheckStatus.PASS,
+                "OLD_PASS",
+            )
+        )
+
+        settings_controller.selectedEndpointIndexChanged.emit()
+
+        self.assertEqual(diag.vbCableTestStatus, "idle")
+        self.assertEqual(diag.vbCableTestMessage, "")
+
+    def test_vb_cable_channel_test_rejects_a_running_bridge(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("临时停止", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_temporarily_stops_and_restores_bridge(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        loopback_result = windows_diagnostics.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+            windows_diagnostics.CheckStatus.PASS,
+            "测试信号已到达。",
+        )
+        restart_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.STARTED,
+            command=("无线麦Mod win版 1.0.51-candidate.51.exe", "--bridge"),
+        )
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(True, True),
+        ), mock.patch.object(
+            windows_diagnostics,
+            "check_vb_cable_loopback_isolated",
+            return_value=loopback_result,
+        ), mock.patch.object(
+            bridge_launcher,
+            "launch_in_process_bridge",
+            return_value=restart_result,
+        ) as restart:
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        restart.assert_called_once_with(launch_voice_program_on_start=False)
+        self.assertEqual(diag.vbCableTestStatus, "pass")
+        self.assertIn("自动恢复", diag.vbCableTestMessage)
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+
+    def test_vb_cable_channel_test_exposes_manual_recovery_when_restart_fails(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        loopback_result = windows_diagnostics.CheckResult(
+            "vb_cable_loopback",
+            "VB-CABLE 本地通道",
+            windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+            windows_diagnostics.CheckStatus.PASS,
+            "测试信号已到达。",
+        )
+        restart_result = bridge_launcher.LaunchResult(
+            outcome=bridge_launcher.LaunchOutcome.LAUNCH_FAILED,
+            command=(),
+            error="denied",
+        )
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(True, True),
+        ), mock.patch.object(
+            windows_diagnostics,
+            "check_vb_cable_loopback_isolated",
+            return_value=loopback_result,
+        ), mock.patch.object(
+            bridge_launcher,
+            "launch_in_process_bridge",
+            return_value=restart_result,
+        ):
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertTrue(diag.vbCableBridgeRecoveryNeeded)
+        self.assertIn("未能自动恢复", diag.vbCableTestMessage)
+
+    def test_manual_vb_cable_recovery_clears_the_stale_recovery_action(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        settings_controller._set_bridge_running(False)
+        diag._set_vb_cable_bridge_recovery_needed(True)
+        diag._set_vb_cable_test_state(
+            "fail",
+            "声音通道正常，但遥控器服务未能自动恢复",
+            running=False,
+        )
+
+        settings_controller._set_bridge_running(True)
+
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+        self.assertEqual(diag.vbCableTestStatus, "idle")
+        self.assertEqual(
+            diag.vbCableTestMessage,
+            "遥控器服务已重新启动；请重新测试声音通道",
+        )
+
+    def test_vb_cable_channel_test_does_not_run_when_graceful_stop_fails(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            return_value=bridge_control_windows.BridgeExitResult(
+                True, False, "服务未停止"
+            ),
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("服务未停止", diag.vbCableTestMessage)
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_recovers_when_graceful_stop_raises(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=True
+        ), mock.patch.object(
+            bridge_control_windows,
+            "request_bridge_exit",
+            side_effect=OSError("simulated stop failure"),
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannelWithBridgeRestart()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("无法临时停止", diag.vbCableTestMessage)
+        self.assertFalse(diag.vbCableBridgeRecoveryNeeded)
+        self.assertFalse(qt_settings_app._vb_cable_test_active_event.is_set())
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_rejects_a_bridge_launch_in_progress(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            settings_controller, "_get_bridge_launch_busy", return_value=True
+        ), mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("正在启动", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_rejects_a_driver_action_in_progress(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        diag._set_driver_action_running(True)
+
+        try:
+            with mock.patch.object(
+                windows_diagnostics, "check_vb_cable_loopback_isolated"
+            ) as loopback:
+                diag.testVbCableChannel()
+        finally:
+            diag._set_driver_action_running(False)
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("输出端点正在处理", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_rejects_voice_hotkey_work_in_progress(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        settings_controller._set_voice_hotkey_busy(True)
+
+        with mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        self.assertEqual(diag.vbCableTestStatus, "fail")
+        self.assertIn("语音快捷键正在处理", diag.vbCableTestMessage)
+        loopback.assert_not_called()
+
+    def test_vb_cable_channel_test_and_refresh_are_mutually_exclusive(self):
+        release_event = threading.Event()
+        call_count = {"n": 0}
+
+        def _blocking_check(*_args, **_kwargs):
+            call_count["n"] += 1
+            release_event.wait(timeout=5.0)
+            return windows_diagnostics.CheckResult(
+                "vb_cable_loopback",
+                "VB-CABLE 本地通道",
+                windows_diagnostics.CheckGroup.OPTIONAL_DRIVER,
+                windows_diagnostics.CheckStatus.FAIL,
+                "未收到测试信号。",
+            )
+
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        with mock.patch.object(
+            settings_controller, "_refresh_bridge_status", return_value=False
+        ), mock.patch.object(
+            windows_diagnostics,
+            "check_vb_cable_loopback_isolated",
+            side_effect=_blocking_check,
+        ), mock.patch.object(
+            windows_diagnostics, "run_diagnostics", wraps=windows_diagnostics.run_diagnostics
+        ) as refresh:
+            diag.testVbCableChannel()
+            self.assertTrue(diag.vbCableTestRunning)
+            self.assertFalse(settings_controller.saveSettings())
+            self.assertIn("通道测试正在运行", settings_controller.errorMessage)
+            diag.testVbCableChannel()
+            diag.refreshDiagnostics()
+            self.assertFalse(diag.isRefreshing)
+            release_event.set()
+            self.assertTrue(self._pump_until(lambda: not diag.vbCableTestRunning))
+
+        self.assertEqual(call_count["n"], 1)
+        refresh.assert_not_called()
+
+    def test_vb_cable_channel_test_refuses_to_start_after_shutdown(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+        qt_settings_app._diagnostics_shutdown_event.set()
+
+        with mock.patch.object(
+            windows_diagnostics, "check_vb_cable_loopback_isolated"
+        ) as loopback:
+            diag.testVbCableChannel()
+
+        self.assertFalse(diag.vbCableTestRunning)
+        loopback.assert_not_called()
+
+    def test_launch_vb_cable_setup_reports_bundle_not_found_as_an_error(self):
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            vb_cable_bundle,
+            "prepare_and_launch_vendor_setup",
+            side_effect=vb_cable_bundle.BundleNotFoundError("no bundle"),
+        ):
+            diag.launchVbCableSetup()
+
+        self.assertIn("未找到", diag.driverErrorMessage)
+
+    def test_launch_vb_cable_setup_reports_uac_cancellation_as_neutral_info_not_error_or_success(self):
+        # A UAC cancellation must never render in
+        # the success/green color (driverStatusMessage) - it is neutral
+        # informational text (driverInfoMessage) instead.
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            vb_cable_bundle,
+            "prepare_and_launch_vendor_setup",
+            side_effect=vb_cable_bundle.UacCancelledError("用户取消了 UAC 提升请求；未安装任何内容。"),
+        ):
+            diag.launchVbCableSetup()
+
+        self.assertEqual(diag.driverErrorMessage, "")
+        self.assertEqual(diag.driverStatusMessage, "")
+        self.assertIn("取消", diag.driverInfoMessage)
+
+    def test_launch_vb_cable_setup_success_is_neutral_info_never_claims_installation_succeeded(self):
+        # Launching the vendor UI is informational
+        # (driverInfoMessage), not a completed success (driverStatusMessage)
+        # - only a later endpoint recheck can confirm an actual install.
+        settings_controller = self._make_settings_controller()
+        diag = self.DiagnosticsController(settings_controller, self._config_root)
+        self._pump_until(lambda: not diag.isRefreshing)
+
+        with mock.patch.object(
+            vb_cable_bundle, "prepare_and_launch_vendor_setup", return_value=None
+        ):
+            diag.launchVbCableSetup()
+
+        self.assertEqual(diag.driverErrorMessage, "")
+        self.assertEqual(diag.driverStatusMessage, "")
+        self.assertIn("重新检查", diag.driverInfoMessage)
+        self.assertNotIn("安装成功", diag.driverInfoMessage)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class RunSettingsWindowShutdownCoverageTests(unittest.TestCase):
+    """``run_settings_window()``'s production
+    shutdown contract must cover every exit path starting right after
+    both controllers are constructed, not only ``app.exec()`` returning.
+    ``SettingsController`` already owns endpoint/program workers at that
+    point; diagnostics are deferred until QML reports its first frame.
+    Drives the REAL function end to end (never a source-level/AST proxy) -
+    only the Qt WINDOW plumbing (``QGuiApplication``/``QQmlApplicationEngine``
+    /``QQuickStyle``/``QUrl``/``qmlRegisterSingletonInstance``) is replaced
+    with small, fully-controllable fakes (real PySide6/shiboken C++ types
+    are not reliably monkeypatchable, and no real QML window needs to exist
+    to prove this contract) - ``ButtonMappingModel``/``SettingsController``/
+    ``DiagnosticsController`` stay the REAL classes ``_load_qt_classes()``
+    itself already produced, so their cleanup methods and worker lifecycle
+    remain the production implementations.
+    """
+
+    def setUp(self):
+        # Fake windows must not create native events against arbitrary HWNDs.
+        register_patch = mock.patch.object(
+            qt_settings_app.single_instance, "register_settings_window_restore_event",
+            return_value=True,
+        )
+        release_patch = mock.patch.object(
+            qt_settings_app.single_instance, "release_settings_window_restore_event",
+        )
+        self.restore_register = register_patch.start()
+        self.restore_release = release_patch.start()
+        self.addCleanup(register_patch.stop)
+        self.addCleanup(release_patch.stop)
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {
+                "LOCALAPPDATA": self._tmpdir.name,
+                "OVB_DISABLE_LIVE_INPUT": "1",
+            },
+        )
+        self._env_patch.start()
+        qt_settings_app._diagnostics_shutdown_event.clear()
+
+    def tearDown(self):
+        qt_settings_app._diagnostics_shutdown_event.clear()
+        logger = logging.getLogger(qt_settings_app.logging_setup.LOGGER_NAME)
+        for handler in list(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+        qt_settings_app.logging_setup._configured = False
+        self._env_patch.stop()
+        self._tmpdir.cleanup()
+
+    def _fake_classes(self, *, load_side_effect=None, root_objects=None, exec_return=0):
+        real_classes = qt_settings_app._load_qt_classes()
+        root_objects = [] if root_objects is None else root_objects
+
+        class _FakeEngine:
+            def addImportPath(self, path):
+                pass
+
+            def load(self, url):
+                if load_side_effect is not None:
+                    raise load_side_effect
+
+            def rootObjects(self):
+                return root_objects
+
+        class _FakeApp:
+            def __init__(self, argv=None):
+                pass
+
+            @staticmethod
+            def instance():
+                return None
+
+            def exec(self):
+                return exec_return
+
+            def quit(self):
+                pass
+
+        class _FakeQQuickStyle:
+            @staticmethod
+            def setStyle(name):
+                pass
+
+        class _FakeQUrl:
+            @staticmethod
+            def fromLocalFile(path):
+                return path
+
+        fake_classes = dict(real_classes)
+        fake_classes["QGuiApplication"] = _FakeApp
+        fake_classes["QQmlApplicationEngine"] = _FakeEngine
+        fake_classes["QQuickStyle"] = _FakeQQuickStyle
+        fake_classes["QUrl"] = _FakeQUrl
+        fake_classes["qmlRegisterSingletonInstance"] = lambda *args, **kwargs: None
+        return fake_classes
+
+    def test_engine_load_raising_still_runs_the_production_shutdown_helper(self):
+        fake_classes = self._fake_classes(load_side_effect=RuntimeError("simulated engine.load() failure"))
+        with mock.patch.object(qt_settings_app, "_load_qt_classes", return_value=fake_classes):
+            with mock.patch.object(
+                qt_settings_app,
+                "_shutdown_diagnostics_workers",
+                wraps=qt_settings_app._shutdown_diagnostics_workers,
+            ) as shutdown_spy:
+                with self.assertRaises(RuntimeError):
+                    qt_settings_app.run_settings_window()
+
+        shutdown_spy.assert_called()
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+
+    def test_empty_root_objects_still_runs_the_production_shutdown_helper(self):
+        fake_classes = self._fake_classes(root_objects=[])
+        with mock.patch.object(qt_settings_app, "_load_qt_classes", return_value=fake_classes):
+            with mock.patch.object(
+                qt_settings_app,
+                "_shutdown_diagnostics_workers",
+                wraps=qt_settings_app._shutdown_diagnostics_workers,
+            ) as shutdown_spy:
+                with self.assertRaises(qt_settings_app.QtUnavailableError):
+                    qt_settings_app.run_settings_window()
+
+        shutdown_spy.assert_called()
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+
+    def test_app_exec_returning_normally_still_runs_the_production_shutdown_helper(self):
+        fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
+        with mock.patch.object(qt_settings_app, "_load_qt_classes", return_value=fake_classes):
+            with mock.patch.object(
+                qt_settings_app,
+                "_shutdown_diagnostics_workers",
+                wraps=qt_settings_app._shutdown_diagnostics_workers,
+            ) as shutdown_spy:
+                exit_code = qt_settings_app.run_settings_window()
+
+        self.assertEqual(exit_code, 0)
+        shutdown_spy.assert_called()
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+
+    def test_loaded_native_window_is_marked_for_duplicate_activation(self):
+        class _FakeWindow:
+            def winId(self):
+                return 4321
+
+        fake_classes = self._fake_classes(root_objects=[_FakeWindow()], exec_return=0)
+        with mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            qt_settings_app.sys, "platform", "win32"
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "mark_settings_window",
+            return_value=True,
+        ) as marker:
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        marker.assert_called_once_with(4321)
+        self.restore_register.assert_called_once_with(4321)
+        self.restore_release.assert_called_once_with(4321)
+
+    def test_event_loop_failure_still_releases_restore_channel(self):
+        class _FakeWindow:
+            def winId(self):
+                return 4321
+
+        fake_classes = self._fake_classes(root_objects=[_FakeWindow()])
+        with mock.patch.object(qt_settings_app, "_load_qt_classes", return_value=fake_classes), \
+             mock.patch.object(qt_settings_app, "_settings_window_handle", return_value=4321), \
+             mock.patch.object(qt_settings_app, "_mark_settings_window_for_activation"), \
+             mock.patch.object(fake_classes["QGuiApplication"], "exec", side_effect=RuntimeError("event loop failed")):
+            with self.assertRaisesRegex(RuntimeError, "event loop failed"):
+                qt_settings_app.run_settings_window()
+        self.restore_release.assert_called_once_with(4321)
+
+    def test_restore_cleanup_failure_does_not_skip_worker_shutdown(self):
+        fake_classes = self._fake_classes(root_objects=[object()])
+        self.restore_release.side_effect = OSError("cleanup failed")
+        with mock.patch.object(qt_settings_app, "_load_qt_classes", return_value=fake_classes), \
+             mock.patch.object(qt_settings_app, "_shutdown_diagnostics_workers") as shutdown:
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+        shutdown.assert_called_once()
+
+    def test_exit_capability_is_marked_before_embedded_runtime_startup(self):
+        class _FakeWindow:
+            def winId(self):
+                return 4321
+
+        events = mock.Mock()
+        runtime = object()
+        fake_classes = self._fake_classes(root_objects=[_FakeWindow()], exec_return=0)
+        with mock.patch.dict(
+            os.environ,
+            {"OVB_DISABLE_LIVE_INPUT": "0"},
+        ), mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            qt_settings_app.sys, "platform", "win32"
+        ), mock.patch.object(
+            qt_settings_app.element_navigation_runtime,
+            "start_embedded_element_navigation",
+            side_effect=lambda _app: events.runtime_started() or runtime,
+        ), mock.patch.object(
+            qt_settings_app.element_navigation_control_windows,
+            "bind_embedded_element_navigation",
+            side_effect=lambda _runtime: events.runtime_bound(),
+        ), mock.patch.object(
+            qt_settings_app.single_instance,
+            "mark_settings_window",
+            side_effect=lambda _hwnd: events.window_marked() or True,
+        ):
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        self.assertEqual(
+            events.mock_calls[:3],
+            [
+                mock.call.window_marked(),
+                mock.call.runtime_started(),
+                mock.call.runtime_bound(),
+            ],
+        )
+
+    def test_hid_setup_is_not_started_before_the_qt_event_loop(self):
+        fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
+        controller_class = fake_classes["SettingsController"]
+        with mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            controller_class,
+            "claimPortableHidSetupPrompt",
+            autospec=True,
+        ) as prompt:
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        prompt.assert_not_called()
+
+    def test_live_navigation_is_bound_and_shutdown_with_the_desktop_app(self):
+        runtime = object()
+        fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
+        with mock.patch.dict(
+            os.environ,
+            {"OVB_DISABLE_LIVE_INPUT": "0"},
+        ), mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            qt_settings_app.sys, "platform", "win32"
+        ), mock.patch.object(
+            qt_settings_app.element_navigation_runtime,
+            "start_embedded_element_navigation",
+            return_value=runtime,
+        ) as start_navigation, mock.patch.object(
+            qt_settings_app.element_navigation_control_windows,
+            "bind_embedded_element_navigation",
+        ) as bind_navigation, mock.patch.object(
+            qt_settings_app.element_navigation_control_windows,
+            "shutdown_element_navigation",
+            return_value=qt_settings_app.element_navigation_control_windows.CommandSendResult.DELIVERED,
+        ) as shutdown_navigation:
+            self.assertEqual(qt_settings_app.run_settings_window(), 0)
+
+        start_navigation.assert_called_once()
+        self.assertIs(start_navigation.call_args.args[0].__class__, fake_classes["QGuiApplication"])
+        bind_navigation.assert_called_once_with(runtime)
+        shutdown_navigation.assert_called_once_with()
+
+    def test_settings_cleanup_failure_cannot_skip_diagnostics_shutdown(self):
+        fake_classes = self._fake_classes(root_objects=[object()], exec_return=0)
+        controller_class = fake_classes["SettingsController"]
+        cleanup_calls = []
+
+        def fail_cleanup(instance):
+            cleanup_calls.append(instance)
+            raise RuntimeError("simulated settings cleanup failure")
+
+        with mock.patch.object(
+            qt_settings_app, "_load_qt_classes", return_value=fake_classes
+        ), mock.patch.object(
+            controller_class,
+            "shutdownForProcessExit",
+            new=fail_cleanup,
+        ), mock.patch.object(
+            qt_settings_app,
+            "_shutdown_diagnostics_workers",
+            wraps=qt_settings_app._shutdown_diagnostics_workers,
+        ) as shutdown_spy:
+            with self.assertRaises(RuntimeError):
+                qt_settings_app.run_settings_window()
+
+        self.assertEqual(len(cleanup_calls), 1)
+        shutdown_spy.assert_called()
+        self.assertEqual(len(qt_settings_app._diagnostics_threads), 0)
+
+
+# Loads the REAL qml/main.qml (not a stand-in snippet) with QT_QPA_
+# PLATFORM=offscreen and reports rootObjects()/warnings/window size as
+# JSON - run in an isolated subprocess (see OffscreenQmlLoadTests below for
+# why: a second QQmlApplicationEngine loading ComboBox-containing QML
+# within the SAME process as another engine that already loaded one -
+# regardless of matching style - empirically broke with "Type ComboBox
+# unavailable" / "TextEditingContextMenu unavailable", a separate QQC2
+# per-process-singleton limitation from the FluentWinUI3 Config one
+# documented on RenderedContrastTests above).
+_APPLICATION_EXIT_PROBE_SCRIPT = r"""
+import json
+import os
+import time
+from types import SimpleNamespace
+
+from PySide6.QtCore import QObject, QTimer
+from ovb import qt_settings_app as m
+
+original_connect_application_exit = m._connect_application_exit
+action = os.environ.get("OVB_EXIT_PROBE_ACTION", "controller")
+window_close_actions = {
+    "window_close_hide",
+    "window_close_quit",
+    "window_close_quit_mixed_dirty",
+    "window_close_quit_running_bridge",
+}
+slow_bridge_exit = action == "window_close_quit_running_bridge"
+m.single_instance.bridge_instance_running = lambda: slow_bridge_exit
+visibility = {
+    "after_close": None,
+    "during_cleanup": None,
+    "unsaved_dialog": None,
+    "saved_endpoint_name": None,
+}
+
+if slow_bridge_exit:
+    def delayed_bridge_exit(**_kwargs):
+        time.sleep(0.6)
+        return SimpleNamespace(stopped=True, error="")
+
+    m.bridge_control_windows.request_bridge_exit = delayed_bridge_exit
+
+
+def connect_application_exit_and_schedule(app, controller):
+    original_connect_application_exit(app, controller)
+
+    def trigger_exit():
+        if action in window_close_actions:
+            windows = app.topLevelWindows()
+            if not windows:
+                app.exit(23)
+                return
+            if action == "window_close_quit_mixed_dirty":
+                endpoint = m.audio_output.AudioEndpoint(
+                    name="Migrated Output",
+                    host_api="Windows WASAPI",
+                )
+                controller._endpoint_options = [
+                    m.settings_ui._endpoint_display(endpoint)
+                ]
+                controller._endpoint_values = [endpoint]
+                controller._selected_endpoint_index = 0
+                controller._mark_settings_dirty()
+                controller._model.setActionTextAt(
+                    controller._model.index_of("power"),
+                    "ctrl+l",
+                )
+            windows[0].close()
+            return
+        controller.requestApplicationExit()
+
+    QTimer.singleShot(50, trigger_exit)
+    if action == "window_close_hide":
+        def finish_hide_probe():
+            windows = app.topLevelWindows()
+            visibility["after_close"] = (
+                windows[0].isVisible() if windows else None
+            )
+            controller.requestApplicationExit()
+
+        QTimer.singleShot(300, finish_hide_probe)
+    if action == "window_close_quit_mixed_dirty":
+        def finish_mixed_dirty_probe():
+            windows = app.topLevelWindows()
+            window = windows[0] if windows else None
+            dialog = (
+                window.findChild(QObject, "unsavedExitDialog")
+                if window is not None
+                else None
+            )
+            visibility["after_close"] = (
+                window.isVisible() if window is not None else None
+            )
+            visibility["unsaved_dialog"] = (
+                bool(dialog.property("visible")) if dialog is not None else False
+            )
+            saved = m.config.load_config(m.config.config_path())
+            visibility["saved_endpoint_name"] = saved.get(
+                "output_endpoint_name", ""
+            )
+            controller.requestApplicationExit()
+
+        QTimer.singleShot(300, finish_mixed_dirty_probe)
+    if slow_bridge_exit:
+        def record_visibility():
+            windows = app.topLevelWindows()
+            visibility["during_cleanup"] = (
+                windows[0].isVisible() if windows else None
+            )
+
+        QTimer.singleShot(150, record_visibility)
+
+
+m._connect_application_exit = connect_application_exit_and_schedule
+if action in {
+    "window_close_quit",
+    "window_close_quit_mixed_dirty",
+    "window_close_quit_running_bridge",
+}:
+    settings = m.config.default_config()
+    settings["close_behavior"] = m.config.CLOSE_BEHAVIOR_QUIT
+    m.config.save_config(m.config.config_path(), settings)
+started = time.monotonic()
+result = m.run_settings_window(
+    start_hidden=action not in window_close_actions
+)
+print(json.dumps({
+    "action": action,
+    "result": result,
+    "elapsed": time.monotonic() - started,
+    "visible_after_close": visibility["after_close"],
+    "visible_during_cleanup": visibility["during_cleanup"],
+    "unsaved_dialog": visibility["unsaved_dialog"],
+    "saved_endpoint_name": visibility["saved_endpoint_name"],
+}))
+"""
+
+
+_QML_LOAD_PROBE_SCRIPT = r"""
+import faulthandler
+import json
+import sys
+import threading
+import time
+
+# The "engine.warnings connected to a Python callback" theory for
+# this probe's 0xC0000005 was disproven by real Windows CI evidence
+# (run 29681031609): a named-callback connect()/
+# disconnect() pair still crashed AFTER printing STAGE:connected/loaded/
+# disconnected, and faulthandler's own thread dump showed the actual crash
+# thread deep inside a WinRT device-enumeration await - a background
+# DiagnosticsController worker this script starts below, not anything QML-warnings-related. faulthandler.enable() is kept
+# purely as cheap forensic insurance if this
+# script ever fails again - it costs nothing on the passing path.
+faulthandler.enable()
+
+from ovb import qt_settings_app as m
+from PySide6.QtCore import QObject
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+
+warnings = []
+engine.warnings.connect(lambda ws: warnings.extend(ws))
+print("STAGE:connected", file=sys.stderr, flush=True)
+
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+print("STAGE:loaded", file=sys.stderr, flush=True)
+
+root_objects = engine.rootObjects()
+app.processEvents()
+initial_settings_dirty = bool(controller.settingsDirty)
+tab_bar = root_objects[0].findChild(QObject, "tabBar") if root_objects else None
+if tab_bar is not None:
+    tab_bar.setProperty("currentIndex", 2)
+    app.processEvents()
+voice_scroll = (
+    root_objects[0].findChild(QObject, "voiceScroll") if root_objects else None
+)
+voice_page = voice_scroll.parent() if voice_scroll is not None else None
+hotkey_before_capture = controller.holdVoiceHotkeyText
+hotkey_before_stop_completed = hotkey_before_capture
+recording_before_stop_completed = False
+pending_before_stop_completed = ""
+if voice_page is not None:
+    class BlockingHotkeyCapture:
+        def __init__(self):
+            self.stop_started = threading.Event()
+            self.allow_stop = threading.Event()
+
+        def stop(self):
+            self.stop_started.set()
+            if not self.allow_stop.wait(5.0):
+                raise RuntimeError("test capture stop timed out")
+
+    blocking_capture = BlockingHotkeyCapture()
+    controller._hotkey_capture = blocking_capture
+    controller._set_input_operation_state("hotkey", "active")
+    voice_page.setProperty("voiceHotkeyRecording", True)
+    controller.hotkeyCaptured.emit("ctrl+shift+f8")
+    stop_deadline = time.monotonic() + 5.0
+    while not blocking_capture.stop_started.is_set() and time.monotonic() < stop_deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+    hotkey_before_stop_completed = controller.holdVoiceHotkeyText
+    recording_before_stop_completed = bool(
+        voice_page.property("voiceHotkeyRecording")
+    )
+    pending_before_stop_completed = str(
+        voice_page.property("pendingVoiceHotkey")
+    )
+    blocking_capture.allow_stop.set()
+    deadline = time.monotonic() + 5.0
+    while (controller.hotkeyCaptureActive or controller.voiceHotkeyBusy) \
+            and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    app.processEvents()
+saved_config = m.config.load_config(m.config.config_path(m.config.config_root()))
+voice_save_status = controller.statusMessage
+status_bar = (
+    root_objects[0].findChild(QObject, "globalStatusBar") if root_objects else None
+)
+tab_bar.setProperty("currentIndex", 0)
+app.processEvents()
+voice_feedback_on_device = bool(status_bar.property("hasStatus"))
+tab_bar.setProperty("currentIndex", 2)
+app.processEvents()
+voice_feedback_on_voice = bool(status_bar.property("hasStatus"))
+tab_bar.setProperty("currentIndex", 1)
+model.setActionTextAt(model.index_of("power"), "escape")
+app.processEvents()
+mapping_dirty_on_buttons = bool(status_bar.property("hasStatus"))
+tab_bar.setProperty("currentIndex", 2)
+app.processEvents()
+mapping_dirty_on_voice = bool(status_bar.property("hasStatus"))
+root_window = root_objects[0]
+root_window.hide()
+app.processEvents()
+hidden_before_restore = not bool(root_window.property("visible"))
+controller.windowRestoreRequested.emit()
+app.processEvents()
+restored_by_request = bool(root_window.property("visible"))
+root_window.close()
+app.processEvents()
+hidden_after_second_close = not bool(root_window.property("visible"))
+result = {
+    "root_count": len(root_objects),
+    "warnings": [w.toString() for w in warnings],
+    "title": root_objects[0].property("title") if root_objects else None,
+    "width": root_objects[0].property("width") if root_objects else None,
+    "height": root_objects[0].property("height") if root_objects else None,
+    "initial_settings_dirty": initial_settings_dirty,
+    "retired_finish_tap_control_exists": bool(
+        root_objects
+        and root_objects[0].findChild(QObject, "voiceReleaseFinishTapSwitch")
+    ),
+    "voice_hotkey_recording": (
+        voice_page.property("voiceHotkeyRecording")
+        if voice_page is not None else None
+    ),
+    "hotkey_before_capture": hotkey_before_capture,
+    "hotkey_before_stop_completed": hotkey_before_stop_completed,
+    "recording_before_stop_completed": recording_before_stop_completed,
+    "pending_before_stop_completed": pending_before_stop_completed,
+    "saved_voice_hotkey": saved_config.get("voice_hotkeys", {}).get("hold"),
+    "voice_save_status": voice_save_status,
+    "voice_feedback_on_device": voice_feedback_on_device,
+    "voice_feedback_on_voice": voice_feedback_on_voice,
+    "mapping_dirty_on_buttons": mapping_dirty_on_buttons,
+    "mapping_dirty_on_voice": mapping_dirty_on_voice,
+    "hidden_before_restore": hidden_before_restore,
+    "restored_by_request": restored_by_request,
+    "hidden_after_second_close": hidden_after_second_close,
+}
+
+# The real fast-close gate this probe exists to be - calls the
+# EXACT SAME production shutdown helper run_settings_window() calls right
+# after app.exec() returns (see qt_settings_app.py's module docstring and
+# _shutdown_diagnostics_workers()'s own docstring), while every Qt/Python
+# object built above (including the DiagnosticsController constructed by
+# _load_qt_classes()/DiagnosticsController(...) above, which already
+# started a REAL background BLE-discovery worker thread in its own
+# __init__ - never faked/skipped here) is still fully alive. This is what
+# actually reproduces the real settings-window-closes-quickly race, and
+# actually exercises the fix for it.
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print("STAGE:shutdown", file=sys.stderr, flush=True)
+
+print(json.dumps(result))
+"""
+
+
+_HID_HELPER_DIALOG_PROBE_SCRIPT = r"""
+import json
+import sys
+import time
+
+from PySide6.QtCore import QObject, QPointF, Qt
+from PySide6.QtTest import QTest
+from ovb import qt_settings_app as m
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def find_child(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render_until(window, app, predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        window.grabWindow()
+        app.processEvents()
+        if predicate():
+            return True
+        QTest.qWait(20)
+    return False
+
+
+def item_geometry(item):
+    assert item is not None
+    position = item.mapToScene(QPointF(0.0, 0.0))
+    width = float(item.property("width"))
+    height = float(item.property("height"))
+    return {
+        "x": position.x(),
+        "y": position.y(),
+        "width": width,
+        "height": height,
+        "right": position.x() + width,
+        "bottom": position.y() + height,
+    }
+
+
+def popup_geometry(popup):
+    x = float(popup.property("x"))
+    y = float(popup.property("y"))
+    width = float(popup.property("width"))
+    height = float(popup.property("height"))
+    return {
+        "x": x,
+        "y": y,
+        "width": width,
+        "height": height,
+        "right": x + width,
+        "bottom": y + height,
+    }
+
+
+setattr(sys, "frozen", True)
+m.single_instance.bridge_instance_running = lambda: False
+m.startup_windows.rebind_owned_frozen_startup = (
+    lambda: m.startup_windows.StartupState(False)
+)
+m.startup_windows.read_startup_state = lambda: m.startup_windows.StartupState(False)
+m.hid_elevation_windows.bundled_helper_offer_id = lambda: "4:" + ("a" * 64)
+m.hid_elevation_windows.inspect_installed_helper = lambda: (
+    m.hid_elevation_windows.HidHelperState(False, "protected_helper_missing")
+)
+m.hid_elevation_windows.is_process_elevated = lambda: "--elevated" in sys.argv
+m.hid_elevation_windows.can_current_user_self_elevate = lambda: True
+m.hid_elevation_windows.is_installed_distribution = lambda: False
+m.hid_helper_consumers.current_consumer_is_registered = lambda _root: True
+install_calls = []
+
+
+def unexpected_install(*args, **kwargs):
+    install_calls.append((args, kwargs))
+    raise AssertionError("opening or declining the prompt must not request UAC")
+
+
+m.hid_helper_consumers.install_for_current_consumer = unexpected_install
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("FluentWinUI3")
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setProperty("width", 640)
+window.setProperty("height", 480)
+window.show()
+
+dialog = find_child(window, "hidHelperSetupDialog")
+body = find_child(window, "hidHelperSetupBody")
+decline = find_child(window, "cancelHidHelperSetupButton")
+confirm = find_child(window, "confirmHidHelperSetupButton")
+repair = find_child(window, "repairHidHelperButton")
+assert all(item is not None for item in (dialog, body, decline, confirm, repair))
+if "--elevated" in sys.argv:
+    assert render_until(window, app, lambda: bool(window.property("portableHidSetupPromptAttempted")))
+    saved = m.config.load_config(m.config.config_path(m.config.config_root()))
+    result = {
+        "warnings": [warning.toString() for warning in warnings],
+        "window_visible": bool(window.property("visible")),
+        "dialog_visible": bool(dialog.property("visible")),
+        "repair_visible": bool(repair.property("visible")),
+        "install_call_count": len(install_calls),
+        "saved_offer_id": saved.get("hid_helper_setup_prompted_offer_id", ""),
+    }
+    controller.shutdownBackgroundTasks()
+    m._shutdown_diagnostics_workers()
+    print(json.dumps(result))
+    sys.exit(0)
+assert render_until(window, app, lambda: bool(dialog.property("visible")))
+
+dialog_geometry = popup_geometry(dialog)
+body_geometry = item_geometry(body)
+decline_geometry = item_geometry(decline)
+confirm_geometry = item_geometry(confirm)
+initial = {
+    "dialog_visible": bool(dialog.property("visible")),
+    "dialog_title": str(dialog.property("title")),
+    "body_text": str(body.property("text")),
+    "body_height": float(body.property("height")),
+    "body_implicit_height": float(body.property("implicitHeight")),
+    "dialog": dialog_geometry,
+    "body": body_geometry,
+    "decline": decline_geometry,
+    "confirm": confirm_geometry,
+    "decline_text": str(decline.property("text")),
+    "decline_flat": bool(decline.property("flat")),
+    "decline_highlighted": bool(decline.property("highlighted")),
+    "confirm_text": str(confirm.property("text")),
+    "confirm_flat": bool(confirm.property("flat")),
+    "confirm_highlighted": bool(confirm.property("highlighted")),
+}
+
+decline_point = decline.mapToScene(
+    QPointF(float(decline.property("width")) / 2.0, float(decline.property("height")) / 2.0)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, decline_point)
+assert render_until(window, app, lambda: not bool(dialog.property("visible")))
+
+repair_point = repair.mapToScene(
+    QPointF(float(repair.property("width")) / 2.0, float(repair.property("height")) / 2.0)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, repair_point)
+assert render_until(window, app, lambda: bool(dialog.property("visible")))
+
+saved = m.config.load_config(m.config.config_path(m.config.config_root()))
+result = {
+    "warnings": [warning.toString() for warning in warnings],
+    "window_width": float(window.property("width")),
+    "window_height": float(window.property("height")),
+    "initial": initial,
+    "dialog_reopened": bool(dialog.property("visible")),
+    "repair_visible": bool(repair.property("visible")),
+    "install_call_count": len(install_calls),
+    "saved_offer_id": saved.get("hid_helper_setup_prompted_offer_id"),
+}
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
+
+_OVB_ONLY_DEVICE_PAGE_PROBE_SCRIPT = r"""
+import json
+import os
+from types import SimpleNamespace
+
+from PySide6.QtCore import QPointF
+from ovb import qt_settings_app as m
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def find_child(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle(os.environ.get("PROBE_STYLE", "Basic"))
+app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
+m.hid_elevation_windows.inspect_installed_helper = lambda: (
+    m.hid_elevation_windows.HidHelperState(True, "ready")
+)
+model = ButtonMappingModel()
+controller = SettingsController(model)
+controller._config = dict(controller._config, remote_selection={
+    "schema": 1,
+    "devices": [{"key": "a" * 64, "profile": "chromecast-remote"}],
+    "active": "a" * 64,
+})
+diagnostics_controller = DiagnosticsController(
+    controller,
+    m.config.config_root(),
+    auto_refresh=False,
+)
+# Runtime status cases provide their own deterministic diagnostic rows.
+# Prevent the real post-connect refresh from racing and replacing those rows.
+diagnostics_controller.refreshDiagnostics = lambda: None
+diagnostics_controller._check_rows = [
+    {
+        "checkId": "probe_seed",
+        "status": "pass",
+        "detail": "",
+        "resultCode": "ready",
+    }
+]
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setProperty("initialDiagnosticsStarted", True)
+window.setWidth(640)
+window.setHeight(480)
+window.show()
+tab_bar = find_child(window, "tabBar")
+assert tab_bar is not None
+tab_bar.setProperty("currentIndex", 1)
+for _ in range(10):
+    window.grabWindow()
+    app.processEvents()
+
+mapping_layout = find_child(window, "mappingLayout")
+assert mapping_layout is not None
+result = {
+    "google_visible": bool(mapping_layout.property("visible")),
+    "mapping_page_title": controller.mappingPageTitle,
+    "device_options": list(controller.deviceOptions),
+}
+tab_bar.setProperty("currentIndex", 0)
+for _ in range(10):
+    window.grabWindow()
+    app.processEvents()
+result["device_rows"] = all(
+    find_child(window, name) is not None
+    for name in (
+        "currentDeviceRow",
+        "buttonReceiverRow",
+        "remoteServiceRow",
+        "runtimeLogRow",
+    )
+)
+
+for timer_name in ("bridgeStatusRefreshTimer", "bridgeLaunchPollTimer"):
+    timer = find_child(window, timer_name)
+    if timer is not None:
+        timer.setProperty("running", False)
+
+current_device_row = find_child(window, "currentDeviceRow")
+button_receiver_row = find_child(window, "buttonReceiverRow")
+remote_service_row = find_child(window, "remoteServiceRow")
+assert current_device_row is not None
+assert button_receiver_row is not None
+assert remote_service_row is not None
+
+
+def settle():
+    for _ in range(4):
+        window.grabWindow()
+        app.processEvents()
+
+
+def column_snapshot(name):
+    item = find_child(window, name)
+    assert item is not None, name
+    origin = item.mapToScene(QPointF(0, 0))
+    return {
+        "x": float(origin.x()),
+        "width": float(item.property("width")),
+    }
+
+
+def row_snapshot(row, description_name=""):
+    color = row.property("stateColor")
+    row_name = str(row.property("objectName"))
+    title_label = find_child(window, row_name + "_titleLabel")
+    state_label = find_child(window, row_name + "_stateLabel")
+    state_column = find_child(window, row_name + "_stateColumn")
+    description_label = find_child(
+        window,
+        description_name or row_name + "_descriptionLabel",
+    )
+    assert title_label is not None
+    assert state_label is not None
+    assert state_column is not None
+    assert description_label is not None
+    center_delta = None
+    title_center_delta = None
+    if bool(description_label.property("visible")):
+        title_origin = title_label.mapToScene(QPointF(0, 0))
+        description_origin = description_label.mapToScene(QPointF(0, 0))
+        state_origin = state_label.mapToScene(QPointF(0, 0))
+        description_center = (
+            float(description_origin.y())
+            + float(description_label.property("height")) / 2
+        )
+        state_center = (
+            float(state_origin.y())
+            + float(state_label.property("height")) / 2
+        )
+        title_center = (
+            float(title_origin.y())
+            + float(title_label.property("height")) / 2
+        )
+        center_delta = abs(description_center - state_center)
+        title_center_delta = abs(title_center - description_center)
+    return {
+        "state": str(row.property("stateText")),
+        "detail": str(row.property("descriptionText")),
+        "color": color.name() if hasattr(color, "name") else str(color),
+        "state_truncated": bool(state_label.property("truncated")),
+        "state_width": float(state_column.property("width")),
+        "state_implicit_width": float(state_label.property("implicitWidth")),
+        "detail_truncated": bool(description_label.property("truncated")),
+        "detail_width": float(description_label.property("width")),
+        "detail_implicit_width": float(description_label.property("implicitWidth")),
+        "center_delta": center_delta,
+        "title_center_delta": title_center_delta,
+    }
+
+
+result["device_columns"] = {
+    "states": [
+        column_snapshot(name + "_stateColumn")
+        for name in (
+            "currentDeviceRow",
+            "buttonReceiverRow",
+            "remoteServiceRow",
+        )
+    ],
+    "actions": [
+        column_snapshot(name + "_actionColumn")
+        for name in (
+            "currentDeviceRow",
+            "buttonReceiverRow",
+            "remoteServiceRow",
+            "runtimeLogRow",
+        )
+    ],
+}
+
+
+def runtime_case(
+    raw_state,
+    tap_state,
+    *,
+    voice_state="ready",
+    connected=False,
+    restart=False,
+    reconnect=False,
+    ble_code="ready",
+    connection_state=None,
+    running=True,
+):
+    diagnostics_controller._is_refreshing = False
+    diagnostics_controller._check_rows = [
+        {
+            "checkId": "ble_candidate",
+            "status": "pass" if ble_code == "ready" else "fail",
+            "detail": "文案变化也不能改变状态",
+            "resultCode": ble_code,
+        }
+    ]
+    diagnostics_controller.isRefreshingChanged.emit()
+    diagnostics_controller.checkResultsChanged.emit()
+    controller._set_bridge_running(running)
+    controller._set_bridge_launch_phase("waiting")
+    controller._set_bridge_reconnect_busy(False)
+    controller._set_bridge_reconnect_available(reconnect)
+    controller._set_bridge_restart_recommended(restart)
+    controller._set_bridge_connected(connected)
+    controller._set_bridge_connection_state(
+        connection_state
+        if connection_state is not None
+        else "connected"
+        if connected
+        else "waiting_for_device"
+    )
+    controller._set_bridge_input_states(
+        SimpleNamespace(
+            raw_input_state=raw_state,
+            hid_tap_state=tap_state,
+            voice_key_physicalizer_state=voice_state,
+        )
+    )
+    settle()
+    action = find_child(window, "bridgeActionButton")
+    return {
+        "device": row_snapshot(current_device_row),
+        "buttons": row_snapshot(button_receiver_row),
+        "service": row_snapshot(remote_service_row),
+        "action": {
+            "visible": bool(action.property("visible")),
+            "text": str(action.property("text")),
+        },
+    }
+
+
+def diagnostics_case(*, ble_status, ble_code, raw_code):
+    controller._set_bridge_running(False)
+    controller._set_bridge_connected(False)
+    controller._set_bridge_connection_state("stopped")
+    controller._set_bridge_restart_recommended(False)
+    controller._set_bridge_input_states(None)
+    controller._set_bridge_launch_phase("idle")
+    diagnostics_controller._is_refreshing = False
+    diagnostics_controller._check_rows = [
+        {
+            "checkId": "os_version",
+            "status": "pass",
+            "detail": "irrelevant",
+            "resultCode": "ready",
+        },
+        {
+            "checkId": "ble_candidate",
+            "status": ble_status,
+            "detail": "文案变化也不能改变状态",
+            "resultCode": ble_code,
+        },
+        {
+            "checkId": "raw_input",
+            "status": "fail",
+            "detail": "文案变化也不能改变状态",
+            "resultCode": raw_code,
+        },
+    ]
+    diagnostics_controller.isRefreshingChanged.emit()
+    diagnostics_controller.checkResultsChanged.emit()
+    settle()
+    action = find_child(window, "bridgeActionButton")
+    return {
+        "device": row_snapshot(current_device_row),
+        "buttons": row_snapshot(button_receiver_row),
+        "service": row_snapshot(remote_service_row),
+        "action": {
+            "visible": bool(action.property("visible")),
+            "text": str(action.property("text")),
+        },
+    }
+
+
+def helper_case(*, available, detail, portable, can_elevate=True):
+    controller._set_bridge_running(False)
+    controller._set_bridge_connected(False)
+    controller._set_bridge_connection_state("stopped")
+    controller._set_bridge_restart_recommended(False)
+    controller._set_bridge_input_states(None)
+    controller._set_bridge_launch_phase("idle")
+    controller._hid_helper_frozen_distribution = True
+    controller._hid_helper_portable_distribution = portable
+    controller._hid_helper_can_self_elevate = can_elevate
+    controller._hid_helper_process_elevated = False
+    controller._set_hid_helper_repair_busy(False)
+    controller._set_hid_helper_state(
+        m.hid_elevation_windows.HidHelperState(available, detail)
+    )
+    controller.hidHelperStateChanged.emit()
+    settle()
+    action = find_child(window, "bridgeActionButton")
+    return {
+        "device": row_snapshot(current_device_row),
+        "buttons": row_snapshot(button_receiver_row),
+        "service": row_snapshot(remote_service_row),
+        "action": {
+            "visible": bool(action.property("visible")),
+            "text": str(action.property("text")),
+        },
+    }
+
+
+# Only one profile ships, so the receiver can only ever publish the
+# bootstrap value, the ready value, or "chromecast_" + a client reason.
+# The retired profile's raw-input and HID-tap states are unreachable, so the
+# rows below use real Chromecast states; the service-stopped helper and
+# diagnostic rows stay because they still exercise the page's layout.
+result["status_cases"] = {
+    "starting": runtime_case("starting", "starting"),
+    "ready": runtime_case("chromecast_ready", "ready", connected=True),
+    "source_unconfirmed": runtime_case(
+        "chromecast_source_unconfirmed", "failed", reconnect=True
+    ),
+    "unpaired_running": runtime_case(
+        "chromecast_source_unconfirmed",
+        "failed",
+        reconnect=True,
+        ble_code="no_candidate",
+    ),
+    "connected_input_wait": runtime_case(
+        "starting", "starting", connected=True
+    ),
+    "restart": runtime_case(
+        "chromecast_ready", "ready", connected=True, restart=True
+    ),
+    "reconnect": runtime_case(
+        "chromecast_ready", "ready", connected=False, reconnect=True
+    ),
+    "retry_wait": runtime_case(
+        "chromecast_ready",
+        "ready",
+        connected=False,
+        reconnect=True,
+        connection_state="retry_wait",
+    ),
+    "connecting": runtime_case(
+        "chromecast_ready",
+        "ready",
+        connected=False,
+        reconnect=True,
+        connection_state="connecting",
+    ),
+    "voice_recovering": runtime_case(
+        "chromecast_ready", "ready", voice_state="recovering", connected=True
+    ),
+    "voice_failed": runtime_case(
+        "chromecast_ready",
+        "ready",
+        voice_state="failed",
+        connected=True,
+        restart=True,
+    ),
+    "stopped_ready": runtime_case("chromecast_ready", "ready", running=False),
+    "stopped_waiting": runtime_case("starting", "starting", running=False),
+    "stopped_error": runtime_case("chromecast_source_unconfirmed", "ready",
+                                  running=False),
+    # Service stopped wins over every Chromecast detail, so the detail
+    # verdicts need the service up.
+    "payload_unavailable": runtime_case(
+        "chromecast_input_payload_unavailable", "ready", connected=True
+    ),
+    "permission_cancelled": runtime_case(
+        "chromecast_permission_cancelled", "ready", connected=True
+    ),
+    "sensitive_logging": runtime_case(
+        "chromecast_sensitive_logging_disabled", "ready", connected=True
+    ),
+    "hid_tap_restart_required": runtime_case(
+        "chromecast_ready", "restart_required", connected=True
+    ),
+    "diag_probe_failed": diagnostics_case(
+        ble_status="pass",
+        ble_code="ready",
+        raw_code="probe_failed",
+    ),
+    "diag_no_device": diagnostics_case(
+        ble_status="pass",
+        ble_code="ready",
+        raw_code="no_device",
+    ),
+    "diag_unpaired": diagnostics_case(
+        ble_status="fail",
+        ble_code="no_candidate",
+        raw_code="no_device",
+    ),
+    "helper_disabled": helper_case(
+        available=False,
+        detail="helper_missing",
+        portable=True,
+    ),
+    "helper_permission": helper_case(
+        available=False,
+        detail="helper_task_acl_invalid",
+        portable=False,
+    ),
+    "helper_version": helper_case(
+        available=False,
+        detail="helper_task_contract_newer",
+        portable=False,
+    ),
+    "helper_cleanup": helper_case(
+        available=True,
+        detail="helper_cleanup_pending",
+        portable=True,
+    ),
+    "helper_account": helper_case(
+        available=False,
+        detail="current_account_cannot_self_elevate",
+        portable=True,
+        can_elevate=False,
+    ),
+}
+tab_bar.setProperty("currentIndex", 2)
+for _ in range(10):
+    window.grabWindow()
+    app.processEvents()
+result["voice_sections"] = all(
+    find_child(window, name) is not None
+    for name in (
+        "audioPrerequisiteSection",
+        "voiceProgramSection",
+        "voiceTestSection",
+    )
+)
+
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
+_SETTINGS_SHELL_LAYOUT_PROBE_SCRIPT = r"""
+import json
+import os
+
+from PySide6.QtCore import QPointF
+from PySide6.QtTest import QTest
+from ovb import qt_settings_app as m
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def find_child(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app):
+    for _ in range(12):
+        window.grabWindow()
+        app.processEvents()
+
+
+def bounds(window, name):
+    item = find_child(window, name)
+    assert item is not None, name + " missing"
+    origin = item.mapToScene(QPointF(0, 0))
+    width = float(item.property("width"))
+    height = float(item.property("height"))
+    return {
+        "visible": bool(item.property("visible")),
+        "x": float(origin.x()),
+        "y": float(origin.y()),
+        "width": width,
+        "height": height,
+        "right": float(origin.x()) + width,
+        "bottom": float(origin.y()) + height,
+    }
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle(os.environ.get("PROBE_STYLE", "Basic"))
+app = QGuiApplication.instance() or QGuiApplication([])
+bridge_state = {"running": False}
+m.single_instance.bridge_instance_running = lambda: bridge_state["running"]
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setWidth(int(os.environ["PROBE_WIDTH"]))
+window.setHeight(int(os.environ["PROBE_HEIGHT"]))
+window.show()
+render(window, app)
+
+tab_bar = find_child(window, "tabBar")
+assert tab_bar is not None
+status_bar = find_child(window, "globalStatusBar")
+status_text = find_child(window, "globalStatusText")
+assert status_bar is not None and status_text is not None
+
+result = {
+    "warnings": [],
+    "width": int(window.property("width")),
+    "height": int(window.property("height")),
+    "initial_status_visible": bool(status_bar.property("visible")),
+    "initial_status_has_status": bool(status_bar.property("hasStatus")),
+    "initial_status_text_visible": bool(status_text.property("visible")),
+    "initial_status_text": str(status_text.property("text")),
+    "navigation": {
+        name: bounds(window, name)
+        for name in (
+            "navigationBar",
+            "connectionTabButton",
+            "mappingTabButton",
+            "permissionsTabButton",
+            "diagnosticsTabButton",
+        )
+    },
+}
+
+tab_bar.setProperty("currentIndex", 0)
+render(window, app)
+connection_names = (
+    "connectionPageContent",
+    "deviceSection",
+    "deviceCombo",
+    "googleOutputSection",
+    "endpointCombo",
+    "bridgeSection",
+    "bridgeNotRunningWarning",
+    "connectionActionRow",
+    "restoreDefaultsButton",
+    "deviceSaveButton",
+    "saveAndLaunchButton",
+)
+connection_scroll = find_child(window, "connectionScroll")
+result["connection"] = {
+    "items": {name: bounds(window, name) for name in connection_names},
+    "content_width": float(connection_scroll.property("contentWidth")),
+    "available_width": float(connection_scroll.property("availableWidth")),
+    "launch_status": str(find_child(window, "launchStatusText").property("text")),
+    "bridge_warning": str(find_child(window, "bridgeNotRunningWarning").property("text")),
+    "save_highlighted": bool(find_child(window, "deviceSaveButton").property("highlighted")),
+    "launch_highlighted": bool(find_child(window, "saveAndLaunchButton").property("highlighted")),
+}
+
+controller._bridge_launch_elapsed_seconds = 12
+controller.bridgeLaunchElapsedSecondsChanged.emit()
+controller._set_bridge_launch_phase("waiting")
+render(window, app)
+result["connection"]["waiting_progress"] = {
+    "visible": bool(find_child(window, "bridgeLaunchProgress").property("visible")),
+    "indicator_running": bool(
+        find_child(window, "bridgeLaunchBusyIndicator").property("running")
+    ),
+    "stage_text": str(find_child(window, "bridgeLaunchStageText").property("text")),
+    "elapsed_visible": bool(
+        find_child(window, "bridgeLaunchElapsedText").property("visible")
+    ),
+    "elapsed_text": str(find_child(window, "bridgeLaunchElapsedText").property("text")),
+}
+
+controller._set_bridge_launch_phase("connected")
+render(window, app)
+result["connection"]["connected_progress"] = {
+    "visible": bool(find_child(window, "bridgeLaunchProgress").property("visible")),
+    "indicator_running": bool(
+        find_child(window, "bridgeLaunchBusyIndicator").property("running")
+    ),
+    "stage_text": str(find_child(window, "bridgeLaunchStageText").property("text")),
+}
+
+controller._set_launch_status("AUDIT_LAUNCH_RESULT_MUST_BE_VISIBLE")
+render(window, app)
+result["connection"]["explicit_launch_status"] = str(
+    find_child(window, "launchStatusText").property("text")
+)
+
+bridge_timer = find_child(window, "bridgeStatusRefreshTimer")
+assert bridge_timer is not None
+bridge_state["running"] = True
+controller.refreshBridgeState()
+render(window, app)
+result["connection"]["warning_after_external_start"] = str(
+    find_child(window, "bridgeNotRunningWarning").property("text")
+)
+bridge_state["running"] = False
+controller.refreshBridgeState()
+render(window, app)
+result["connection"]["warning_after_external_exit"] = str(
+    find_child(window, "bridgeNotRunningWarning").property("text")
+)
+
+tab_bar.setProperty("currentIndex", 1)
+render(window, app)
+mapping_names = (
+    "mappingLayout",
+    "mappingActionsPanel",
+    "mappingList",
+    "mappingLines",
+    "activeMappingLine",
+    "leftMappingCards",
+    "photoSidebar",
+    "rightMappingCards",
+        "mappingListFrame",
+        "detectRealKeyButton",
+        "restoreMappingDefaultsButton",
+        "editMapping_power",
+        "editMapping_tv",
+)
+result["mapping"] = {
+    "items": {name: bounds(window, name) for name in mapping_names},
+}
+
+tab_bar.setProperty("currentIndex", 2)
+render(window, app)
+permissions_names = (
+    "permissionsPageContent",
+    "requiredPermissionsSection",
+    "openBluetoothSettingsButton",
+    "openMicrophonePrivacyButton",
+    "openSoundInputSettingsButton",
+)
+permissions_scroll = find_child(window, "permissionsScroll")
+result["permissions"] = {
+    "items": {name: bounds(window, name) for name in permissions_names},
+    "content_width": float(permissions_scroll.property("contentWidth")),
+    "available_width": float(permissions_scroll.property("availableWidth")),
+}
+
+tab_bar.setProperty("currentIndex", 3)
+render(window, app)
+diagnostics_names = (
+    "diagnosticsPageContent",
+    "refreshButton",
+    "optionalDriverSection",
+    "optionalDriverDescription",
+    "selectCableInputButton",
+    "launchDriverSetupButton",
+    "vbCableChannelTestSection",
+    "vbCableChannelDescription",
+    "testVbCableChannelButton",
+    "diagnosticsFooterSection",
+    "diagnosticsFooterDescription",
+    "openSpeechSettingsButton",
+    "diagnosticsOpenLogButton",
+)
+diagnostics_scroll = find_child(window, "diagnosticsScroll")
+result["diagnostics"] = {
+    "items": {name: bounds(window, name) for name in diagnostics_names},
+    "content_width": float(diagnostics_scroll.property("contentWidth")),
+    "available_width": float(diagnostics_scroll.property("availableWidth")),
+    "content_height": float(diagnostics_scroll.property("contentHeight")),
+    "available_height": float(diagnostics_scroll.property("availableHeight")),
+}
+
+diagnostics_controller._check_rows = [
+    {
+        "checkId": "audit_refresh",
+        "title": "刷新测试",
+        "group": "ordinary_buttons",
+        "status": "pass",
+        "detail": "AUDIT_DETAIL_FIRST",
+    }
+]
+diagnostics_controller.checkResultsChanged.emit()
+render(window, app)
+diagnostic_result = find_child(window, "diagnosticResult_audit_refresh")
+assert diagnostic_result is not None
+result["diagnostics"]["detail_before_refresh"] = str(
+    diagnostic_result.property("detailText")
+)
+
+diagnostics_controller._check_rows = [
+    {
+        "checkId": "audit_refresh",
+        "title": "刷新测试",
+        "group": "ordinary_buttons",
+        "status": "fail",
+        "detail": "AUDIT_DETAIL_AFTER_REFRESH",
+    }
+]
+diagnostics_controller.checkResultsChanged.emit()
+render(window, app)
+diagnostic_result = find_child(window, "diagnosticResult_audit_refresh")
+assert diagnostic_result is not None
+result["diagnostics"]["detail_after_refresh"] = str(
+    diagnostic_result.property("detailText")
+)
+
+controller._set_status_message("neutral status")
+render(window, app)
+result["neutral_status"] = {
+    "visible": bool(status_bar.property("visible")),
+    "text": str(status_text.property("text")),
+}
+controller._set_error_message("priority error")
+render(window, app)
+result["error_status"] = {
+    "visible": bool(status_bar.property("visible")),
+    "text": str(status_text.property("text")),
+}
+result["warnings"] = [warning.toString() for warning in warnings]
+
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
+_TAB_FOCUS_SCROLL_PROBE_SCRIPT = r"""
+import json
+
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtTest import QTest
+from ovb import qt_settings_app as m
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def find_child(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app):
+    for _ in range(10):
+        window.grabWindow()
+        app.processEvents()
+
+
+def tab_to(window, app, target, limit=20):
+    for _ in range(limit):
+        if bool(target.property("activeFocus")):
+            return True
+        QTest.keyClick(window, Qt.Key_Tab)
+        render(window, app)
+    return bool(target.property("activeFocus"))
+
+
+def navigation_has_focus(window):
+    return any(
+        bool(find_child(window, name).property("activeFocus"))
+        for name in (
+            "connectionTabButton",
+            "mappingTabButton",
+            "permissionsTabButton",
+            "diagnosticsTabButton",
+        )
+    )
+
+
+def visible_in_window(item, window):
+    origin = item.mapToScene(QPointF(0, 0))
+    return (
+        origin.y() >= 0
+        and origin.y() + float(item.property("height")) <= float(window.property("height"))
+    )
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setWidth(640)
+window.setHeight(480)
+window.show()
+render(window, app)
+
+tab_bar = find_child(window, "tabBar")
+tab_bar.setProperty("currentIndex", 0)
+render(window, app)
+connection_scroll = find_child(window, "connectionScroll")
+connection_flickable = connection_scroll.property("contentItem")
+connection_flickable.setProperty("contentY", 0)
+endpoint = find_child(window, "endpointCombo")
+launch = find_child(window, "saveAndLaunchButton")
+endpoint.forceActiveFocus(Qt.TabFocusReason)
+render(window, app)
+connection_reached = tab_to(window, app, launch)
+QTest.keyClick(window, Qt.Key_Tab)
+render(window, app)
+connection_escaped = not bool(launch.property("activeFocus")) and navigation_has_focus(window)
+
+tab_bar.setProperty("currentIndex", 2)
+render(window, app)
+permissions_scroll = find_child(window, "permissionsScroll")
+permissions_flickable = permissions_scroll.property("contentItem")
+permissions_flickable.setProperty("contentY", 0)
+microphone = find_child(window, "openMicrophonePrivacyButton")
+sound_button = find_child(window, "openSoundInputSettingsButton")
+microphone.forceActiveFocus(Qt.TabFocusReason)
+render(window, app)
+permissions_reached = tab_to(window, app, sound_button)
+QTest.keyClick(window, Qt.Key_Tab)
+render(window, app)
+permissions_escaped = not bool(sound_button.property("activeFocus")) and navigation_has_focus(window)
+
+result = {
+    "warnings": [warning.toString() for warning in warnings],
+    "connection": {
+        "reached": connection_reached,
+        "escaped": connection_escaped,
+        "content_y": float(connection_flickable.property("contentY")),
+        "target_visible": visible_in_window(launch, window),
+    },
+    "permissions": {
+        "reached": permissions_reached,
+        "escaped": permissions_escaped,
+        "content_y": float(permissions_flickable.property("contentY")),
+        "target_visible": visible_in_window(sound_button, window),
+    },
+}
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
+_SELECTION_COMBO_STATE_PROBE_SCRIPT = r"""
+import json
+
+from ovb import qt_settings_app as m
+from PySide6.QtCore import QObject, QMetaObject, Qt, QUrl
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtQml import QQmlComponent, QQmlEngine
+from PySide6.QtQuickControls2 import QQuickStyle
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+engine = QQmlEngine()
+qml_dir = m._qml_directory()
+component = QQmlComponent(engine)
+component.setData(
+    b'''import QtQuick
+import QtQuick.Controls
+ApplicationWindow {
+    visible: true
+    width: 480
+    height: 280
+    SelectionComboBox {
+        objectName: "emptyCombo"
+        model: []
+        currentIndex: -1
+        recommendedIndex: -1
+    }
+    SelectionComboBox {
+        objectName: "ordinaryCombo"
+        model: ["Speakers"]
+        currentIndex: 0
+        recommendedIndex: -1
+    }
+    SelectionComboBox {
+        objectName: "recommendedCombo"
+        model: ["CABLE Input"]
+        currentIndex: 0
+        recommendedIndex: 0
+    }
+    SelectionComboBox {
+        id: movingCombo
+        objectName: "movingCombo"
+        y: 120
+        width: 320
+        model: ["First", "Second"]
+        currentIndex: 0
+        recommendedIndex: -1
+        property bool firstBoldForProbe: false
+        property bool secondBoldForProbe: false
+        function openPopupForProbe() {
+            popup.open()
+        }
+        function selectSecondForProbe() {
+            currentIndex = 1
+        }
+        function captureBoldForProbe() {
+            const first = popup.contentItem.itemAtIndex(0)
+            const second = popup.contentItem.itemAtIndex(1)
+            firstBoldForProbe = first ? first.contentItem.font.weight >= Font.DemiBold : false
+            secondBoldForProbe = second ? second.contentItem.font.weight >= Font.DemiBold : false
+        }
+    }
+}''',
+    QUrl.fromLocalFile(str(qml_dir / "SelectionComboBoxProbe.qml")),
+)
+assert component.isReady(), [error.toString() for error in component.errors()]
+window = component.create()
+assert window is not None, [error.toString() for error in component.errors()]
+app.processEvents()
+
+result = {}
+for key, object_name in (
+    ("empty", "emptyCombo"),
+    ("ordinary", "ordinaryCombo"),
+    ("recommended", "recommendedCombo"),
+):
+    combo = window.findChild(QObject, object_name)
+    assert combo is not None, object_name
+    result[key] = combo.property("displayText")
+
+moving = window.findChild(QObject, "movingCombo")
+assert moving is not None
+assert QMetaObject.invokeMethod(
+    moving,
+    "openPopupForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+for _ in range(12):
+    app.processEvents()
+    window.grabWindow()
+assert QMetaObject.invokeMethod(
+    moving,
+    "captureBoldForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+result["bold_initial"] = [
+    moving.property("firstBoldForProbe"),
+    moving.property("secondBoldForProbe"),
+]
+assert QMetaObject.invokeMethod(
+    moving,
+    "selectSecondForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+for _ in range(4):
+    app.processEvents()
+    window.grabWindow()
+assert QMetaObject.invokeMethod(
+    moving,
+    "captureBoldForProbe",
+    Qt.ConnectionType.DirectConnection,
+)
+result["bold_after_move"] = [
+    moving.property("firstBoldForProbe"),
+    moving.property("secondBoldForProbe"),
+]
+
+print(json.dumps(result, ensure_ascii=False))
+"""
+
+
+_THREE_PAGE_LAYOUT_PROBE_SCRIPT = r"""
+import json
+import os
+import time
+
+from PySide6.QtCore import QMetaObject, QPointF, Qt
+from ovb import qt_settings_app as m
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def find_child(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = find_child(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def render(window, app, count=10):
+    image = None
+    for _ in range(count):
+        image = window.grabWindow()
+        app.processEvents()
+    return image
+
+
+def wait_for_voice_hotkey_idle(controller, app, timeout=3.0):
+    deadline = time.monotonic() + timeout
+    while controller.voiceHotkeyBusy and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert not controller.voiceHotkeyBusy
+
+
+def bounds(window, name):
+    item = find_child(window, name)
+    assert item is not None, name + " missing"
+    map_to_scene = getattr(item, "mapToScene", None)
+    if callable(map_to_scene):
+        origin = map_to_scene(QPointF(0, 0))
+        origin_x = float(origin.x())
+        origin_y = float(origin.y())
+    else:
+        origin_x = float(item.property("x"))
+        origin_y = float(item.property("y"))
+    width = float(item.property("width"))
+    height = float(item.property("height"))
+    return {
+        "visible": bool(item.property("visible")),
+        "x": origin_x,
+        "y": origin_y,
+        "width": width,
+        "height": height,
+        "right": origin_x + width,
+        "bottom": origin_y + height,
+    }
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle(os.environ.get("PROBE_STYLE", "Basic"))
+app = QGuiApplication.instance() or QGuiApplication([])
+m.single_instance.bridge_instance_running = lambda: False
+m.windows_diagnostics.run_diagnostics = lambda **_kwargs: (
+    m.windows_diagnostics.DiagnosticsReport(checks=())
+)
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(
+    SettingsController, "OvbSettings", 1, 0, "SettingsController", controller
+)
+qmlRegisterSingletonInstance(
+    ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model
+)
+qmlRegisterSingletonInstance(
+    DiagnosticsController,
+    "OvbSettings",
+    1,
+    0,
+    "DiagnosticsController",
+    diagnostics_controller,
+)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+warnings = []
+engine.warnings.connect(lambda values: warnings.extend(values))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setWidth(int(os.environ["PROBE_WIDTH"]))
+window.setHeight(int(os.environ["PROBE_HEIGHT"]))
+window.show()
+render(window, app)
+
+tab_bar = find_child(window, "tabBar")
+assert tab_bar is not None
+result = {
+    "width": float(window.property("width")),
+    "height": float(window.property("height")),
+    "warnings": [],
+    "client_shell": bounds(window, "clientShell"),
+    "client_shell_outline": bounds(window, "clientShellOutline"),
+    "global_status_bar": bounds(window, "globalStatusBar"),
+    "pages": {},
+}
+
+
+def capture_page(index, name, content_name, item_names):
+    tab_bar.setProperty("currentIndex", index)
+    render(window, app)
+    screenshot_dir = os.environ.get("PROBE_SCREENSHOT_DIR")
+    if screenshot_dir:
+        os.makedirs(screenshot_dir, exist_ok=True)
+        render(window, app, 2).save(
+            os.path.join(
+                screenshot_dir,
+                f"{os.environ.get('PROBE_STYLE', 'Basic')}-"
+                f"{int(result['width'])}x{int(result['height'])}-{name}.png",
+            )
+        )
+    result["pages"][name] = {
+        "content": bounds(window, content_name),
+        "items": {item_name: bounds(window, item_name) for item_name in item_names},
+    }
+    if name == "voice":
+        scroll = find_child(window, "voiceScroll")
+        flick = scroll.property("contentItem")
+        original_y = flick.property("contentY")
+        result["voice_scroll"] = dict(bounds(window, "voiceScroll"), clip=scroll.property("clip"))
+        flick.setProperty("contentY", max(0, flick.property("contentHeight") - flick.property("height")))
+        render(window, app)
+        result["voice_scrolled_end"] = bounds(window, "voiceTestSection")
+        flick.setProperty("contentY", original_y)
+        render(window, app)
+
+
+capture_page(
+    0,
+    "device",
+    "devicePageContent",
+    (
+        "devicePrerequisiteSection",
+        "devicePrerequisiteSectionTitle",
+        "currentDeviceRow",
+        "buttonReceiverRow",
+        "remoteServiceRow",
+        "runtimeLogRow",
+        "deviceUsageLink",
+        "deviceOpenLogButton",
+        "deviceLogLocationLink",
+        "desktopBehaviorSection",
+        "desktopBehaviorSectionTitle",
+        "launchAtLoginRow",
+        "launchBridgeOnAppStartRow",
+        "diagnosticTraceRow",
+        "appLogRow",
+        "closeBehaviorRow",
+    ),
+)
+capture_page(
+    1,
+    "buttons",
+    "mappingLayout",
+    (
+        "mappingActionsPanel",
+        "mappingList",
+        "photoSidebar",
+    ),
+)
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
+wait_for_voice_hotkey_idle(controller, app)
+capture_page(
+    2,
+    "voice",
+    "voicePageContent",
+    (
+        "audioPrerequisiteSection",
+        "audioPrerequisiteSectionTitle",
+        "voiceProgramSection",
+        "voiceProgramSectionTitle",
+        "voiceProgramCustomPathRow",
+        "voiceTestSection",
+        "voiceTestSectionTitle",
+    ),
+)
+
+voice_row_names = (
+    "virtualAudioRow",
+    "outputEndpointRow",
+    "microphonePrivacyRow",
+    "voiceProgramSelectionRow",
+    "voiceProgramCustomPathRow",
+    "voiceHotkeyRow",
+    "voicePhysicalKeyRow",
+    "soundChannelTestRow",
+)
+result["voice_columns"] = {
+    "states": {
+        name: bounds(window, name + "_stateColumn") for name in voice_row_names
+    },
+    "actions": {
+        name: bounds(window, name + "_actionColumn") for name in voice_row_names
+    },
+    "editors": {
+        name: bounds(window, name)
+        for name in (
+            "endpointCombo",
+            "voiceProgramCombo",
+            "voiceProgramCustomPathField",
+            "holdVoiceHotkeyField",
+            "voicePhysicalKeyField",
+        )
+    },
+    "right_controls": {
+        name: bounds(window, name)
+        for name in (
+            "applyVirtualAudioButton",
+            "openMicrophonePrivacyButton",
+            "browseVoiceProgramButton",
+            "recordVoiceHotkeyButton",
+            "recordVoicePhysicalKeyButton",
+            "testVbCableChannelButton",
+        )
+    },
+    "left_controls": {
+        "installVirtualAudioButton": bounds(window, "installVirtualAudioButton"),
+        "voiceProgramElevatedCheckBox": bounds(window, "voiceProgramElevatedCheckBox"),
+    },
+    "descriptions": {
+        name: bounds(window, name)
+        for name in (
+            "voiceHotkeyRow_descriptionLabel",
+            "voicePhysicalKeyRow_descriptionLabel",
+            "soundChannelTestDescription",
+        )
+    },
+    "editor_columns": {
+        name: bounds(window, name + "_editorColumn")
+        for name in (
+            "soundChannelTestRow",
+        )
+    },
+}
+
+diagnostics_controller._set_vb_cable_bridge_recovery_needed(True)
+render(window, app)
+result["voice_recovery_editor"] = {
+    "column": bounds(window, "soundChannelTestRow_editorColumn"),
+    "button": bounds(window, "recoverBridgeButton"),
+}
+diagnostics_controller._set_vb_cable_bridge_recovery_needed(False)
+render(window, app)
+
+controller.selectedVoiceProgramIndex = 2
+wait_for_voice_hotkey_idle(controller, app)
+render(window, app)
+result["voice_provider_actions"] = {
+    name: bounds(window, name)
+    for name in (
+        "openVoiceProgramSettingsButton",
+    )
+}
+
+mapping_button = find_child(window, "mappingTabButton")
+tab_bar.setProperty("currentIndex", 2)
+render(window, app, 2)
+assert QMetaObject.invokeMethod(
+    mapping_button,
+    "pressed",
+    Qt.ConnectionType.DirectConnection,
+)
+result["mapping_index_on_press"] = int(tab_bar.property("currentIndex"))
+result["navigation_backgrounds"] = {
+    name: bounds(window, name)
+    for name in (
+        "deviceTabButton",
+        "deviceTabButton_background",
+        "mappingTabButton",
+        "mappingTabButton_background",
+        "voiceTabButton",
+        "voiceTabButton_background",
+    )
+}
+
+result["warnings"] = [warning.toString() for warning in warnings]
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(result))
+"""
+
+
+class SettingsShellSourceContractTests(unittest.TestCase):
+    def setUp(self):
+        qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
+        self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
+        self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
+        self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
+        self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(
+            encoding="utf-8"
+        )
+        self.section_frame_qml = (qml_dir / "SectionFrame.qml").read_text(
+            encoding="utf-8"
+        )
+        self.ui_label_qml = (qml_dir / "UiLabel.qml").read_text(
+            encoding="utf-8"
+        )
+        self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
+            encoding="utf-8"
+        )
+        self.nav_button_qml = (qml_dir / "NavButton.qml").read_text(
+            encoding="utf-8"
+        )
+        self.dialog_close_button_qml = (qml_dir / "DialogCloseButton.qml").read_text(
+            encoding="utf-8"
+        )
+        self.icon_glyph_qml = (qml_dir / "IconGlyph.qml").read_text(
+            encoding="utf-8"
+        )
+        self.inline_settings_row_qml = (qml_dir / "InlineSettingsRow.qml").read_text(
+            encoding="utf-8"
+        )
+        self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
+            encoding="utf-8"
+        )
+        self.mapping_key_label_qml = (qml_dir / "MappingKeyLabel.qml").read_text(
+            encoding="utf-8"
+        )
+        self.tokens_qml = (qml_dir / "Tokens.qml").read_text(encoding="utf-8")
+        self.compact_button_qml = (qml_dir / "CompactButton.qml").read_text(
+            encoding="utf-8"
+        )
+        self.compact_tooltip_qml = (qml_dir / "CompactToolTip.qml").read_text(
+            encoding="utf-8"
+        )
+        self.settings_list_row_qml = (qml_dir / "SettingsListRow.qml").read_text(
+            encoding="utf-8"
+        )
+        self.settings_section_title_qml = (
+            qml_dir / "SettingsSectionTitle.qml"
+        ).read_text(encoding="utf-8")
+
+    def test_settings_feedback_has_one_global_owner(self):
+        self.assertIn('objectName: "globalStatusBar"', self.main_qml)
+        self.assertIn(
+            "SettingsController.activePageIndex = currentIndex",
+            self.main_qml,
+        )
+
+    def test_hid_helper_repair_is_scoped_to_the_button_receiver_row(self):
+        self.assertIn('objectName: "buttonReceiverRow"', self.device_qml)
+        self.assertIn('objectName: "repairHidHelperButton"', self.device_qml)
+        self.assertIn("root.enableHidHelperRequested()", self.device_qml)
+        self.assertIn("SettingsController.repairHidHelper()", self.main_qml)
+        self.assertIn("SettingsController.hidHelperRepairVisible", self.device_qml)
+        self.assertIn("SettingsController.hidHelperSetupRequired", self.device_qml)
+        self.assertIn("SettingsController.hidHelperCleanupPending", self.device_qml)
+        # The HID-helper repair UI is still owned by the button-receiver row,
+        # but the per-issue state codes it used to surface were the retired
+        # profile's; only the Chromecast setup states remain.
+        self.assertNotIn("SettingsController.hidHelperAccountUnsupported", self.device_qml)
+        self.assertIn("启用改键", self.device_qml)
+        self.assertIn("完成清理", self.device_qml)
+        self.assertNotIn(
+            'case "disabled": return qsTr("点击“启用改键”")',
+            self.device_qml,
+        )
+        self.assertNotIn('case "account": return qsTr("请更换账号")', self.device_qml)
+        self.assertNotIn(
+            'case "permission": return qsTr("点击“修复权限”")',
+            self.device_qml,
+        )
+        self.assertNotIn(
+            'case "version": return qsTr("请安装兼容版")',
+            self.device_qml,
+        )
+        self.assertIn('objectName: "hidHelperSetupDialog"', self.main_qml)
+        self.assertIn(
+            "建议打开管理员按键权限",
+            self.main_qml,
+        )
+        self.assertIn("用于自定义改键和遥控器语音键", self.main_qml)
+        self.assertIn("成功后普通启动和自启动不再询问", self.main_qml)
+        self.assertIn("现在不打开时，只保留 Windows 原始按键", self.main_qml)
+        self.assertIn("修复管理员按键权限？", self.main_qml)
+        self.assertIn("修复后恢复自定义改键和遥控器语音键", self.main_qml)
+        self.assertIn('? qsTr("不打开") : qsTr("取消")', self.main_qml)
+        self.assertIn("flat: SettingsController.hidHelperSetupRequired", self.main_qml)
+        self.assertIn('? qsTr("打开") : qsTr("修复")', self.main_qml)
+        self.assertIn("root.flat", self.compact_button_qml)
+        self.assertIn("root.flat && root.activeFocus", self.compact_button_qml)
+        self.assertIn("自定义按键映射已可用。确认管理员权限，清理旧组件。", self.main_qml)
+        self.assertIn('objectName: "removeHidHelperButton"', self.device_qml)
+        self.assertIn("本机所有无线麦Mod版本都不能使用自定义按键映射", self.main_qml)
+        self.assertIn(
+            "SettingsController.feedbackPageIndex === tabBar.currentIndex",
+            self.main_qml,
+        )
+        self.assertIn(
+            "tabBar.currentIndex === 1 && SettingsController.mappingDirty",
+            self.main_qml,
+        )
+        for page_text in (
+            self.device_qml,
+            self.voice_qml,
+            self.buttons_qml,
+        ):
+            self.assertNotIn("SettingsController.errorMessage", page_text)
+            self.assertNotIn("SettingsController.statusMessage", page_text)
+
+        self.assertIn("保留右下角图标；关闭此项则完全退出", self.device_qml)
+
+    def test_touched_pages_reuse_shared_compact_sources(self):
+        self.assertIn("default property alias contentData", self.section_frame_qml)
+        for kind in ("bodyKind", "noteKind", "sectionTitleKind", "pageTitleKind"):
+            self.assertIn(kind, self.ui_label_qml)
+
+        for page_text in (
+            self.device_qml,
+            self.voice_qml,
+        ):
+            self.assertIn("SectionFrame {", page_text)
+            self.assertIn("InlineSettingsRow {", page_text)
+
+        self.assertIn("SelectionComboBox {", self.voice_qml)
+        self.assertIn("CompactTextField {", self.voice_qml)
+        self.assertIn(
+            "property string descriptionObjectName", self.inline_settings_row_qml
+        )
+        self.assertIn("property alias editorData", self.inline_settings_row_qml)
+        self.assertIn("property bool editorColumnVisible", self.inline_settings_row_qml)
+        self.assertIn("property int stateColumnWidth", self.inline_settings_row_qml)
+        self.assertIn("property int actionColumnWidth", self.inline_settings_row_qml)
+        self.assertIn(
+            "property bool descriptionNeverElide", self.inline_settings_row_qml
+        )
+        self.assertIn("default property alias actionData", self.inline_settings_row_qml)
+        self.assertIn("AbstractButton {", self.mapping_card_qml)
+        self.assertIn("implicitHeight: 49", self.mapping_card_qml)
+        self.assertNotIn("mappingCardHeight", self.buttons_qml)
+
+    def test_settings_card_section_titles_share_one_compact_style(self):
+        self.assertIn("kind: bodyKind", self.settings_section_title_qml)
+        self.assertIn("font.weight: Font.Bold", self.settings_section_title_qml)
+        self.assertIn(
+            "Layout.leftMargin: tokens.spacingLarge",
+            self.settings_section_title_qml,
+        )
+        self.assertIn(
+            "Layout.topMargin: tokens.spacingSmall",
+            self.settings_section_title_qml,
+        )
+        self.assertIn(
+            "Layout.bottomMargin: tokens.spacingSmall",
+            self.settings_section_title_qml,
+        )
+        self.assertEqual(self.device_qml.count("SettingsSectionTitle {"), 2)
+        self.assertEqual(self.voice_qml.count("SettingsSectionTitle {"), 3)
+        for object_name in (
+            "devicePrerequisiteSectionTitle",
+            "desktopBehaviorSectionTitle",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.device_qml)
+        for object_name in (
+            "audioPrerequisiteSectionTitle",
+            "voiceProgramSectionTitle",
+            "voiceTestSectionTitle",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+
+    def test_single_mapping_uses_the_shared_key_title(self):
+        self.assertIn(
+            "font.pixelSize: root.tokens.fontSizeMappingKey",
+            self.mapping_key_label_qml,
+        )
+        self.assertIn("font.weight: Font.Medium", self.mapping_key_label_qml)
+        self.assertEqual(self.mapping_card_qml.count("MappingKeyLabel {"), 1)
+        self.assertEqual(self.buttons_qml.count("MappingKeyLabel {"), 0)
+        self.assertNotIn("comboMapping", self.tokens_qml)
+
+    def test_all_selectors_reuse_one_selected_option_delegate(self):
+        self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 4)
+        self.assertIn(
+            "recommendedIndex: SettingsController.recommendedEndpointIndex",
+            self.voice_qml,
+        )
+        self.assertIn(
+            "font.weight: index === root.effectiveIndex ? Font.DemiBold : Font.Normal",
+            self.selection_combo_qml,
+        )
+        self.assertIn("property int effectiveIndex: currentIndex", self.selection_combo_qml)
+        self.assertIn("property bool showEffectiveMarker: false", self.selection_combo_qml)
+        self.assertIn("recommendedIndex >= 0 && index >= 0", self.selection_combo_qml)
+        self.assertIn('qsTr("（推荐）")', self.selection_combo_qml)
+        self.assertIn("displayText: decoratedText(currentIndex, currentText)", self.selection_combo_qml)
+        self.assertEqual(self.buttons_qml.count("SelectionComboBox {"), 0)
+        self.assertNotIn("SettingsController.comboModifierOptions", self.buttons_qml)
+        self.assertIn(
+            "model: SettingsController.voiceProgramOptions",
+            self.voice_qml,
+        )
+
+    def test_log_export_has_one_formal_entry_point(self):
+        self.assertNotIn("SettingsController.exportLogs(", self.voice_qml)
+        self.assertNotIn("SettingsController.exportLogs(", self.buttons_qml)
+        self.assertEqual(
+            self.device_qml.count("SettingsController.exportLogs(selectedFile)"),
+            1,
+        )
+        self.assertIn('fileMode: FileDialog.SaveFile', self.device_qml)
+        self.assertIn('qsTr("导出日志")', self.device_qml)
+        self.assertIn('titleText: qsTr("诊断日志")', self.device_qml)
+        self.assertEqual(self.device_qml.count('SettingsController.openLogLocation()'), 1)
+        self.assertIn('text: qsTr("打开日志位置")', self.device_qml)
+
+    def test_device_start_and_virtual_audio_apply_keep_distinct_commands(self):
+        self.assertIn("SettingsController.startBridge()", self.device_qml)
+        self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
+        self.assertIn(
+            "SettingsController.selectAndPersistOutputEndpointIndex(",
+            self.voice_qml,
+        )
+        self.assertNotIn("SettingsController.saveSettings()", self.voice_qml)
+        self.assertIn("连接遥控器，接收按键和语音", self.device_qml)
+        self.assertNotIn(
+            "descriptionText: SettingsController.launchStatusText", self.device_qml
+        )
+        self.assertNotIn("saveAndLaunch", self.device_qml)
+        self.assertNotIn("stopBridge", self.device_qml)
+
+    def test_diagnostics_keep_details_in_the_rows_that_use_them(self):
+        self.assertIn("function currentDeviceDetailText()", self.device_qml)
+        self.assertIn("让遥控器按键在电脑上生效", self.device_qml)
+        self.assertIn("function checkDetail(checkId, fallback)", self.voice_qml)
+        for check_id in ("vb_cable_endpoints", "output_endpoint"):
+            self.assertIn(f'"{check_id}"', self.voice_qml)
+        # The shipped profile resolves its device state from the bridge, so the
+        # device page no longer looks diagnostics rows up by check id at all.
+        for check_id in ("ble_candidate", "os_version", "raw_input"):
+            self.assertNotIn(f'"{check_id}"', self.device_qml)
+        self.assertNotIn('checkState("dictation")', self.voice_qml)
+
+    def test_diagnostics_exposes_loopback_as_an_explicit_nonautomatic_action(self):
+        self.assertIn('objectName: "soundChannelTestRow"', self.voice_qml)
+        self.assertIn('objectName: "testVbCableChannelButton"', self.voice_qml)
+        self.assertIn(
+            "DiagnosticsController.testVbCableChannelWithBridgeRestart()",
+            self.voice_qml,
+        )
+        self.assertIn("DiagnosticsController.vbCableTestRunning", self.voice_qml)
+        self.assertIn('objectName: "bridgeTestConfirmDialog"', self.voice_qml)
+        self.assertGreaterEqual(
+            self.voice_qml.count("!root.configurationWriteBusy"),
+            2,
+        )
+
+    def test_service_state_has_one_formal_device_page_location(self):
+        self.assertIn('objectName: "remoteServiceRow"', self.device_qml)
+        self.assertEqual(self.device_qml.count('objectName: "bridgeActionButton"'), 1)
+        self.assertNotIn('objectName: "restartBridgeButton"', self.device_qml)
+        self.assertNotIn('objectName: "startBridgeButton"', self.device_qml)
+        self.assertIn(
+            "SettingsController.bridgeRestartRecommended",
+            self.device_qml,
+        )
+        self.assertIn("SettingsController.restartBridge()", self.device_qml)
+        self.assertIn("SettingsController.reconnectBridgeNow()", self.device_qml)
+        self.assertIn("SettingsController.bridgeReconnectAvailable", self.device_qml)
+        self.assertIn('return qsTr("重新连接")', self.device_qml)
+        self.assertIn('return qsTr("重启服务")', self.device_qml)
+        self.assertIn('return qsTr("点击“重启服务”")', self.device_qml)
+        self.assertIn('return qsTr("已连接")', self.device_qml)
+        self.assertIn('case "pending": return qsTr("接收尚未接入")', self.device_qml)
+        self.assertNotIn("请按遥控器方向键", self.device_qml)
+        self.assertIn('return qsTr("点击“重新连接”")', self.device_qml)
+        self.assertNotIn('qsTr("确认中")', self.device_qml)
+        self.assertNotIn('return qsTr("等待连接")', self.device_qml)
+        self.assertIn("function bridgeNeedsRestartAction()", self.device_qml)
+        self.assertIn("SettingsController.buttonReceiverUsable", self.device_qml)
+        # buttonReceiverWaitsForRemote() only fed the retired profile's
+        # HID-tap waiting branch, which is gone with that profile.
+        self.assertNotIn("buttonReceiverWaitsForRemote", self.device_qml)
+        self.assertNotIn("hidTapWaitsForFirstInput", self.device_qml)
+        self.assertNotIn('objectName: "mappingBridgeWarning"', self.buttons_qml)
+        self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
+        self.assertIn("SettingsController.bridgeRunning", self.device_qml)
+        self.assertIn('return qsTr("点击“启动服务”")', self.device_qml)
+        self.assertNotIn("语音和真实按键检测不可用", self.buttons_qml)
+
+    def test_device_status_columns_are_fixed_and_never_elided(self):
+        self.assertIn("readonly property int deviceStateColumnWidth: 96", self.device_qml)
+        self.assertIn("readonly property int deviceActionColumnWidth: tokens.buttonWidth4Chars", self.device_qml)
+        self.assertEqual(
+            self.device_qml.count(
+                "stateColumnWidth: root.deviceStateColumnWidth"
+            ),
+            3,
+        )
+        self.assertEqual(
+            self.device_qml.count(
+                "actionColumnWidth: root.deviceActionColumnWidth"
+            ),
+            4,
+        )
+        self.assertIn("wrapMode: Text.NoWrap", self.inline_settings_row_qml)
+        self.assertIn("elide: Text.ElideNone", self.inline_settings_row_qml)
+        self.assertIn(
+            "elide: root.descriptionNeverElide ? Text.ElideNone : Text.ElideRight",
+            self.inline_settings_row_qml,
+        )
+        self.assertEqual(
+            self.device_qml.count("descriptionNeverElide: true"),
+            1,
+        )
+        self.assertIn(
+            "root.buttonReceiverStateCode() === \"input_incomplete\"",
+            self.device_qml,
+        )
+        self.assertIn(
+            "Math.max(\n                root.stateColumnWidth",
+            self.inline_settings_row_qml,
+        )
+        self.assertEqual(
+            self.inline_settings_row_qml.count(
+                "Layout.alignment: Qt.AlignVCenter"
+            ),
+            4,
+        )
+        for too_long in ("版本不兼容", "等待遥控器", "系统不支持"):
+            self.assertNotIn(too_long, self.device_qml)
+
+    def test_settings_rows_share_the_global_row_divider(self):
+        for row_qml in (
+            self.inline_settings_row_qml,
+            self.settings_list_row_qml,
+        ):
+            self.assertIn("SettingsRowDivider {", row_qml)
+            self.assertIn("visible: root.showDivider", row_qml)
+
+    def test_device_page_notes_are_short_and_remove_internal_diagnostics(self):
+        for expected in (
+            "登录后后台运行",
+            "自动连接遥控器",
+            "保留右下角图标；关闭此项则完全退出",
+            "未连接",
+            "让遥控器按键在电脑上生效",
+            "连接遥控器，接收按键和语音",
+            "点击“重新连接”",
+            "点击“重启服务”",
+            "点击“重新检查”",
+        ):
+            self.assertIn(expected, self.device_qml)
+
+        for removed in (
+            "需处理",
+            "待实测",
+            "部分可用",
+            "查看连接、按键、音频和程序日志",
+            "相当于自动点击一次",
+            "默认隐藏到通知区域；需要彻底结束时可改为完全退出",
+            "登录后自动在后台运行",
+            "打开无线麦Mod后自动连接遥控器",
+            "设置右上角关闭按钮的行为",
+            "正在检查蓝牙设备",
+            "正在检查按键",
+            "正在启动服务",
+            "启动后按键和语音才会生效",
+            "改键未生效",
+            "普通按键异常",
+            "语音连接中",
+            "正在确认状态",
+            "需重启",
+            "请重新启动",
+            "重新启动",
+            "服务异常",
+            "权限异常",
+            "语音异常",
+        ):
+            self.assertNotIn(removed, self.device_qml)
+
+        self.assertIn("SettingsController.rawInputState", self.device_qml)
+        self.assertIn("SettingsController.hidTapState", self.device_qml)
+        # The voice-key physicalizer and the check-result lookup only fed the
+        # retired profile's diagnostics-driven branches, both now gone.
+        self.assertNotIn("SettingsController.voiceKeyPhysicalizerState", self.device_qml)
+        self.assertNotIn("function checkResult(checkId)", self.device_qml)
+        self.assertNotIn("待唤醒", self.device_qml)
+        self.assertNotIn("function bridgeDetailText()", self.device_qml)
+        self.assertNotIn("function buttonReceiverDetailText()", self.device_qml)
+
+    def test_main_window_owns_the_single_live_bridge_refresh_timer(self):
+        self.assertIn('objectName: "bridgeStatusRefreshTimer"', self.main_qml)
+        self.assertIn("? 1000 : 2000", self.main_qml)
+        self.assertIn("running: true", self.main_qml)
+        self.assertIn(
+            "onTriggered: SettingsController.refreshBridgeState()",
+            self.main_qml,
+        )
+        self.assertIn("onActiveChanged", self.main_qml)
+        self.assertIn('objectName: "bridgeLaunchPollTimer"', self.main_qml)
+        self.assertIn("interval: 150", self.main_qml)
+        self.assertIn("SettingsController.pollBridgeLaunch()", self.main_qml)
+        for page_text in (self.device_qml, self.buttons_qml, self.voice_qml):
+            self.assertNotIn("refreshBridgeState()", page_text)
+
+    def test_duplicate_launch_restore_runs_through_the_qt_window(self):
+        self.assertIn(
+            "function onWindowRestoreRequested() { window.restoreWindow() }",
+            self.main_qml,
+        )
+        self.assertIn('objectName: "windowRestoreRequestTimer"', self.main_qml)
+        self.assertIn("interval: 150", self.main_qml)
+        self.assertIn(
+            "onTriggered: SettingsController.pollWindowRestoreRequest()",
+            self.main_qml,
+        )
+
+    def test_navigation_switches_on_press_without_internal_check_state(self):
+        self.assertIn("checkable: false", self.nav_button_qml)
+        for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
+            self.assertIn(f"{inset}: 0", self.nav_button_qml)
+        self.assertIn('objectName: root.objectName + "_background"', self.nav_button_qml)
+        self.assertEqual(self.main_qml.count("onPressed: window.requestPage("), 3)
+        self.assertNotIn("onPressed: tabBar.currentIndex =", self.main_qml)
+        self.assertNotIn("onClicked: tabBar.currentIndex =", self.main_qml)
+
+    def test_navigation_and_unsaved_exit_wait_for_cleanup_and_lock_during_save(self):
+        self.assertIn("function requestPage(index)", self.main_qml)
+        self.assertIn("SettingsController.stopInputCapture()", self.main_qml)
+        self.assertIn("function onInputCleanupReady()", self.main_qml)
+        self.assertIn("function onInputCleanupFailed(message)", self.main_qml)
+        self.assertIn("pendingExitPrompt", self.main_qml)
+        self.assertIn("pendingExitAutoSave", self.main_qml)
+        self.assertGreaterEqual(
+            self.main_qml.count("!SettingsController.settingsSaveBusy"),
+            4,
+        )
+        self.assertIn("Popup.NoAutoClose", self.main_qml)
+        save_function = self.main_qml[
+            self.main_qml.index("function saveAndExit()"):
+            self.main_qml.index("function discardAndExit()")
+        ]
+        self.assertNotIn("unsavedExitDialog.close()", save_function)
+        self.assertIn("onSaveSettingsAndExitFinished", self.main_qml)
+        exit_function = self.main_qml[
+            self.main_qml.index("function requestFullExit()"):
+            self.main_qml.index("function saveAndExit()")
+        ]
+        busy_index = exit_function.index("SettingsController.settingsSaveBusy")
+        dirty_index = exit_function.index("SettingsController.settingsDirty")
+        self.assertLess(busy_index, dirty_index)
+        self.assertIn(
+            "SettingsController.canAutoSaveMappingBeforeExit()",
+            exit_function,
+        )
+        self.assertIn("saveAndExit()", exit_function)
+        self.assertIn("window.beginApplicationExit()", exit_function)
+        begin_exit_function = self.main_qml[
+            self.main_qml.index("function beginApplicationExit()"):
+            self.main_qml.index("function requestFullExit()")
+        ]
+        self.assertIn("window.hide()", begin_exit_function)
+        self.assertIn(
+            "SettingsController.requestApplicationExit()", begin_exit_function
+        )
+        self.assertIn("property bool applicationExitInProgress: false", self.main_qml)
+        self.assertIn(
+            "window.applicationExitInProgress = true", begin_exit_function
+        )
+        self.assertGreaterEqual(
+            self.main_qml.count("&& !window.applicationExitInProgress"),
+            2,
+        )
+        self.assertGreaterEqual(
+            self.main_qml.count("window.applicationExitInProgress = false"),
+            2,
+        )
+        self.assertIn(
+            "function onMaintenanceExitRequested() { window.requestFullExit() }",
+            self.main_qml,
+        )
+        self.assertIn(
+            "SettingsController.cancelPendingMaintenanceExit()",
+            self.main_qml,
+        )
+        self.assertGreaterEqual(
+            self.main_qml.count("SettingsController.cancelPendingMaintenanceExit()"),
+            3,
+        )
+
+    def test_first_hid_setup_waits_for_a_visible_rendered_window(self):
+        frame_handler = self.main_qml[
+            self.main_qml.index("onFrameSwapped:"):
+            self.main_qml.index("color: tokens.windowFrame")
+        ]
+        self.assertIn(
+            "property bool portableHidSetupPromptAttempted: false",
+            self.main_qml,
+        )
+        self.assertIn("window.visible", frame_handler)
+        self.assertIn(
+            "SettingsController.claimPortableHidSetupPrompt()", frame_handler
+        )
+        self.assertIn("window.openHidHelperSetupPrompt()", frame_handler)
+
+    def test_device_page_owns_the_three_desktop_behavior_options(self):
+        self.assertIn('objectName: "desktopBehaviorSection"', self.device_qml)
+        self.assertIn(
+            'objectName: "desktopBehaviorSectionTitle"', self.device_qml
+        )
+        self.assertIn('text: qsTr("通用设置")', self.device_qml)
+        self.assertIn('objectName: "launchAtLoginSwitch"', self.device_qml)
+        self.assertIn('objectName: "launchBridgeOnAppStartSwitch"', self.device_qml)
+        # 关闭音频发送 moved to the voice page and shares one row there.
+        self.assertNotIn('objectName: "disableAudioSendingSwitch"', self.device_qml)
+        self.assertIn('objectName: "disableAudioSendingSwitch"', self.voice_qml)
+        self.assertIn('objectName: "diagnosticTraceSwitch"', self.device_qml)
+        self.assertIn('objectName: "closeBehaviorSwitch"', self.device_qml)
+        self.assertIn("SettingsController.setLaunchAtLogin", self.device_qml)
+        self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.device_qml)
+        self.assertIn("SettingsController.setDiagnosticTraceEnabled", self.device_qml)
+        self.assertIn("SettingsController.setCloseBehaviorIndex", self.device_qml)
+        self.assertIn('titleText: qsTr("启动程序时自动运行服务")', self.device_qml)
+        self.assertIn("自动连接遥控器", self.device_qml)
+        self.assertNotIn("与随 Windows 启动互不绑定", self.device_qml)
+        self.assertNotIn("GeneralPage", self.main_qml)
+        self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
+        self.assertIn('objectName: "systemTrayIcon"', self.main_qml)
+        self.assertIn("window.showNormal()", self.main_qml)
+        self.assertIn(
+            "reason !== Platform.SystemTrayIcon.Context",
+            self.main_qml,
+        )
+        self.assertIn("SettingsController.requestApplicationExit()", self.main_qml)
+        self.assertIn("SettingsController.applicationExitConfirmed", self.main_qml)
+
+        runtime_log_index = self.device_qml.index(
+            'objectName: "runtimeLogRow"'
+        )
+        general_title_index = self.device_qml.index(
+            'objectName: "desktopBehaviorSectionTitle"'
+        )
+        first_option_index = self.device_qml.index(
+            'objectName: "launchAtLoginRow"'
+        )
+        self.assertLess(runtime_log_index, general_title_index)
+        self.assertLess(general_title_index, first_option_index)
+        self.assertNotIn("iconGlyph:", self.device_qml)
+        self.assertNotIn("property string iconGlyph", self.settings_list_row_qml)
+        self.assertNotIn("IconGlyph {", self.settings_list_row_qml)
+
+
+    def test_windows_prefers_the_system_chinese_ui_font(self):
+        self.assertIn(
+            'preferredWindowsUiFont: "Microsoft YaHei UI"', self.main_qml
+        )
+        self.assertIn('Qt.platform.os === "windows"', self.main_qml)
+        self.assertIn("Qt.fontFamilies().indexOf(preferredWindowsUiFont)", self.main_qml)
+        self.assertIn("window.preferredWindowsUiFontAvailable", self.main_qml)
+
+    def test_dialogs_share_the_fluent_close_button(self):
+        self.assertIn('glyph: "\\uE711"', self.dialog_close_button_qml)
+        self.assertIn('Accessible.name: qsTr("关闭")', self.dialog_close_button_qml)
+        self.assertNotIn("ToolTip", self.dialog_close_button_qml)
+        self.assertIn("renderType: Text.QtRendering", self.icon_glyph_qml)
+        self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
+        self.assertEqual(self.voice_qml.count("SettingsDialog {"), 2)
+
+    def test_tooltips_are_compact_and_follow_each_truncated_text(self):
+        self.assertIn("ToolTip {", self.compact_tooltip_qml)
+        self.assertIn("delay: 450", self.compact_tooltip_qml)
+        self.assertIn("font.pixelSize: root.tokens.fontSizeSmall", self.compact_tooltip_qml)
+        self.assertIn(
+            "y: -implicitHeight - root.tokens.spacingSmall "
+            "- tooltipBackground.border.width",
+            self.compact_tooltip_qml,
+        )
+        for inset in ("leftInset", "rightInset", "topInset", "bottomInset"):
+            self.assertIn(f"{inset}: 0", self.compact_tooltip_qml)
+        self.assertIn("maximumTextWidth: 260", self.compact_tooltip_qml)
+        self.assertEqual(self.buttons_qml.count("CompactToolTip {"), 3)
+        for title_id in (
+            "primaryGestureTitle",
+            "doubleGestureTitle",
+            "longGestureTitle",
+        ):
+            self.assertIn(f"id: {title_id}", self.buttons_qml)
+        for title_id in (
+            "primaryGestureTitle",
+            "doubleGestureTitle",
+            "longGestureTitle",
+        ):
+            title_start = self.buttons_qml.index(f"id: {title_id}")
+            tooltip_start = self.buttons_qml.index("CompactToolTip {", title_start)
+            title_source = self.buttons_qml[title_start:tooltip_start]
+            self.assertIn("Layout.fillHeight: true", title_source)
+            self.assertIn("verticalAlignment: Text.AlignVCenter", title_source)
+        self.assertNotIn("ToolTip.visible", self.buttons_qml)
+        self.assertIn("gestureHover.hovered && !cell.empty", self.mapping_card_qml)
+        self.assertIn("cell.usingNote || valueLabel.truncated", self.mapping_card_qml)
+        self.assertNotIn("actionHover", self.mapping_card_qml)
+        for row_qml in (
+            self.inline_settings_row_qml,
+            self.settings_list_row_qml,
+        ):
+            self.assertIn("HoverHandler { id: titleHover }", row_qml)
+            self.assertGreaterEqual(row_qml.count("CompactToolTip {"), 2)
+            self.assertIn("titleHover.hovered && titleLabel.truncated", row_qml)
+            self.assertNotIn("ToolTip.visible", row_qml)
+        self.assertIn("descriptionHover.hovered && descriptionLabel.truncated", self.inline_settings_row_qml)
+        self.assertIn("descriptionHover.hovered && descriptionLabel.truncated", self.settings_list_row_qml)
+        self.assertIn("globalStatusHover.hovered", self.main_qml)
+        self.assertIn("globalStatusText.truncated", self.main_qml)
+
+    def test_icon_glyph_has_windows_10_font_fallback(self):
+        self.assertIn('Qt.fontFamilies().indexOf("Segoe Fluent Icons")', self.icon_glyph_qml)
+        self.assertIn('Qt.fontFamilies().indexOf("Segoe MDL2 Assets")', self.icon_glyph_qml)
+        self.assertIn("font.family: iconFontFamily", self.icon_glyph_qml)
+
+    def test_device_page_shows_real_service_state_and_start_progress(self):
+        self.assertIn("SettingsController.bridgeLaunchBusy", self.device_qml)
+        self.assertIn("SettingsController.bridgeConnected", self.device_qml)
+        self.assertIn("SettingsController.bridgeRunning", self.device_qml)
+        self.assertIn("SettingsController.bridgeLaunchPhase", self.device_qml)
+        self.assertIn('qsTr("启动中…")', self.device_qml)
+        self.assertIn("enabled: !SettingsController.bridgeLaunchBusy", self.device_qml)
+
+    def test_voice_page_states_real_windows_boundaries_without_fake_grants(self):
+        for object_name in (
+            "openMicrophonePrivacyButton",
+            "openVoiceProgramSettingsButton",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
+        self.assertIn('titleText: qsTr("麦克风权限")', self.voice_qml)
+        self.assertNotIn('stateText: qsTr("待确认")', self.voice_qml)
+        self.assertIn(
+            'qsTr("请录入按住型快捷键")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'qsTr("刷新时会打开微信设置")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'qsTr("自动读取按住型快捷键")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'qsTr("自动读取开关型快捷键")',
+            self.voice_qml,
+        )
+        self.assertNotIn('? qsTr("无需设置")', self.voice_qml)
+        self.assertIn("SettingsController.hotkeyCaptureReady", self.voice_qml)
+        self.assertIn('qsTr("准备中")', self.voice_qml)
+        self.assertIn('qsTr("正在准备…")', self.voice_qml)
+        self.assertIn('? qsTr("录入中")', self.voice_qml)
+        self.assertIn(
+            'SettingsController.voiceHotkeySaveState === "retry"',
+            self.voice_qml,
+        )
+        self.assertIn('qsTr("点击“安装音频”")', self.voice_qml)
+        self.assertIn('qsTr("请重新选择端点")', self.voice_qml)
+        self.assertIn('qsTr("点击“重新检查”")', self.voice_qml)
+        self.assertIn('qsTr("请手动验证")', self.voice_qml)
+        self.assertNotIn('text: qsTr("语音试说")', self.voice_qml)
+        self.assertIn('qsTr("退出后点“重新检测”")', self.voice_qml)
+        self.assertNotIn('qsTr("需处理")', self.voice_qml)
+        self.assertNotIn('qsTr("待完成")', self.voice_qml)
+        for misleading_claim in (
+            "已授权",
+            "无线麦Mod需要管理员权限",
+            "VB-CABLE 安装成功",
+        ):
+            self.assertNotIn(misleading_claim, self.voice_qml)
+        self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
+        self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
+        self.assertNotIn('objectName: "speakTestDialog"', self.voice_qml)
+
+    def test_voice_program_state_does_not_treat_an_idle_window_as_failure(self):
+        self.assertNotIn("running_not_ready", self.voice_qml)
+        self.assertIn(
+            'SettingsController.voiceProgramStatusCode === "running"',
+            self.voice_qml,
+        )
+        self.assertIn("tokens.successColor", self.voice_qml)
+
+    def test_device_and_voice_guidance_use_the_shared_page_navigation(self):
+        self.assertIn("signal openButtonsRequested()", self.device_qml)
+        self.assertIn("onOpenButtonsRequested: window.requestPage(1)", self.main_qml)
+        self.assertIn("signal openDeviceRequested()", self.voice_qml)
+        self.assertIn("signal openButtonsRequested()", self.voice_qml)
+        self.assertIn("onOpenDeviceRequested: window.requestPage(0)", self.main_qml)
+        self.assertGreaterEqual(
+            self.main_qml.count("onOpenButtonsRequested: window.requestPage(1)"),
+            2,
+        )
+
+    def test_buttons_page_keeps_the_mapping_cards_and_photo_sidebar(self):
+        for object_name in ("photoSidebar", "photoFrame", "photoImage"):
+            self.assertIn(f'objectName: "{object_name}"', self.buttons_qml)
+        self.assertIn("SettingsController.photoSource", self.buttons_qml)
+        self.assertIn("SettingsController.photoAvailable", self.buttons_qml)
+        self.assertIn('objectName: "photoHotspot_" + buttonId', self.buttons_qml)
+        self.assertIn(
+            'objectName: "photoHotspotMarker_" + photoHotspot.buttonId',
+            self.buttons_qml,
+        )
+        self.assertIn('objectName: "mappingLines"', self.buttons_qml)
+        self.assertIn('objectName: "activeMappingLine"', self.buttons_qml)
+        self.assertIn("function connectorControlRadius(startX, endX)", self.buttons_qml)
+        self.assertIn("function connectorRoute(card, hotspot, coordinateItem)", self.buttons_qml)
+        self.assertEqual(self.buttons_qml.count("ctx.bezierCurveTo("), 1)
+        self.assertNotIn("ctx.quadraticCurveTo(", self.buttons_qml)
+        self.assertNotIn("ctx.lineTo(endX", self.buttons_qml)
+        self.assertIn('ctx.lineCap = "round"', self.buttons_qml)
+        self.assertIn("active ? 2.2 : 1.25", self.buttons_qml)
+        self.assertIn("hotspotX * photoImage.paintedWidth", self.buttons_qml)
+        self.assertIn("hotspotY * photoImage.paintedHeight", self.buttons_qml)
+        self.assertIn("visible: photoHotspot.isSelected", self.buttons_qml)
+        self.assertIn('objectName: "leftMappingCards"', self.buttons_qml)
+        self.assertIn('objectName: "rightMappingCards"', self.buttons_qml)
+        self.assertIn("MappingCard {", self.buttons_qml)
+        self.assertIn("leftCardRepeater.itemAt(i)", self.buttons_qml)
+        self.assertIn("rightCardRepeater.itemAt(i)", self.buttons_qml)
+        self.assertIn("photoHotspotRepeater.itemAt(i)", self.buttons_qml)
+        self.assertNotIn("function targetY(buttonId)", self.buttons_qml)
+        self.assertIn("root.selected ? root.tokens.accentSoft", self.mapping_card_qml)
+        self.assertIn("border.width: root.tokens.hairlineWidth", self.mapping_card_qml)
+        self.assertIn("root.tokens.cardBorder", self.mapping_card_qml)
+        self.assertIn("leftPadding: 4", self.mapping_card_qml)
+        self.assertIn("columnSpacing: 0", self.mapping_card_qml)
+        self.assertIn("spacing: 0", self.mapping_card_qml)
+        self.assertIn("root.tokens.surfaceMuted", self.mapping_card_qml)
+        self.assertIn("MappingKeyLabel {", self.mapping_card_qml)
+        self.assertIn("fontFamilyMono", self.mapping_card_qml)
+        self.assertIn('"Delete": "Del"', self.mapping_card_qml)
+        self.assertIn('"Delete（退格）": "Del"', self.mapping_card_qml)
+        self.assertIn('noteText.trim() !== qsTr("未命名")', self.mapping_card_qml)
+        self.assertIn("VoicePausedCell", self.mapping_card_qml)
+        self.assertIn('qsTr("语音模式下暂停")', self.mapping_card_qml)
+        for column_name in ("单击", "双击", "长按"):
+            self.assertIn(f'qsTr("{column_name}")', self.mapping_card_qml)
+        self.assertIn('objectName: exposeObjectNames ? "editMapping_" + cardId', self.mapping_card_qml)
+
+    def test_action_combo_group_headers_do_not_add_model_rows(self):
+        self.assertIn(
+            "SettingsController.actionOptionGroupTitle(String(modelData))",
+            self.buttons_qml,
+        )
+        self.assertIn("groupTitle !== SettingsController.actionOptionGroupTitle(", self.buttons_qml)
+        self.assertIn("Math.ceil(tokens.fontSizeTiny) + tokens.spacingMedium", self.buttons_qml)
+        self.assertIn("topPadding: groupHeaderHeight", self.buttons_qml)
+        self.assertIn("bottomPadding: 0", self.buttons_qml)
+        self.assertIn("color: tokens.textSecondary", self.buttons_qml)
+        self.assertIn("color: tokens.border", self.buttons_qml)
+        self.assertIn("height: optionDelegate.groupHeaderHeight", self.buttons_qml)
+        self.assertNotIn('ListElement { text: "按键操作"', self.buttons_qml)
+
+    def test_visible_mapping_inputs_share_the_grouped_action_sources(self):
+        self.assertIn("model: SettingsController.primaryActionOptionsFor(", self.buttons_qml)
+        self.assertIn("actionEditor.buttonId", self.buttons_qml)
+        self.assertEqual(
+            self.buttons_qml.count("model: SettingsController.secondaryActionOptionsFor(actionEditor.buttonId)"),
+            1,
+        )
+        self.assertEqual(
+            self.buttons_qml.count("model: SettingsController.longPressActionOptionsFor(actionEditor.buttonId)"),
+            1,
+        )
+        self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
+        self.assertIn('objectName: "actionEditorDialog"', self.buttons_qml)
+        self.assertIn('readonly property string headerText: buttonName.length > 0', self.buttons_qml)
+        self.assertIn('text: actionEditor.headerText', self.buttons_qml)
+        self.assertIn('text: shortcutRecorder.headerText', self.buttons_qml)
+        self.assertNotIn('text: actionEditor.title', self.buttons_qml)
+        self.assertNotIn('text: shortcutRecorder.title', self.buttons_qml)
+        self.assertNotIn('text: "×"', self.buttons_qml)
+        self.assertNotIn('text: "X"', self.buttons_qml)
+        self.assertEqual(self.buttons_qml.count("DialogCloseButton {"), 2)
+        self.assertIn("optionDelegate.highlighted", self.buttons_qml)
+        self.assertNotIn('objectName: "mappingListFrame"', self.buttons_qml)
+        self.assertIn("property int count: 15", self.buttons_qml)
+        self.assertNotIn("ListView {", self.buttons_qml)
+        self.assertNotIn('objectName: "voiceSettingsPanel"', self.buttons_qml)
+        self.assertNotIn('objectName: "voiceProgramDialog"', self.buttons_qml)
+        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
+        self.assertIn('objectName: "holdVoiceHotkeyField"', self.voice_qml)
+        self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
+        self.assertIn('qsTr("检测真实按键")', self.buttons_qml)
+        self.assertNotIn('objectName: "saveMappingButton"', self.buttons_qml)
+        self.assertNotIn('text: qsTr("保存映射")', self.buttons_qml)
+        self.assertIn('objectName: "retryMappingAutoSaveButton"', self.main_qml)
+        self.assertIn("SettingsController.retryMappingAutoSave()", self.main_qml)
+
+    def test_buttons_page_device_track_precedes_single_mapping_and_actions(self):
+        switch_index = self.buttons_qml.index('objectName: "mappingViewSwitcher"')
+        single_index = self.buttons_qml.index('objectName: "mappingList"')
+        actions_index = self.buttons_qml.index('objectName: "mappingActionsPanel"')
+        switcher_source = self.buttons_qml[switch_index:single_index]
+
+        self.assertLess(switch_index, single_index)
+        self.assertLess(single_index, actions_index)
+        # Chromecast is the only shipped profile, so exactly one equal-width
+        # device button remains. A second one here means a second profile was
+        # reintroduced and deviceOptions[1] would render as undefined.
+        self.assertEqual(switcher_source.count("Layout.preferredWidth: 1"), 1)
+        self.assertIn("text: SettingsController.deviceOptions[0]", switcher_source)
+        self.assertNotIn("text: SettingsController.deviceOptions[1]", self.buttons_qml)
+        # The retired profile's per-device highlight branch is gone, so the
+        # single remaining device button is highlighted unconditionally.
+        self.assertIn("highlighted: true", switcher_source)
+        self.assertNotIn('objectName: "comboMappingList"', self.buttons_qml)
+        self.assertNotIn("model: SettingsController.comboRows", self.buttons_qml)
+        self.assertNotIn('objectName: "comboActionEditor_" + buttonId', self.buttons_qml)
+
+    def test_voice_hotkey_field_is_owned_by_the_voice_page(self):
+        self.assertIn('placeholderText: qsTr("尚未录入")', self.voice_qml)
+        self.assertIn(
+            'qsTr("请录入按住型快捷键")',
+            self.voice_qml,
+        )
+        self.assertIn(
+            'qsTr("语音按键，录入%1快捷键").arg(root.voiceHotkeyModeLabel)',
+            self.voice_qml,
+        )
+        self.assertNotIn('qsTr("微信语音无需设置快捷键")', self.voice_qml)
+        self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
+        self.assertNotIn("windowsDictationSelected", self.voice_qml)
+        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
+        self.assertIn(
+            "if (!SettingsController.startHotkeyCapture())",
+            self.voice_qml,
+        )
+        self.assertNotIn('objectName: "holdVoiceHotkeyField"', self.buttons_qml)
+
+    def test_voice_program_section_has_no_redundant_note_only_row(self):
+        self.assertNotIn('objectName: "voiceProgramSpecificRow"', self.voice_qml)
+        self.assertNotIn('objectName: "voiceProgramLaunchText"', self.voice_qml)
+        self.assertNotIn("voiceProgramLaunchDescription", self.voice_qml)
+        voice_hotkey_block = self.voice_qml.split(
+            'objectName: "voiceHotkeyRow"', 1
+        )[1].split('objectName: "voiceTestSection"', 1)[0]
+        self.assertIn("showDivider: false", voice_hotkey_block)
+
+    def test_voice_rows_use_the_shared_fixed_action_column(self):
+        self.assertIn(
+            "settingsActionColumnWidth: tokens.buttonWidth6Chars",
+            self.voice_qml,
+        )
+        self.assertRegex(
+            self.voice_qml,
+            r'(?s)objectName: "testVbCableChannelButton".*?'
+            r"Layout\.fillWidth: true",
+        )
+
+    def test_conflicting_audio_work_locks_direct_writes_but_mapping_page_has_no_save_control(self):
+        self.assertIn(
+            "readonly property bool endpointPreflightBusy:",
+            self.voice_qml,
+        )
+        self.assertIn("readonly property bool configurationWriteBusy:", self.voice_qml)
+        for busy_source in (
+            "DiagnosticsController.driverActionRunning",
+            "DiagnosticsController.vbCableTestRunning",
+            "SettingsController.bridgeLaunchBusy",
+            "root.endpointPreflightBusy",
+        ):
+            self.assertIn(busy_source, self.voice_qml)
+        self.assertGreaterEqual(
+            self.voice_qml.count("!root.configurationWriteBusy"),
+            9,
+        )
+        self.assertIn(
+            "&& !SettingsController.settingsSaveBusy",
+            self.voice_qml,
+        )
+        self.assertIn(
+            "&& !SettingsController.endpointPreflightBusy",
+            self.device_qml,
+        )
+        self.assertIn(
+            "&& !DiagnosticsController.driverActionRunning",
+            self.device_qml,
+        )
+        self.assertNotIn('objectName: "saveMappingButton"', self.buttons_qml)
+        self.assertNotIn("configurationWriteBusy", self.buttons_qml)
+
+
+class ThreePageSettingsSourceContractTests(unittest.TestCase):
+    def setUp(self):
+        qml_dir = Path(qt_settings_app.__file__).resolve().parent / "qml"
+        self.main_qml = (qml_dir / "main.qml").read_text(encoding="utf-8")
+        self.tokens_qml = (qml_dir / "Tokens.qml").read_text(encoding="utf-8")
+        self.device_qml = (qml_dir / "DevicePage.qml").read_text(encoding="utf-8")
+        self.voice_qml = (qml_dir / "VoicePage.qml").read_text(encoding="utf-8")
+        self.buttons_qml = (qml_dir / "ButtonsPage.qml").read_text(encoding="utf-8")
+        self.inline_row_qml = (qml_dir / "InlineSettingsRow.qml").read_text(
+            encoding="utf-8"
+        )
+        self.mapping_card_qml = (qml_dir / "MappingCard.qml").read_text(
+            encoding="utf-8"
+        )
+        self.compact_button_qml = (qml_dir / "CompactButton.qml").read_text(
+            encoding="utf-8"
+        )
+        self.compact_text_field_qml = (qml_dir / "CompactTextField.qml").read_text(
+            encoding="utf-8"
+        )
+        self.compact_switch_qml = (qml_dir / "CompactSwitch.qml").read_text(
+            encoding="utf-8"
+        )
+        self.selection_combo_qml = (qml_dir / "SelectionComboBox.qml").read_text(
+            encoding="utf-8"
+        )
+        self.section_frame_qml = (qml_dir / "SectionFrame.qml").read_text(
+            encoding="utf-8"
+        )
+
+    def test_navigation_has_only_device_buttons_and_voice(self):
+        for object_name, label in (
+            ("deviceTabButton", "设备"),
+            ("mappingTabButton", "按键"),
+            ("voiceTabButton", "语音"),
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.main_qml)
+            self.assertIn(f'text: qsTr("{label}")', self.main_qml)
+        for retired in (
+            "connectionTabButton",
+            "permissionsTabButton",
+            "diagnosticsTabButton",
+            "generalTabButton",
+            "PermissionsPage",
+            "DiagnosticsPage",
+            "GeneralPage",
+        ):
+            self.assertNotIn(retired, self.main_qml)
+        self.assertIn("DevicePage {", self.main_qml)
+        self.assertIn("ButtonsPage {", self.main_qml)
+        self.assertIn("VoicePage {", self.main_qml)
+
+    def test_window_uses_the_inset_rounded_client_shell(self):
+        for token_name in (
+            "windowFrame",
+            "nativeWindowBorder",
+            "windowFrameBorder",
+            "windowClientRadius",
+            "windowFrameGap",
+        ):
+            self.assertRegex(
+                self.tokens_qml,
+                rf"property\s+(?:color|int)\s+{token_name}:",
+            )
+        self.assertIn('objectName: "clientShell"', self.main_qml)
+        self.assertIn('objectName: "clientContent"', self.main_qml)
+        self.assertIn('objectName: "clientShellOutline"', self.main_qml)
+        self.assertIn("anchors.leftMargin: tokens.windowFrameGap", self.main_qml)
+        self.assertIn("anchors.rightMargin: tokens.windowFrameGap", self.main_qml)
+        self.assertIn("anchors.bottomMargin: tokens.windowFrameGap", self.main_qml)
+        self.assertIn("radius: tokens.windowClientRadius", self.main_qml)
+        self.assertIn("border.color: tokens.windowFrameBorder", self.main_qml)
+        self.assertIn(
+            "readonly property color nativeBorderColor: tokens.nativeWindowBorder",
+            self.main_qml,
+        )
+        self.assertIn(
+            'property color nativeWindowBorder: darkMode ? "#4a5059" : "#a8adb4"',
+            self.tokens_qml,
+        )
+        self.assertIn(
+            'property color windowFrame: darkMode ? "#101318" : "#eef0f2"',
+            self.tokens_qml,
+        )
+        self.assertIn(
+            'property color sidebar: darkMode ? "#1b1e24" : "#f5f6f8"',
+            self.tokens_qml,
+        )
+        self.assertIn("property real hairlineWidth: 0.5", self.tokens_qml)
+        self.assertIn("property int structuralDividerWidth: 1", self.tokens_qml)
+        self.assertNotIn("import QtQuick.Effects", self.main_qml)
+        self.assertNotIn("clientShellShadow", self.main_qml)
+        self.assertNotIn("windowShadow", self.tokens_qml)
+
+    def test_global_status_bar_uses_background_without_a_top_rule(self):
+        status_bar_source = self.main_qml[
+            self.main_qml.index('id: globalStatusBar'):
+            self.main_qml.index('id: globalStatusText')
+        ]
+        self.assertIn("tokens.background", status_bar_source)
+        self.assertNotIn("tokens.statusBackground", status_bar_source)
+        self.assertNotIn("height: tokens.hairlineWidth", status_bar_source)
+
+    def test_regular_frames_share_one_hairline_width(self):
+        for source in (
+            self.main_qml,
+            self.buttons_qml,
+            self.mapping_card_qml,
+            self.compact_button_qml,
+            self.compact_text_field_qml,
+            self.selection_combo_qml,
+            self.section_frame_qml,
+        ):
+            self.assertIn("hairlineWidth", source)
+            self.assertNotIn("activeFocus ? 2 : 1", source)
+        self.assertNotIn("border.width: 0.75", self.mapping_card_qml)
+
+    def test_device_page_contains_device_and_desktop_behavior_rows(self):
+        for object_name in (
+            "currentDeviceRow",
+            "buttonReceiverRow",
+            "remoteServiceRow",
+            "runtimeLogRow",
+            "launchAtLoginRow",
+            "launchBridgeOnAppStartRow",
+            "diagnosticTraceRow",
+            "closeBehaviorRow",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.device_qml)
+        for button_name in (
+            "refreshDeviceChecksButton",
+            "openBluetoothSettingsButton",
+            "openButtonSettingsButton",
+            "bridgeActionButton",
+            "deviceOpenLogButton",
+        ):
+            self.assertIn(f'objectName: "{button_name}"', self.device_qml)
+        self.assertIn("SettingsController.startBridge()", self.device_qml)
+        self.assertNotIn("SettingsController.saveSettings()", self.device_qml)
+        self.assertNotIn("stopBridge", self.device_qml)
+        self.assertNotIn('text: qsTr("设备")', self.device_qml)
+        self.assertIn("SettingsController.activeRemoteLabel", self.device_qml)
+        self.assertIn('return qsTr("启动服务")', self.device_qml)
+
+    def test_device_toggles_share_the_compact_accent_switch(self):
+        # diagnosticTrace / appLog / closeBehavior plus the receiver switch and
+        # the 随 Windows 启动 / 启动程序时自动运行服务 pair further up the page.
+        self.assertEqual(self.device_qml.count("CompactSwitch {"), 5)
+        self.assertNotIn("                    Switch {", self.device_qml)
+        self.assertIn("implicitWidth: 28", self.compact_switch_qml)
+        self.assertIn("implicitHeight: 14", self.compact_switch_qml)
+        self.assertIn("? root.tokens.accent", self.compact_switch_qml)
+        self.assertIn("? root.tokens.accentText", self.compact_switch_qml)
+
+    def test_sidebar_separator_uses_a_visible_structural_divider(self):
+        navigation_source = self.main_qml[
+            self.main_qml.index('id: navigationBar'):
+            self.main_qml.index('id: pageStack')
+        ]
+        self.assertIn("width: tokens.structuralDividerWidth", navigation_source)
+        self.assertIn("color: tokens.borderStrong", navigation_source)
+
+    def test_diagnostics_are_reused_inside_their_own_rows(self):
+        # Diagnostics rows are looked up on the page that renders them: the
+        # device page now resolves its state from the bridge instead, so only
+        # the voice page keeps check-id lookups.
+        for check_id in ("os_version", "raw_input", "ble_candidate"):
+            self.assertNotIn(f'"{check_id}"', self.device_qml)
+        for check_id in (
+            "vb_cable_endpoints",
+            "output_endpoint",
+        ):
+            self.assertIn(f'"{check_id}"', self.voice_qml)
+        self.assertIn("DiagnosticsController.refreshDiagnostics()", self.device_qml)
+
+    def test_voice_page_has_one_recording_row_and_provider_content(self):
+        for object_name in (
+            "audioPrerequisiteSection",
+            "remoteRecordingModeRow",
+            "voiceProgramSection",
+            "voiceTestSection",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        # One shipped profile means one recording-mode row, with no retired
+        # read-only counterpart left to hide.
+        self.assertEqual(
+            self.voice_qml.count('objectName: "remoteRecordingModeRow"'), 1
+        )
+        self.assertNotIn("googleRemoteRecordingModeRow", self.voice_qml)
+        recording_block = self.voice_qml.split(
+            'objectName: "remoteRecordingModeRow"', 1
+        )[1]
+        self.assertIn('titleText: qsTr("按键模式")', recording_block)
+        self.assertIn("SelectionComboBox", recording_block)
+        self.assertIn('objectName: "voiceProgramCombo"', self.voice_qml)
+        self.assertIn('objectName: "voiceProgramCustomPathRow"', self.voice_qml)
+        self.assertIn('objectName: "recordVoiceHotkeyButton"', self.voice_qml)
+        self.assertIn('objectName: "openVoiceProgramSettingsButton"', self.voice_qml)
+        self.assertNotIn("voiceProgramWindowsDictationSelected", self.voice_qml)
+        self.assertIn(
+            "SettingsController.voiceProgramCustomSelected",
+            self.voice_qml,
+        )
+        self.assertNotIn("selectedVoiceProgramIndex ===", self.voice_qml)
+        self.assertIn(
+            "SettingsController.refreshVoiceHotkeyFromProvider()", self.voice_qml
+        )
+        self.assertIn(
+            "SettingsController.loadVoiceHotkeyFromProvider()", self.voice_qml
+        )
+        self.assertNotIn('objectName: "voiceProgramStatusRefreshTimer"', self.voice_qml)
+        self.assertIn("readonly property bool voiceHotkeyBusy", self.voice_qml)
+        # 开启音频压制 and 关闭音频发送 share one row under 语音物理按键.
+        self.assertIn('objectName: "audioDuckingRow"', self.voice_qml)
+        self.assertIn('objectName: "audioDuckingSwitch"', self.voice_qml)
+        self.assertIn("SettingsController.setAudioDuckingEnabled", self.voice_qml)
+        self.assertIn("SettingsController.setDisableAudioSending", self.voice_qml)
+        ducking_block = self.voice_qml.split(
+            'objectName: "audioDuckingRow"', 1
+        )[1]
+        self.assertIn('objectName: "disableAudioSendingSwitch"', ducking_block)
+        self.assertLess(
+            ducking_block.index('objectName: "audioDuckingSwitch"'),
+            ducking_block.index('objectName: "disableAudioSendingSwitch"'),
+        )
+
+    def test_voice_audio_rows_auto_save_and_keep_manual_privacy_only(self):
+        for object_name in (
+            "installVirtualAudioButton",
+            "endpointCombo",
+            "applyVirtualAudioButton",
+            "openMicrophonePrivacyButton",
+            "microphonePrivacyRow",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertIn("recommendedIndex: SettingsController.recommendedEndpointIndex", self.voice_qml)
+        self.assertIn(
+            "SettingsController.selectAndPersistOutputEndpointIndex(index)",
+            self.voice_qml,
+        )
+        self.assertIn(
+            "SettingsController.selectAndPersistOutputEndpointIndex(",
+            self.voice_qml,
+        )
+        self.assertIn('text: qsTr("选推荐端点")', self.voice_qml)
+        self.assertIn(
+            "SettingsController.selectedEndpointIndex",
+            self.voice_qml,
+        )
+        self.assertNotIn('text: qsTr("应用")', self.voice_qml)
+        self.assertNotIn("SettingsController.saveSettings()", self.voice_qml)
+        self.assertNotIn('objectName: "openSoundInputSettingsButton"', self.voice_qml)
+        self.assertNotIn('text: qsTr("声音输入")', self.voice_qml)
+
+    def test_voice_channel_check_keeps_safe_service_recovery(self):
+        for object_name in (
+            "bridgeTestConfirmDialog",
+            "testVbCableChannelButton",
+            "recoverBridgeButton",
+        ):
+            self.assertIn(f'objectName: "{object_name}"', self.voice_qml)
+        self.assertIn(
+            "DiagnosticsController.testVbCableChannelWithBridgeRestart()",
+            self.voice_qml,
+        )
+        self.assertNotIn('objectName: "trySpeakingButton"', self.voice_qml)
+        self.assertIn('qsTr("检查虚拟声卡")', self.voice_qml)
+        self.assertIn("vbCableBridgeRecoveryNeeded", self.voice_qml)
+
+    def test_button_page_keeps_real_cards_and_confirms_built_in_defaults(self):
+        self.assertIn("MappingCard {", self.buttons_qml)
+        self.assertEqual(self.buttons_qml.count("cardId: buttonId"), 2)
+        self.assertIn('objectName: "restoreMappingDefaultsDialog"', self.buttons_qml)
+        self.assertIn('text: qsTr("恢复内置默认")', self.buttons_qml)
+        self.assertIn("SettingsController.restoreMappingDefaults()", self.buttons_qml)
+        self.assertIn("并立即自动保存", self.buttons_qml)
+        detect_index = self.buttons_qml.index('objectName: "detectRealKeyButton"')
+        note_index = self.buttons_qml.index('objectName: "voiceGestureRestrictionText"')
+        self.assertLess(detect_index, note_index)
+        self.assertIn(
+            "text: SettingsController.keyDetectionText + qsTr(",
+            self.buttons_qml,
+        )
+        self.assertIn(
+            "if (!SettingsController.startMappingHotkeyCapture()",
+            self.buttons_qml,
+        )
+        self.assertIn(
+            'objectName: "shortcutRecorderCaptureModeButton"',
+            self.buttons_qml,
+        )
+        self.assertIn(
+            'objectName: "shortcutRecorderManualModeButton"',
+            self.buttons_qml,
+        )
+        self.assertIn(
+            'objectName: "shortcutRecorderManualField"',
+            self.buttons_qml,
+        )
+        self.assertIn(
+            "SettingsController.normalizeMappingHotkeyText(",
+            self.buttons_qml,
+        )
+        self.assertIn(
+            'placeholderText: qsTr("例如 Ctrl+[、Win+L 或 左 Ctrl+←")',
+            self.buttons_qml,
+        )
+        self.assertRegex(
+            self.buttons_qml,
+            r'(?s)text: qsTr\("取消"\).*?'
+            r'onClicked: shortcutRecorder\.requestClose\(\)',
+        )
+        self.assertNotIn(
+            "SettingsController.keyDetectionActive\n"
+            "                                ? SettingsController.keyDetectionText",
+            self.buttons_qml,
+        )
+        self.assertIn('qsTr("语音模式下暂停")', self.mapping_card_qml)
+
+    def test_inline_rows_do_not_restore_the_old_blue_circle_icon(self):
+        self.assertNotIn("iconGlyph", self.inline_row_qml)
+        self.assertNotIn("radius: 14", self.inline_row_qml)
+        self.assertIn("titleText", self.inline_row_qml)
+        self.assertIn("descriptionText", self.inline_row_qml)
+        self.assertIn("stateText", self.inline_row_qml)
+
+    def test_inline_diagnostic_notes_strip_terminal_sentence_marks(self):
+        normalization = 'replace(/[。；;]+$/, "")'
+        self.assertIn(normalization, self.voice_qml)
+        self.assertNotIn(normalization, self.device_qml)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class SelectionComboBoxBehaviorTests(unittest.TestCase):
+    def test_recommendation_decorates_only_a_real_recommended_index(self):
+        import subprocess
+
+        env = dict(os.environ)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env["PYTHONIOENCODING"] = "utf-8"
+        result = subprocess.run(
+            [sys.executable, "-c", _SELECTION_COMBO_STATE_PROBE_SCRIPT],
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"selection combo probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["empty"], "")
+        self.assertEqual(data["ordinary"], "Speakers")
+        self.assertEqual(data["recommended"], "（推荐） CABLE Input")
+        self.assertEqual(data["bold_initial"], [True, False])
+        self.assertEqual(data["bold_after_move"], [False, True])
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class ApplicationExitIntegrationTests(unittest.TestCase):
+    def test_full_exit_closes_the_real_hidden_qml_window(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["OVB_DISABLE_LIVE_INPUT"] = "1"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"application exit probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["result"], 0)
+        self.assertLess(data["elapsed"], 5.0)
+
+    def test_default_window_close_hides_to_the_notification_area(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["OVB_DISABLE_LIVE_INPUT"] = "1"
+            env["OVB_EXIT_PROBE_ACTION"] = "window_close_hide"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"window close probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["action"], "window_close_hide")
+        self.assertEqual(data["result"], 0)
+        self.assertFalse(data["visible_after_close"])
+        self.assertGreater(data["elapsed"], 0.25)
+        self.assertLess(data["elapsed"], 5.0)
+
+    def test_explicit_quit_window_close_runs_the_full_exit_path(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["OVB_DISABLE_LIVE_INPUT"] = "1"
+            env["OVB_EXIT_PROBE_ACTION"] = "window_close_quit"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"window close probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["action"], "window_close_quit")
+        self.assertEqual(data["result"], 0)
+        self.assertLess(data["elapsed"], 5.0)
+
+    def test_mixed_mapping_and_endpoint_draft_keeps_the_exit_prompt(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["OVB_DISABLE_LIVE_INPUT"] = "1"
+            env["OVB_EXIT_PROBE_ACTION"] = "window_close_quit_mixed_dirty"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"mixed-dirty close probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["action"], "window_close_quit_mixed_dirty")
+        self.assertTrue(data["visible_after_close"])
+        self.assertTrue(data["unsaved_dialog"])
+        self.assertEqual(data["saved_endpoint_name"], "")
+        self.assertEqual(data["result"], 0)
+
+    def test_window_hides_while_a_running_bridge_stops(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["OVB_DISABLE_LIVE_INPUT"] = "1"
+            env["OVB_EXIT_PROBE_ACTION"] = "window_close_quit_running_bridge"
+            result = subprocess.run(
+                [sys.executable, "-c", _APPLICATION_EXIT_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"running-bridge close probe failed: {result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["action"], "window_close_quit_running_bridge")
+        self.assertFalse(data["visible_during_cleanup"])
+        self.assertGreater(data["elapsed"], 0.5)
+        self.assertLess(data["elapsed"], 5.0)
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class OffscreenQmlLoadTests(unittest.TestCase):
+    """Loads the REAL qml/main.qml (not a stand-in snippet), in an isolated
+    subprocess (see ``_QML_LOAD_PROBE_SCRIPT`` above), and fails the test on
+    ANY QML warning - this is the same check this task's own screenshot
+    step relies on, so a future change that breaks the singleton wiring (see
+    qt_settings_app.py and main.qml's module docstrings for the exact Qt
+    Quick Controls internal-property-name collision this works around)
+    fails fast in CI instead of only being noticed visually.
+    """
+
+    def test_main_qml_loads_with_zero_warnings_and_a_reasonable_window_size(self):
+        import json
+        import subprocess
+
+        env = dict(os.environ)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env["LOCALAPPDATA"] = tempfile.mkdtemp()
+        result = subprocess.run(
+            [sys.executable, "-c", _QML_LOAD_PROBE_SCRIPT],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode, 0, f"QML load probe subprocess failed: {result.stderr}"
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+
+        self.assertEqual(data["root_count"], 1, "main.qml failed to instantiate")
+        self.assertEqual(
+            data["warnings"], [], "main.qml produced QML warnings/errors during load"
+        )
+        self.assertEqual(data["width"], 720)
+        self.assertEqual(data["height"], 550)
+        self.assertEqual(
+            data["title"],
+            qt_settings_app.product_identity.windows_window_title(),
+        )
+        self.assertFalse(data["initial_settings_dirty"])
+        self.assertFalse(data["retired_finish_tap_control_exists"])
+        self.assertFalse(data["voice_hotkey_recording"])
+        self.assertEqual(
+            data["hotkey_before_stop_completed"],
+            data["hotkey_before_capture"],
+        )
+        self.assertTrue(data["recording_before_stop_completed"])
+        self.assertEqual(data["pending_before_stop_completed"], "ctrl+shift+f8")
+        self.assertEqual(data["saved_voice_hotkey"], "ctrl+shift+f8")
+        self.assertIn("快捷键已保存到无线麦Mod", data["voice_save_status"])
+        self.assertFalse(data["voice_feedback_on_device"])
+        self.assertTrue(data["voice_feedback_on_voice"])
+        self.assertTrue(data["mapping_dirty_on_buttons"])
+        self.assertFalse(data["mapping_dirty_on_voice"])
+        self.assertTrue(data["hidden_before_restore"])
+        self.assertTrue(data["restored_by_request"])
+        self.assertTrue(data["hidden_after_second_close"])
+
+    def test_elevated_window_opens_without_the_first_hid_permission_prompt(self):
+        import json
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env["QT_QPA_PLATFORM"] = "offscreen"
+            env["LOCALAPPDATA"] = tmpdir
+            env["OVB_DISABLE_LIVE_INPUT"] = "1"
+            result = subprocess.run(
+                [sys.executable, "-c", _HID_HELPER_DIALOG_PROBE_SCRIPT, "--elevated"],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["warnings"], [])
+        self.assertTrue(data["window_visible"])
+        self.assertFalse(data["dialog_visible"])
+        self.assertFalse(data["repair_visible"])
+        self.assertEqual(data["install_call_count"], 0)
+        self.assertFalse(data["saved_offer_id"])
+
+    def test_first_hid_permission_prompt_is_compact_clear_and_non_elevating(self):
+        import json
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            env["OVB_DISABLE_LIVE_INPUT"] = "1"
+            result = subprocess.run(
+                [sys.executable, "-c", _HID_HELPER_DIALOG_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"HID helper dialog probe failed: {result.stdout}\n{result.stderr}",
+        )
+        data = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(data["warnings"], [])
+        self.assertEqual((data["window_width"], data["window_height"]), (640, 480))
+
+        initial = data["initial"]
+        self.assertTrue(initial["dialog_visible"])
+        self.assertEqual(initial["dialog_title"], "建议打开管理员按键权限")
+        self.assertIn("用于自定义改键和遥控器语音键", initial["body_text"])
+        self.assertIn("成功后普通启动和自启动不再询问", initial["body_text"])
+        self.assertIn("现在不打开时，只保留 Windows 原始按键", initial["body_text"])
+        self.assertGreaterEqual(
+            initial["body_height"] + 0.5,
+            initial["body_implicit_height"],
+        )
+        self.assertEqual(initial["decline_text"], "不打开")
+        self.assertTrue(initial["decline_flat"])
+        self.assertFalse(initial["decline_highlighted"])
+        self.assertEqual(initial["confirm_text"], "打开")
+        self.assertFalse(initial["confirm_flat"])
+        self.assertTrue(initial["confirm_highlighted"])
+
+        def assert_inside(item, container):
+            self.assertGreaterEqual(item["x"], container["x"] - 0.5)
+            self.assertGreaterEqual(item["y"], container["y"] - 0.5)
+            self.assertLessEqual(item["right"], container["right"] + 0.5)
+            self.assertLessEqual(item["bottom"], container["bottom"] + 0.5)
+
+        viewport = {"x": 0, "y": 0, "right": 640, "bottom": 480}
+        assert_inside(initial["dialog"], viewport)
+        assert_inside(initial["body"], initial["dialog"])
+        assert_inside(initial["decline"], initial["dialog"])
+        assert_inside(initial["confirm"], initial["dialog"])
+        self.assertLessEqual(initial["body"]["bottom"], initial["decline"]["y"] + 0.5)
+        self.assertLessEqual(initial["decline"]["right"], initial["confirm"]["x"] + 0.5)
+
+        self.assertTrue(data["dialog_reopened"])
+        self.assertTrue(data["repair_visible"])
+        self.assertEqual(data["install_call_count"], 0)
+        self.assertEqual(data["saved_offer_id"], "4:" + ("a" * 64))
+
+    def test_google_only_three_page_shell_is_rendered(self):
+        import json
+        import subprocess
+
+        style_results = {}
+        for style in ("Basic", "FluentWinUI3"):
+            with self.subTest(style=style), tempfile.TemporaryDirectory() as tmpdir:
+                env = dict(os.environ)
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+                env["LOCALAPPDATA"] = tmpdir
+                env["PROBE_STYLE"] = style
+                result = subprocess.run(
+                    [sys.executable, "-c", _OVB_ONLY_DEVICE_PAGE_PROBE_SCRIPT],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"Chromecast-only QML probe failed ({style}): {result.stderr}",
+                )
+                style_results[style] = json.loads(
+                    result.stdout.strip().splitlines()[-1]
+                )
+
+        data = style_results["Basic"]
+        # Chromecast is the only shipped profile, so the selector must offer
+        # exactly one row. A retired id left in _DEVICE_ORDER would resolve to
+        # the same profile and render a duplicate identical entry here.
+        self.assertEqual(
+            data["device_options"],
+            [device_catalog.DEFAULT_DISPLAY_NAME],
+        )
+        self.assertTrue(data["google_visible"])
+        self.assertEqual(data["mapping_page_title"], "按键映射")
+        self.assertTrue(data["device_rows"])
+        self.assertTrue(data["voice_sections"])
+
+        state_columns = data["device_columns"]["states"]
+        action_columns = data["device_columns"]["actions"]
+        for column in state_columns[1:]:
+            self.assertAlmostEqual(column["x"], state_columns[0]["x"], delta=0.5)
+            self.assertAlmostEqual(
+                column["width"], state_columns[0]["width"], delta=0.5
+            )
+        for column in action_columns[1:]:
+            self.assertAlmostEqual(column["x"], action_columns[0]["x"], delta=0.5)
+            self.assertAlmostEqual(
+                column["width"], action_columns[0]["width"], delta=0.5
+            )
+
+        cases = data["status_cases"]
+        # Only one profile ships and it owns its own receiver, so every
+        # verdict below is driven by the Chromecast raw-input state. The
+        # retired profile's raw-input and HID-tap states are unreachable.
+        self.assertEqual(cases["starting"]["buttons"]["state"], "正在检查")
+        self.assertEqual(cases["starting"]["service"]["state"], "正在等待连接")
+        self.assertFalse(cases["starting"]["action"]["visible"])
+        self.assertEqual(cases["ready"]["buttons"]["state"], "正常")
+        self.assertEqual(cases["ready"]["service"]["state"], "已连接")
+        self.assertFalse(cases["ready"]["action"]["visible"])
+        self.assertEqual(
+            cases["source_unconfirmed"]["buttons"]["state"], "点击“重启服务”"
+        )
+        self.assertEqual(
+            cases["source_unconfirmed"]["service"]["state"], "点击“重启服务”"
+        )
+        self.assertEqual(cases["source_unconfirmed"]["action"]["text"], "重启服务")
+        self.assertTrue(cases["source_unconfirmed"]["action"]["visible"])
+        # A BLE failure is reported through the same restart verdict; the
+        # separate "pair first" verdict belonged to the retired profile's scan.
+        self.assertEqual(
+            cases["unpaired_running"]["buttons"]["state"], "点击“重启服务”"
+        )
+        self.assertEqual(
+            cases["connected_input_wait"]["buttons"]["state"], "正在检查"
+        )
+        self.assertEqual(
+            cases["connected_input_wait"]["service"]["state"], "已连接"
+        )
+        self.assertEqual(
+            cases["restart"]["service"]["state"], "点击“重启服务”"
+        )
+        self.assertEqual(cases["restart"]["action"]["text"], "重启服务")
+        self.assertEqual(
+            cases["restart"]["service"]["detail"],
+            "连接遥控器，接收按键和语音",
+        )
+        self.assertNotEqual(
+            cases["restart"]["service"]["color"],
+            cases["connected_input_wait"]["service"]["color"],
+        )
+        self.assertEqual(
+            cases["reconnect"]["service"]["detail"],
+            "连接遥控器，接收按键和语音",
+        )
+        self.assertEqual(
+            cases["reconnect"]["service"]["state"], "点击“重新连接”"
+        )
+        self.assertEqual(cases["reconnect"]["action"]["text"], "重新连接")
+        self.assertEqual(
+            cases["retry_wait"]["service"]["state"], "点击“重新连接”"
+        )
+        self.assertEqual(cases["retry_wait"]["action"]["text"], "重新连接")
+        self.assertEqual(
+            cases["connecting"]["service"]["state"], "正在连接遥控器"
+        )
+        self.assertFalse(cases["connecting"]["action"]["visible"])
+        # Voice and HID-tap states no longer steer the Chromecast verdict.
+        self.assertEqual(cases["voice_recovering"]["buttons"]["state"], "正常")
+        self.assertEqual(cases["voice_failed"]["buttons"]["state"], "正常")
+        self.assertEqual(
+            cases["hid_tap_restart_required"]["buttons"]["state"], "正常"
+        )
+        # Service stopped wins over every receiver detail.
+        self.assertEqual(
+            cases["stopped_ready"]["buttons"]["state"], "等待服务启动"
+        )
+        self.assertEqual(
+            cases["stopped_error"]["buttons"]["state"], "等待服务启动"
+        )
+        self.assertEqual(
+            cases["stopped_ready"]["service"]["state"], "点击“启动服务”"
+        )
+        self.assertEqual(cases["stopped_ready"]["action"]["text"], "启动服务")
+        # Detail verdicts the Chromecast branch does own.
+        self.assertEqual(
+            cases["payload_unavailable"]["buttons"]["state"], "按键数据不完整"
+        )
+        self.assertIn("Windows 没有提供完整按键数据", cases["payload_unavailable"]["buttons"]["detail"])
+        self.assertEqual(
+            cases["permission_cancelled"]["buttons"]["state"], "授权已取消"
+        )
+        self.assertEqual(
+            cases["permission_cancelled"]["service"]["state"], "请先完成启用"
+        )
+        self.assertEqual(
+            cases["sensitive_logging"]["buttons"]["state"], "启用未完成"
+        )
+        # Diagnostics-only and helper rows all stop at "service stopped".
+        for name in (
+            "diag_probe_failed",
+            "diag_no_device",
+            "diag_unpaired",
+            "helper_disabled",
+            "helper_permission",
+            "helper_version",
+            "helper_cleanup",
+            "helper_account",
+        ):
+            with self.subTest(case=name):
+                self.assertEqual(
+                    cases[name]["buttons"]["state"], "等待服务启动"
+                )
+                self.assertEqual(
+                    cases[name]["buttons"]["detail"],
+                    "让遥控器按键在电脑上生效",
+                )
+                self.assertEqual(
+                    cases[name]["service"]["state"], "点击“启动服务”"
+                )
+        for style, style_data in style_results.items():
+            with self.subTest(style=style, check="status_geometry"):
+                style_state_columns = style_data["device_columns"]["states"]
+                style_action_columns = style_data["device_columns"]["actions"]
+                for column in style_state_columns[1:]:
+                    self.assertAlmostEqual(
+                        column["x"], style_state_columns[0]["x"], delta=0.5
+                    )
+                    self.assertAlmostEqual(
+                        column["width"],
+                        style_state_columns[0]["width"],
+                        delta=0.5,
+                    )
+                for column in style_action_columns[1:]:
+                    self.assertAlmostEqual(
+                        column["x"], style_action_columns[0]["x"], delta=0.5
+                    )
+                    self.assertAlmostEqual(
+                        column["width"],
+                        style_action_columns[0]["width"],
+                        delta=0.5,
+                    )
+                for case in style_data["status_cases"].values():
+                    for row_name in ("device", "buttons", "service"):
+                        row = case[row_name]
+                        self.assertFalse(row["state_truncated"])
+                        self.assertGreaterEqual(
+                            row["state_width"] + 0.5,
+                            row["state_implicit_width"],
+                        )
+                        if row_name == "device":
+                            # The physical-remote label can elide in the fixed
+                            # first row; InlineSettingsRow supplies its tooltip.
+                            self.assertTrue(row["detail"].endswith(" · AAAAAA"))
+                            self.assertGreater(row["detail_width"], 0)
+                        else:
+                            self.assertFalse(row["detail_truncated"])
+                            self.assertGreaterEqual(
+                                row["detail_width"] + 0.5,
+                                row["detail_implicit_width"],
+                            )
+                        if row["center_delta"] is not None:
+                            self.assertLessEqual(row["center_delta"], 0.5)
+                        if row["title_center_delta"] is not None:
+                            self.assertLessEqual(row["title_center_delta"], 0.5)
+    def test_three_page_shell_fits_compact_viewports_without_horizontal_overflow(self):
+        import json
+        import subprocess
+
+        scenarios = (
+            ("Basic", 720, 500),
+            ("Basic", 640, 480),
+            ("FluentWinUI3", 720, 560),
+            ("FluentWinUI3", 720, 500),
+            ("FluentWinUI3", 640, 480),
+        )
+        for style, width, height in scenarios:
+            with self.subTest(style=style, width=width, height=height), tempfile.TemporaryDirectory() as tmpdir:
+                env = dict(os.environ)
+                env.setdefault("QT_QPA_PLATFORM", "offscreen")
+                env["LOCALAPPDATA"] = tmpdir
+                env["PROBE_STYLE"] = style
+                env["PROBE_WIDTH"] = str(width)
+                env["PROBE_HEIGHT"] = str(height)
+                result = subprocess.run(
+                    [sys.executable, "-c", _THREE_PAGE_LAYOUT_PROBE_SCRIPT],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    "three-page layout probe failed at "
+                    f"{width}x{height}: {result.stdout}\n{result.stderr}",
+                )
+                data = json.loads(result.stdout.strip().splitlines()[-1])
+                self.assertEqual(data["warnings"], [])
+                self.assertEqual((data["width"], data["height"]), (width, height))
+                self.assertEqual(data["mapping_index_on_press"], 1)
+
+                shell = data["client_shell"]
+                self.assertAlmostEqual(shell["x"], 3, delta=0.5)
+                self.assertAlmostEqual(shell["y"], 0, delta=0.5)
+                self.assertAlmostEqual(shell["right"], width - 3, delta=0.5)
+                self.assertAlmostEqual(shell["bottom"], height - 3, delta=0.5)
+                outline = data["client_shell_outline"]
+                for edge in ("x", "y", "right", "bottom"):
+                    self.assertAlmostEqual(outline[edge], shell[edge], delta=0.5)
+
+                device_items = data["pages"]["device"]["items"]
+                runtime_row = device_items["runtimeLogRow"]
+                log_button = device_items["deviceOpenLogButton"]
+                location_link = device_items["deviceLogLocationLink"]
+                usage_link = device_items["deviceUsageLink"]
+                diagnostic_row = device_items["diagnosticTraceRow"]
+                self.assertTrue(log_button["visible"])
+                self.assertTrue(location_link["visible"])
+                self.assertAlmostEqual(usage_link["right"], location_link["right"], delta=1.1)
+                self.assertLess(log_button["right"], location_link["x"])
+                for button, row in (
+                    (usage_link, runtime_row),
+                    (log_button, diagnostic_row), (location_link, diagnostic_row),
+                ):
+                    self.assertGreaterEqual(button["x"], row["x"] - 0.5)
+                    self.assertLessEqual(
+                        button["right"], row["right"] + 0.5
+                    )
+                    self.assertGreaterEqual(button["y"], row["y"] - 0.5)
+                    self.assertLessEqual(
+                        button["bottom"], row["bottom"] + 0.5
+                    )
+
+                descriptions = data["voice_columns"]["descriptions"]
+                note_x = descriptions["voiceHotkeyRow_descriptionLabel"]["x"]
+                test_description_x = descriptions[
+                    "soundChannelTestDescription"
+                ]["x"]
+                self.assertGreater(note_x, test_description_x)
+                editor_columns = data["voice_columns"]["editor_columns"]
+                self.assertFalse(editor_columns["soundChannelTestRow"]["visible"])
+                self.assertTrue(data["voice_recovery_editor"]["column"]["visible"])
+                self.assertTrue(data["voice_recovery_editor"]["button"]["visible"])
+
+                nav = data["navigation_backgrounds"]
+                for button_name in (
+                    "deviceTabButton",
+                    "mappingTabButton",
+                    "voiceTabButton",
+                ):
+                    background = nav[button_name + "_background"]
+                    button = nav[button_name]
+                    for edge in ("x", "y", "right", "bottom"):
+                        self.assertAlmostEqual(
+                            background[edge], button[edge], delta=0.5
+                        )
+
+                for page_name, page in data["pages"].items():
+                    content = page["content"]
+                    self.assertTrue(content["visible"], page_name)
+                    self.assertGreater(content["width"], 0, page_name)
+                    self.assertGreaterEqual(content["x"], -1, page_name)
+                    self.assertLessEqual(content["right"], width + 1, page_name)
+                    for item_name, item in page["items"].items():
+                        self.assertTrue(item["visible"], item_name)
+                        self.assertGreater(item["width"], 0, item_name)
+                        self.assertGreaterEqual(item["x"], -1, item_name)
+                        self.assertLessEqual(item["right"], width + 1, item_name)
+
+                device_items = data["pages"]["device"]["items"]
+                self.assertGreaterEqual(
+                    device_items["devicePrerequisiteSectionTitle"]["y"],
+                    device_items["devicePrerequisiteSection"]["y"],
+                )
+                self.assertLessEqual(
+                    device_items["devicePrerequisiteSectionTitle"]["bottom"],
+                    device_items["currentDeviceRow"]["y"] + 1,
+                )
+                for first, second in (
+                    ("currentDeviceRow", "buttonReceiverRow"),
+                    ("buttonReceiverRow", "remoteServiceRow"),
+                    ("remoteServiceRow", "runtimeLogRow"),
+                ):
+                    self.assertLessEqual(
+                        device_items[first]["bottom"], device_items[second]["y"] + 1
+                    )
+                self.assertLessEqual(
+                    device_items["runtimeLogRow"]["bottom"],
+                    device_items["desktopBehaviorSection"]["y"] + 1,
+                )
+                self.assertGreaterEqual(
+                    device_items["desktopBehaviorSectionTitle"]["y"],
+                    device_items["desktopBehaviorSection"]["y"],
+                )
+                for first, second in (
+                    ("desktopBehaviorSectionTitle", "launchAtLoginRow"),
+                    ("launchAtLoginRow", "launchBridgeOnAppStartRow"),
+                    ("launchBridgeOnAppStartRow", "diagnosticTraceRow"),
+                    ("diagnosticTraceRow", "appLogRow"),
+                    ("appLogRow", "closeBehaviorRow"),
+                ):
+                    self.assertLessEqual(
+                        device_items[first]["bottom"],
+                        device_items[second]["y"] + 1,
+                    )
+                self.assertLessEqual(
+                    device_items["closeBehaviorRow"]["bottom"],
+                    device_items["desktopBehaviorSection"]["bottom"] + 1,
+                )
+
+                voice_items = data["pages"]["voice"]["items"]
+                # Custom program rows can exceed this compact viewport. The
+                # visible scroll area must not cover the status bar, and the
+                # final controls must remain reachable by scrolling.
+                self.assertTrue(data["voice_scroll"]["clip"])
+                self.assertLessEqual(data["voice_scroll"]["bottom"], data["global_status_bar"]["y"])
+                self.assertLessEqual(data["voice_scrolled_end"]["bottom"], data["voice_scroll"]["bottom"] + 1)
+                self.assertLessEqual(
+                    voice_items["audioPrerequisiteSection"]["bottom"],
+                    voice_items["voiceProgramSection"]["y"] + 1,
+                )
+                self.assertLessEqual(
+                    voice_items["voiceProgramSection"]["bottom"],
+                    voice_items["voiceTestSection"]["y"] + 1,
+                )
+                self.assertGreaterEqual(
+                    voice_items["voiceProgramCustomPathRow"]["y"],
+                    voice_items["voiceProgramSection"]["y"],
+                )
+                self.assertLessEqual(
+                    voice_items["voiceProgramCustomPathRow"]["bottom"],
+                    voice_items["voiceProgramSection"]["bottom"] + 1,
+                )
+                for section_name, title_name in (
+                    ("audioPrerequisiteSection", "audioPrerequisiteSectionTitle"),
+                    ("voiceProgramSection", "voiceProgramSectionTitle"),
+                    ("voiceTestSection", "voiceTestSectionTitle"),
+                ):
+                    self.assertGreaterEqual(
+                        voice_items[title_name]["y"],
+                        voice_items[section_name]["y"],
+                    )
+                    self.assertLessEqual(
+                        voice_items[title_name]["bottom"],
+                        voice_items[section_name]["bottom"] + 1,
+                    )
+
+                voice_columns = data["voice_columns"]
+                action_columns = list(voice_columns["actions"].values())
+                privacy_state = voice_columns["states"]["microphonePrivacyRow"]
+                state_columns = [
+                    column
+                    for name, column in voice_columns["states"].items()
+                    if name != "microphonePrivacyRow"
+                ]
+                reference_action = action_columns[0]
+                reference_state = state_columns[0]
+                self.assertFalse(privacy_state["visible"])
+                for column in action_columns:
+                    self.assertTrue(column["visible"])
+                    self.assertAlmostEqual(column["x"], reference_action["x"], delta=1)
+                    self.assertAlmostEqual(column["width"], 92, delta=1)
+                for column in state_columns:
+                    self.assertTrue(column["visible"])
+                    self.assertAlmostEqual(column["x"], reference_state["x"], delta=1)
+                    self.assertAlmostEqual(column["width"], 96, delta=1)
+                    self.assertLessEqual(column["right"], reference_action["x"] + 1)
+
+                for control in (
+                    *voice_columns["right_controls"].values(),
+                    *data["voice_provider_actions"].values(),
+                ):
+                    self.assertTrue(control["visible"])
+                    self.assertAlmostEqual(control["x"], reference_action["x"], delta=1)
+                    self.assertAlmostEqual(control["width"], 92, delta=1)
+                    self.assertLessEqual(control["right"], width + 1)
+
+                install_button = voice_columns["left_controls"][
+                    "installVirtualAudioButton"
+                ]
+                self.assertTrue(install_button["visible"])
+                self.assertAlmostEqual(
+                    install_button["x"],
+                    voice_columns["editors"]["endpointCombo"]["x"],
+                    delta=1,
+                )
+                self.assertLessEqual(
+                    install_button["right"], reference_state["x"] + 1
+                )
+
+                editor_map = voice_columns["editors"]
+                editors = list(editor_map.values())
+                for editor in editors:
+                    self.assertTrue(editor["visible"])
+                    self.assertAlmostEqual(editor["x"], editors[0]["x"], delta=1)
+                    self.assertGreaterEqual(editor["width"], 130)
+                    self.assertLessEqual(editor["right"], reference_state["x"] + 1)
+                # Nearby program/shortcut editors form a compact group;
+                # endpoint names and paths retain flexible long fields.
+                self.assertAlmostEqual(
+                    editor_map["voiceProgramCombo"]["width"],
+                    editor_map["holdVoiceHotkeyField"]["width"],
+                    delta=1,
+                )
+                self.assertLessEqual(
+                    voice_columns["left_controls"]["voiceProgramElevatedCheckBox"]["right"],
+                    reference_state["x"] + 1,
+                )
+                self.assertLess(
+                    editor_map["voiceProgramCombo"]["right"],
+                    voice_columns["left_controls"]["voiceProgramElevatedCheckBox"]["x"],
+                )
+                self.assertGreaterEqual(
+                    editor_map["holdVoiceHotkeyField"]["width"],
+                    130,
+                )
+
+class QmlLoadProbeCallsProductionShutdownHelperTests(unittest.TestCase):
+    """A source-level, PySide6-independent regression guard
+    (never touches Qt, matching ``DiagnosticsShutdownOrderingTests``/
+    ``OffscreenQmlLoadTests`` above) that ``_QML_LOAD_PROBE_SCRIPT`` calls
+    the SAME production shutdown helper ``run_settings_window()`` calls
+    right after ``app.exec()`` returns - see that function and
+    ``_shutdown_diagnostics_workers()``'s own docstrings. Without this, a
+    future edit could silently start relying on this module's ``atexit``
+    hook alone again (the exact contract a real Windows CI crash already
+    disproved), or start mocking/skipping the real BLE discovery this probe
+    deliberately still exercises - defeating the whole point of this being
+    a REAL fast-close race reproduction rather than a stand-in for one.
+    """
+
+    def test_probe_script_calls_the_production_shutdown_helper_before_printing_result(self):
+        self.assertIn("m._shutdown_diagnostics_workers()", _QML_LOAD_PROBE_SCRIPT)
+        shutdown_index = _QML_LOAD_PROBE_SCRIPT.index("m._shutdown_diagnostics_workers()")
+        result_index = _QML_LOAD_PROBE_SCRIPT.index("result = {")
+        print_index = _QML_LOAD_PROBE_SCRIPT.index("print(json.dumps(result))")
+
+        self.assertLess(
+            result_index,
+            shutdown_index,
+            "the probe must build its `result` dict from the real QML load "
+            "BEFORE requesting diagnostics-worker shutdown",
+        )
+        self.assertLess(
+            shutdown_index,
+            print_index,
+            "the production shutdown helper must run before the probe prints "
+            "its result and exits, mirroring run_settings_window() calling "
+            "it before returning",
+        )
+
+    def test_probe_script_never_mocks_or_skips_the_real_diagnostics_controller(self):
+        # This probe's entire value is exercising the REAL background BLE
+        # discovery a real DiagnosticsController.__init__() starts - a
+        # future "just make CI green" edit replacing it with a fake/no-op
+        # would silently stop testing the actual crash this task fixed.
+        self.assertIn("DiagnosticsController(controller,", _QML_LOAD_PROBE_SCRIPT)
+        self.assertNotIn("mock", _QML_LOAD_PROBE_SCRIPT.lower())
+
+
+# Real mouse clicks and real key events via QTest, delivered through the
+# ACTUAL QQmlApplicationEngine-loaded main.qml (not a Python-level call to
+# setActionTextAt()) - types a custom chord into the "mic" row's visible
+# ComboBox and clicks "完成" WITHOUT ever pressing Enter, then waits for the
+# automatic disk write. Run in an isolated subprocess (see
+# OffscreenQmlLoadTests/RenderedContrastTests
+# above for the two separate same-process-multi-engine QQC2 limitations
+# this sidesteps); the config file it persists to (LOCALAPPDATA, passed
+# via env by the outer test) is read back by the OUTER test afterward,
+# since that is real state on disk that survives the subprocess exiting.
+_DIRECT_AUTO_SAVE_PROBE_SCRIPT = r"""
+import hashlib
+import json
+import os
+import sys
+import time
+
+from ovb import qt_settings_app as m
+from ovb import remote_layout
+from PySide6.QtCore import (
+    QByteArray, QBuffer, QIODevice, QMetaObject, QObject, QPoint, QPointF, Qt,
+)
+from PySide6.QtGui import QKeySequence
+from PySide6.QtTest import QTest
+
+
+class FakeHotkeyCapture:
+    start_calls = 0
+    stop_calls = 0
+
+    def __init__(self, on_captured, *, accept_injected=False, isolated=False, on_error=None):
+        self.on_captured = on_captured
+        self.accept_injected = accept_injected
+        self.is_running = False
+
+    def start(self):
+        type(self).start_calls += 1
+        self.is_running = True
+
+    def stop(self):
+        type(self).stop_calls += 1
+        self.is_running = False
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def _find_child_by_object_name(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = _find_child_by_object_name(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _select_combo_option(window, app, combo, option_index):
+    indicator_point = combo.mapToScene(
+        QPointF(combo.property("width") - 8, combo.property("height") / 2)
+    ).toPoint()
+    QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, indicator_point)
+    app.processEvents()
+    assert combo.property("down"), "ComboBox popup did not open"
+    QTest.keyClick(window, Qt.Key_Home)
+    for _ in range(option_index):
+        QTest.keyClick(window, Qt.Key_Down)
+    QTest.keyClick(window, Qt.Key_Return)
+    for _ in range(3):
+        window.grabWindow()
+        app.processEvents()
+
+
+def _render(window, app, passes=10):
+    image = None
+    for _ in range(passes):
+        image = window.grabWindow()
+        app.processEvents()
+    return image
+
+
+def _wait_until(window, app, predicate, message, attempts=100):
+    for _ in range(attempts):
+        window.grabWindow()
+        app.processEvents()
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError(message)
+
+
+def _geometry(item):
+    point = item.mapToScene(QPointF(0.0, 0.0))
+    return {
+        "x": float(point.x()),
+        "y": float(point.y()),
+        "width": float(item.property("width")),
+        "height": float(item.property("height")),
+        "visible": bool(item.property("visible")),
+    }
+
+
+def _png_digest(image):
+    encoded = QByteArray()
+    buffer = QBuffer(encoded)
+    assert buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    assert image.save(buffer, "PNG")
+    buffer.close()
+    return hashlib.sha256(bytes(encoded)).hexdigest()
+
+
+def _mapping_snapshot(window, app, model, controller, screenshot_env):
+    QTest.mouseMove(window, QPoint(2, 2))
+    app.processEvents()
+    image = _render(window, app)
+    mapping = _find_child_by_object_name(window, "mappingList")
+    assert mapping is not None
+    origin = mapping.mapToScene(QPointF(0.0, 0.0))
+    cropped = image.copy(
+        int(round(origin.x())),
+        int(round(origin.y())),
+        int(round(mapping.property("width"))),
+        int(round(mapping.property("height"))),
+    )
+    screenshot_path = os.environ.get(screenshot_env, "")
+    if screenshot_path:
+        assert cropped.save(screenshot_path)
+    # The board is whatever the active profile has (Chromecast: 15 keys); a
+    # hardcoded list would look up cards that were never instantiated and
+    # measure None.
+    button_ids = list(remote_layout.button_order(model._profile))
+    return {
+        "mapping": _geometry(mapping),
+        "cards": {
+            button_id: _geometry(
+                _find_child_by_object_name(window, "editMapping_" + button_id)
+            )
+            for button_id in button_ids
+        },
+        "hotspots": {
+            button_id: _geometry(
+                _find_child_by_object_name(window, "photoHotspot_" + button_id)
+            )
+            for button_id in button_ids
+        },
+        "canvases": {
+            name: _geometry(_find_child_by_object_name(window, name))
+            for name in ("mappingLines", "activeMappingLine")
+        },
+        "photo_frame": _geometry(
+            _find_child_by_object_name(window, "photoFrame")
+        ),
+        "selected_button_id": controller.property("selectedButtonId"),
+        "display_map": model.to_display_map(),
+        "secondary_display_map": model.to_secondary_display_map(),
+        "display_note_map": model.to_display_note_map(),
+        "pixel_sha256": _png_digest(cropped),
+    }
+
+
+classes = m._load_qt_classes()
+m.hotkey_capture_windows.HotkeyCapture = FakeHotkeyCapture
+legacy_mapping_path = m.config.key_bindings_path(m.config.config_root())
+legacy_document = m.config.load_key_bindings(legacy_mapping_path)
+legacy_primary = {"kind": "key_combo", "keys": ["vk_a2", "shift"]}
+legacy_secondary = {
+    "double_click": {"kind": "key_combo", "keys": ["vk_11"]},
+    "long_press": {"kind": "key_combo", "keys": ["vk_00"]},
+}
+legacy_document["bindings"]["power"] = legacy_primary
+legacy_document.setdefault("secondary_bindings", {})["power"] = legacy_secondary
+m.config.save_key_bindings(legacy_mapping_path, legacy_document)
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("Basic")
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+# Real Qt Quick Controls delegates (ListView rows in particular) only get
+# their real size/instantiate their children once a real layout+render
+# pass has actually run - under the offscreen platform, plain
+# processEvents() calls alone are not sufficient; grabWindow() (which
+# forces a real frame to be produced) interleaved with processEvents()
+# reliably settles it (confirmed empirically while writing this test - a
+# mapping row's ComboBox does not exist at all, and its ListView reports
+# height 0, without this).
+window.show()
+for _ in range(10):
+    window.grabWindow()
+    app.processEvents()
+
+# Switch to the "按键" tab (index 1) - the ComboBox under test only exists
+# once ButtonsPage is the active StackLayout page.
+tab_bar = _find_child_by_object_name(window, "tabBar")
+assert tab_bar is not None
+tab_bar.setProperty("currentIndex", 1)
+for _ in range(10):
+    window.grabWindow()
+    app.processEvents()
+
+mapping_list = _find_child_by_object_name(window, "mappingList")
+assert mapping_list is not None
+# Follows the active layout (Chromecast: 15 keys) instead of a hardcoded one.
+assert mapping_list.property("count") == model.rowCount()
+assert mapping_list.property("count") > 0
+assert _find_child_by_object_name(window, "toggleVoiceModeButton") is None
+assert _find_child_by_object_name(window, "holdVoiceModeButton") is None
+assert _find_child_by_object_name(window, "toggleVoiceHotkeyField") is None
+
+edit_button = _find_child_by_object_name(window, "editMapping_ok")
+assert edit_button is not None, "mic row's edit button not found - is it in view?"
+edit_center = edit_button.mapToScene(
+    QPointF(edit_button.property("width") / 2, edit_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, edit_center)
+for _ in range(5):
+    window.grabWindow()
+    app.processEvents()
+
+editor = _find_child_by_object_name(window, "actionEditorDialog")
+combo = _find_child_by_object_name(window, "actionEditorPrimaryCombo")
+double_combo = _find_child_by_object_name(window, "actionEditorDoubleCombo")
+long_combo = _find_child_by_object_name(window, "actionEditorLongCombo")
+assert editor is not None and editor.property("visible")
+assert combo is not None and double_combo is not None and long_combo is not None
+assert combo.property("visible")
+assert double_combo.property("visible") and long_combo.property("visible")
+assert int(combo.property("count")) == len(controller.primaryActionOptionsFor("ok"))
+assert int(double_combo.property("count")) == len(controller.secondaryActionOptionsFor("ok"))
+assert int(long_combo.property("count")) == len(controller.longPressActionOptionsFor("ok"))
+assert double_combo.property("enabled") and long_combo.property("enabled")
+assert combo.property("selectTextByMouse")
+assert double_combo.property("selectTextByMouse")
+assert long_combo.property("selectTextByMouse")
+assert combo.property("contentItem").property("selectByMouse")
+assert double_combo.property("contentItem").property("selectByMouse")
+assert long_combo.property("contentItem").property("selectByMouse")
+
+validation_error = _find_child_by_object_name(
+    window,
+    "actionEditorValidationError",
+)
+editor_cancel_button = _find_child_by_object_name(
+    window,
+    "actionEditorCancelButton",
+)
+editor_save_button = _find_child_by_object_name(
+    window,
+    "actionEditorSaveButton",
+)
+assert validation_error is not None
+assert editor_cancel_button is not None and editor_save_button is not None
+
+# Incomplete/invalid text stays quiet until confirmation and remains a draft.
+invalid_center = combo.mapToScene(
+    QPointF(combo.property("width") / 2, combo.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, invalid_center)
+app.processEvents()
+QTest.keySequence(window, QKeySequence.SelectAll)
+for ch in "not_a_key":
+    QTest.keyClick(window, ord(ch))
+    app.processEvents()
+assert not validation_error.property("visible")
+QTest.keyClick(window, Qt.Key_Return)
+_wait_until(
+    window,
+    app,
+    lambda: bool(validation_error.property("visible")),
+    "invalid mapping did not show its dialog error",
+)
+assert validation_error.property("text") == (
+    "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。"
+)
+assert editor_save_button.property("enabled")
+before_invalid_primary = model.to_display_map()["ok"]
+before_invalid_secondary = dict(model.to_secondary_display_map()["ok"])
+assert QMetaObject.invokeMethod(
+    editor,
+    "saveDraft",
+    Qt.ConnectionType.DirectConnection,
+)
+_render(window, app, 3)
+assert editor.property("visible")
+assert model.to_display_map()["ok"] == before_invalid_primary
+assert model.to_secondary_display_map()["ok"] == before_invalid_secondary
+
+cancel_center = editor_cancel_button.mapToScene(
+    QPointF(
+        editor_cancel_button.property("width") / 2,
+        editor_cancel_button.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, cancel_center)
+_wait_until(
+    window,
+    app,
+    lambda: not bool(editor.property("visible")),
+    "cancel did not close the invalid mapping draft",
+)
+assert model.to_display_map()["ok"] == before_invalid_primary
+assert model.to_secondary_display_map()["ok"] == before_invalid_secondary
+
+# Reopening starts from the unchanged model. A legal replacement clears the
+# error later in this same real-user flow and can still be completed normally.
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, edit_center)
+_wait_until(
+    window,
+    app,
+    lambda: bool(editor.property("visible")),
+    "mapping editor did not reopen after cancel",
+)
+assert combo.property("editText") == before_invalid_primary
+assert validation_error.property("text") == ""
+assert editor_save_button.property("enabled")
+
+current_index = int(combo.property("currentIndex"))
+indicator_point = combo.mapToScene(
+    QPointF(combo.property("width") - 8, combo.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, indicator_point)
+for _ in range(5):
+    window.grabWindow()
+    app.processEvents()
+current_option = _find_child_by_object_name(
+    window,
+    "actionEditorPrimaryCombo_option_" + str(current_index),
+)
+assert current_option is not None, "current editor option was not instantiated"
+current_option_label = current_option.property("contentItem")
+current_option_state = {
+    "highlighted": bool(current_option.property("highlighted")),
+    "font_weight": int(current_option_label.property("font").weight()),
+}
+assert current_option_state["highlighted"]
+assert current_option_state["font_weight"] >= 600
+# The row that owns a group header depends on the row being edited: the mic
+# row's list is prefixed with the voice action, an ordinary row's is not. Ask
+# the controller which index starts a group instead of hardcoding one.
+grouped_index = next(
+    index
+    for index, option in enumerate(controller.primaryActionOptionsFor("ok"))
+    if controller.actionOptionStartsGroup(option)
+)
+# The popup opens scrolled to the current row, so a group header above it is
+# laid out off-screen and unclickable. Bring the top of the list into view
+# before measuring it. Qt exposes the popup as a QQuickPopup with no Python
+# converter, so scroll the way a user would instead of reaching into it.
+QTest.keyClick(window, Qt.Key_Home)
+for _ in range(5):
+    window.grabWindow()
+    app.processEvents()
+grouped_option = _find_child_by_object_name(
+    window,
+    "actionEditorPrimaryCombo_option_" + str(grouped_index),
+)
+assert grouped_option is not None
+assert int(grouped_option.property("groupHeaderHeight")) > 0
+before_header_click = (
+    int(combo.property("currentIndex")),
+    str(combo.property("editText")),
+)
+header_point = grouped_option.mapToScene(
+    QPointF(
+        grouped_option.property("width") / 2,
+        grouped_option.property("groupHeaderHeight") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, header_point)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert combo.property("down"), "group header click unexpectedly closed the popup"
+assert (
+    int(combo.property("currentIndex")),
+    str(combo.property("editText")),
+) == before_header_click
+body_point = grouped_option.mapToScene(
+    QPointF(
+        grouped_option.property("width") / 2,
+        grouped_option.property("height") - 4,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, body_point)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert not combo.property("down")
+assert combo.property("editText") == "Escape"
+assert editor.property("primaryText") == "Escape"
+
+# Open the real shortcut recorder, switch from physical capture to manual
+# input, and type a system shortcut without generating Win key events.
+record_button = _find_child_by_object_name(
+    window, "actionEditorPrimaryRecordButton"
+)
+assert record_button is not None
+record_center = record_button.mapToScene(
+    QPointF(
+        record_button.property("width") / 2,
+        record_button.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_center)
+recorder = _find_child_by_object_name(window, "shortcutRecorderDialog")
+assert recorder is not None
+_wait_until(
+    window,
+    app,
+    lambda: bool(recorder.property("visible")) and controller.hotkeyCaptureActive,
+    "shortcut recorder did not start physical capture",
+)
+manual_mode = _find_child_by_object_name(
+    window, "shortcutRecorderManualModeButton"
+)
+manual_field = _find_child_by_object_name(window, "shortcutRecorderManualField")
+manual_confirm = _find_child_by_object_name(
+    window, "shortcutRecorderManualConfirmButton"
+)
+assert manual_mode is not None and manual_field is not None
+assert manual_confirm is not None
+manual_mode_center = manual_mode.mapToScene(
+    QPointF(
+        manual_mode.property("width") / 2,
+        manual_mode.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, manual_mode_center)
+_wait_until(
+    window,
+    app,
+    lambda: not controller.hotkeyCaptureActive,
+    "manual mode did not stop physical capture",
+)
+manual_field_center = manual_field.mapToScene(
+    QPointF(
+        manual_field.property("width") / 2,
+        manual_field.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, manual_field_center)
+for ch in "win+l":
+    QTest.keyClick(window, Qt.Key_Plus if ch == "+" else ord(ch))
+    app.processEvents()
+assert manual_field.property("text") == "win+l"
+manual_screenshot = os.environ.get("OVB_MANUAL_SHORTCUT_SCREENSHOT", "")
+if manual_screenshot:
+    assert _render(window, app).save(manual_screenshot)
+confirm_center = manual_confirm.mapToScene(
+    QPointF(
+        manual_confirm.property("width") / 2,
+        manual_confirm.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, confirm_center)
+_wait_until(
+    window,
+    app,
+    lambda: not bool(recorder.property("visible")),
+    "manual shortcut confirmation did not close the recorder",
+)
+assert combo.property("editText") == "Win + L"
+assert editor.property("primaryText") == "Win + L"
+assert FakeHotkeyCapture.start_calls == 1
+assert FakeHotkeyCapture.stop_calls == 1
+
+# Feed captured key identities through the actual QML recorder. An unsupported
+# key stays in the recorder for correction and cannot replace the draft.
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_center)
+_wait_until(window, app, lambda: controller.hotkeyCaptureReady, "capture not ready")
+controller._on_hotkey_capture_result((controller._input_operation_token, "numpad_enter"))
+_wait_until(window, app, lambda: not controller.hotkeyCaptureActive, "capture did not stop")
+assert recorder.property("visible")
+assert recorder.property("inputMode") == "manual"
+assert "小键盘 Enter" in recorder.property("manualErrorText")
+assert editor.property("primaryText") == "Win + L"
+for invalid, reason in (("Ctrl+A+A", "一个普通键"), ("Ctrl+vk_00", "无效"),
+                        ("Ctrl+小键盘 ←", "NumLock")):
+    manual_field.setProperty("text", invalid)
+    QMetaObject.invokeMethod(recorder, "commitManualShortcut", Qt.ConnectionType.DirectConnection)
+    app.processEvents()
+    assert recorder.property("visible")
+    assert manual_field.property("text") == invalid
+    assert reason in recorder.property("manualErrorText")
+    assert editor.property("primaryText") == "Win + L"
+    assert model.to_display_map()["ok"] == before_invalid_primary
+manual_field.setProperty("text", "lctrl+[")
+QMetaObject.invokeMethod(recorder, "commitManualShortcut", Qt.ConnectionType.DirectConnection)
+_wait_until(window, app, lambda: not recorder.property("visible"), "corrected capture did not close")
+assert combo.property("editText") == "左 Ctrl + ["
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, record_center)
+_wait_until(window, app, lambda: controller.hotkeyCaptureReady, "capture not ready")
+controller._on_hotkey_capture_result((controller._input_operation_token, "lctrl+left_bracket"))
+_wait_until(window, app, lambda: not recorder.property("visible"), "captured bracket did not close")
+assert combo.property("editText") == "左 Ctrl + ["
+assert model.to_display_map()["ok"] == before_invalid_primary
+
+# Choose real preset rows through each visible ComboBox popup. The editable
+# field and backing model must change as soon as the popup activates the row;
+# clicking the dialog's "完成" button is deliberately deferred until after
+# every assertion below.
+assert model.to_display_map()["ok"] == before_invalid_primary
+assert double_combo.property("visible") and long_combo.property("visible")
+
+_select_combo_option(
+    window,
+    app,
+    double_combo,
+    list(controller.secondaryActionOptionsFor("ok")).index("f5"),
+)
+assert double_combo.property("editText") == "F5"
+double_indicator = double_combo.mapToScene(
+    QPointF(double_combo.property("width") - 8, double_combo.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, double_indicator)
+app.processEvents()
+assert double_combo.property("down")
+QTest.keyClick(window, Qt.Key_Home)
+for _ in range(
+    list(controller.secondaryActionOptionsFor("ok")).index("元素导航开关")
+):
+    QTest.keyClick(window, Qt.Key_Down)
+QTest.keyClick(window, Qt.Key_Return)
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert double_combo.property("editText") == "元素导航开关"
+
+_select_combo_option(
+    window,
+    app,
+    double_combo,
+    list(controller.secondaryActionOptionsFor("ok")).index("Escape"),
+)
+assert double_combo.property("editText") == "Escape"
+assert editor.property("doubleText") == "Escape"
+assert model.to_secondary_display_map()["ok"]["double_click"] == ""
+
+_select_combo_option(
+    window,
+    app,
+    long_combo,
+    list(controller.secondaryActionOptionsFor("ok")).index("回车"),
+)
+assert long_combo.property("editText") == "回车"
+assert editor.property("longText") == "回车"
+assert model.to_secondary_display_map()["ok"]["long_press"] == ""
+
+# Real mouse click into the ComboBox's editable text area -
+# forceActiveFocus() on the ComboBox item alone is NOT equivalent (proven
+# while writing this test: it does not hand keyboard focus to the internal
+# editable TextInput the way a real click does).
+center = combo.mapToScene(
+    QPointF(combo.property("width") / 2, combo.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, center)
+app.processEvents()
+assert combo.property("activeFocus"), "click did not focus the ComboBox"
+
+# Select all existing text, then really TYPE the replacement - one real
+# QKeyEvent per character, through the window, exactly as a user's
+# keystrokes would arrive. Lowercase ASCII ordinals (not the Qt.Key_X enum,
+# whose values are the UPPERCASE-letter ASCII codes) so the synthesized
+# text matches real lowercase typing exactly.
+QTest.keySequence(window, QKeySequence.SelectAll)
+app.processEvents()
+typed = "ctrl+shift+["
+canonical = "ctrl+shift+left_bracket"
+for ch in typed:
+    QTest.keyClick(window, Qt.Key_Plus if ch == "+" else ord(ch))
+    app.processEvents()
+
+assert combo.property("editText") == typed
+assert editor.property("primaryText") == typed
+assert model.to_display_map()["ok"] == before_invalid_primary
+for _ in range(3):
+    window.grabWindow()
+    app.processEvents()
+assert double_combo.property("visible") and long_combo.property("visible")
+assert double_combo.property("enabled") and long_combo.property("enabled")
+
+editor_save_button = _find_child_by_object_name(window, "actionEditorSaveButton")
+assert editor_save_button is not None
+done_center = editor_save_button.mapToScene(
+    QPointF(
+        editor_save_button.property("width") / 2,
+        editor_save_button.property("height") / 2,
+    )
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, done_center)
+assert not editor.property("visible")
+assert model.to_display_map()["ok"] == canonical
+assert model.to_secondary_display_map()["ok"]["double_click"] == "Escape"
+assert model.to_secondary_display_map()["ok"]["long_press"] == "回车"
+
+_wait_until(
+    window,
+    app,
+    lambda: not controller.mappingDirty,
+    "mapping edit did not auto-save after clicking 完成",
+)
+saved_view = _mapping_snapshot(
+    window,
+    app,
+    model,
+    controller,
+    "OVB_MAPPING_AFTER_SCREENSHOT",
+)
+
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, edit_center)
+_render(window, app, 3)
+assert combo.property("editText") == "Ctrl + Shift + ["
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, center)
+QTest.keyClick(window, Qt.Key_End)
+QTest.keyClick(window, Qt.Key_Backspace)
+QTest.keyClick(window, Qt.Key_BracketRight)
+assert combo.property("editText") == "Ctrl + Shift + ]"
+assert model.to_display_map()["ok"] == canonical
+QMetaObject.invokeMethod(editor, "close", Qt.ConnectionType.DirectConnection)
+_render(window, app, 3)
+
+assert not controller.settingsDirty
+assert controller.errorMessage == "", f"auto-save reported a validation error: {controller.errorMessage}"
+assert "按键映射已自动保存" in controller.statusMessage
+
+# Opening an old row and clicking Done must keep all three gestures. The
+# unrelated microphone edit above must not have rewritten these values.
+legacy_saved = m.config.load_key_bindings(legacy_mapping_path)
+assert legacy_saved["bindings"]["power"] == legacy_primary
+assert legacy_saved["secondary_bindings"]["power"] == legacy_secondary
+legacy_before = legacy_mapping_path.read_bytes()
+power_edit = _find_child_by_object_name(window, "editMapping_power")
+power_center = power_edit.mapToScene(
+    QPointF(power_edit.property("width") / 2, power_edit.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, power_center)
+_wait_until(window, app, lambda: bool(editor.property("opened")), "legacy editor did not open")
+assert combo.property("editText") == "左 Ctrl（键码 0xA2） + Shift"
+assert double_combo.property("editText") == "Ctrl（键码 0x11）"
+assert long_combo.property("editText") == "vk_00"
+assert editor.property("validationError") == ""
+done_center = editor_save_button.mapToScene(
+    QPointF(editor_save_button.property("width") / 2, editor_save_button.property("height") / 2)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, done_center)
+_wait_until(window, app, lambda: not editor.property("visible"), "legacy editor did not close")
+assert not controller.mappingDirty
+assert legacy_mapping_path.read_bytes() == legacy_before
+
+# The remaining device button must stay enabled so the mapping view is always
+# reachable.
+device_button = _find_child_by_object_name(window, "deviceButton")
+assert device_button is not None
+assert device_button.property("enabled")
+assert _find_child_by_object_name(window, "comboActionEditor_up") is None
+
+print(json.dumps({
+    "saved": saved_view,
+    "current_option": current_option_state,
+    "manual_capture": {
+        "starts": FakeHotkeyCapture.start_calls,
+        "stops": FakeHotkeyCapture.stop_calls,
+    },
+}))
+"""
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class ButtonsPageDirectAutoSaveIntegrationTests(unittest.TestCase):
+    """A REAL Qt/QML interaction test (see
+    ``_DIRECT_AUTO_SAVE_PROBE_SCRIPT`` above) proving a user can type a custom
+    chord through the microphone row's matrix editor and click "完成"
+    WITHOUT ever pressing Enter, then rely on automatic persistence. It also
+    locks the fix15 UI contract: the
+    single host-shortcut field exists, the old lifecycle controls do not, and
+    the editor exposes primary/double/long controls.
+    """
+
+    def test_typed_chord_auto_saves_after_done_with_no_enter_pressed(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            env = dict(os.environ)
+            env.setdefault("QT_QPA_PLATFORM", "offscreen")
+            env["LOCALAPPDATA"] = tmpdir
+            result = subprocess.run(
+                [sys.executable, "-c", _DIRECT_AUTO_SAVE_PROBE_SCRIPT],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"direct auto-save probe subprocess failed: {result.stdout}\n{result.stderr}",
+            )
+            visual = json.loads(result.stdout.strip().splitlines()[-1])
+            self.assertTrue(visual["current_option"]["highlighted"])
+            self.assertGreaterEqual(visual["current_option"]["font_weight"], 600)
+
+            # The real, persisted file - read back from the SAME
+            # LOCALAPPDATA the subprocess wrote to, after it has exited.
+            with mock.patch.dict(os.environ, {"LOCALAPPDATA": tmpdir}):
+                bindings = config.load_key_bindings(
+                    config.key_bindings_path(config.config_root())
+                )
+            action = key_mapping.ButtonAction.from_dict(bindings["bindings"]["ok"])
+            self.assertEqual(action.kind, key_mapping.ActionKind.KEY_COMBO)
+            self.assertEqual(action.keys, ("ctrl", "shift", "left_bracket"))
+            self.assertEqual(
+                visual["manual_capture"],
+                {"starts": 3, "stops": 3},
+            )
+
+
+def _contrast_ratio(luminance_a, luminance_b):
+    """WCAG 2.x contrast ratio (always >= 1.0) between two luminances."""
+
+    lighter, darker = max(luminance_a, luminance_b), min(luminance_a, luminance_b)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+# Renders the REAL main.qml with the REAL "FluentWinUI3" style in a fresh,
+# throwaway subprocess and prints one JSON line with the darkest-pixel
+# luminance and corner-background luminance sampled inside each of three
+# controls (see RenderedContrastTests below for why this must be a
+# SEPARATE process rather than sharing one with the rest of this test
+# file's Qt-loading tests): QQuickStyle is a process-global, set-once
+# setting - once any OTHER test in this file has loaded Qt Quick Controls
+# QML with "Basic" (or any other style), a later attempt to set
+# "FluentWinUI3" in the SAME process either has no effect or raises
+# "QQuickStyle::setStyle() must be called before loading QML that imports
+# Qt Quick Controls 2." (both reproduced while writing this test).
+_CONTRAST_PROBE_SCRIPT = r"""
+import json
+import sys
+
+from ovb import qt_settings_app as m
+from PySide6.QtCore import QPointF, QObject
+
+
+def _linearize(c):
+    c = c / 255.0
+    return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def _luminance(color):
+    return 0.2126 * _linearize(color.red()) + 0.7152 * _linearize(color.green()) + 0.0722 * _linearize(color.blue())
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def _find(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = _find(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle("FluentWinUI3")
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+if len(engine.rootObjects()) != 1:
+    print(json.dumps({"error": "main.qml failed to load"}))
+    sys.exit(1)
+
+window = engine.rootObjects()[0]
+window.show()
+
+
+def render():
+    for _ in range(10):
+        window.grabWindow()
+        app.processEvents()
+    return window.grabWindow()
+
+
+def sample_control(results, image, object_name):
+    item = _find(window, object_name)
+    if item is None:
+        print(json.dumps({"error": object_name + " not found"}))
+        sys.exit(1)
+    assert item.property("visible"), object_name + " must be visible before pixel sampling"
+    margin = 3
+    corner = item.mapToScene(QPointF(1, 1))
+    background_luminance = _luminance(image.pixelColor(int(corner.x()), int(corner.y())))
+    top_left = item.mapToScene(QPointF(margin, margin))
+    width = int(item.property("width") - 2 * margin)
+    height = int(item.property("height") - 2 * margin)
+    x0, y0 = int(top_left.x()), int(top_left.y())
+    darkest = 1.0
+    for x in range(x0, x0 + width):
+        for y in range(y0, y0 + height):
+            luminance = _luminance(image.pixelColor(x, y))
+            if luminance < darkest:
+                darkest = luminance
+    results[object_name] = {"background": background_luminance, "darkest": darkest}
+
+
+results = {}
+image = render()
+sample_control(results, image, "deviceTabButton")
+
+tab_bar = _find(window, "tabBar")
+if tab_bar is None:
+    print(json.dumps({"error": "tabBar not found"}))
+    sys.exit(1)
+tab_bar.setProperty("currentIndex", 1)
+image = render()
+sample_control(results, image, "restoreMappingDefaultsButton")
+
+controller._replace_voice_program_settings(dict(controller._voice_program_settings, provider="custom"))
+tab_bar.setProperty("currentIndex", 2)
+image = render()
+sample_control(results, image, "holdVoiceHotkeyField")
+
+print(json.dumps(results))
+"""
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class RenderedContrastTests(unittest.TestCase):
+    """Renders the REAL main.qml with the REAL
+    "FluentWinUI3" style (in an isolated subprocess - see
+    ``_CONTRAST_PROBE_SCRIPT`` above for why) and asserts a real, measured
+    WCAG contrast ratio between each sampled control's own background and
+    its darkest rendered pixel - not merely "zero QML warnings" (which the
+    white-on-light regression this fixes produced zero of; a rendering bug
+    is not a QML error). Calibrated against the actual pre-fix regression:
+    removing ``main.qml``'s explicit ``palette.*`` bindings (see that
+    file's own module docstring for why they are needed) reproduces a
+    measured contrast ratio of exactly 1.00 (the "text" is pixel-identical
+    to the background - completely invisible) on every one of the three
+    controls checked here; this test's threshold (3.0) sits far below the
+    actual fixed measurement (18+) and far above the broken one (1.00), so
+    it cannot pass by accident either way.
+    """
+
+    _MIN_CONTRAST_RATIO = 3.0
+    _LABELS = {
+        "deviceTabButton": "「设备」tab label",
+        "restoreMappingDefaultsButton": "「恢复内置默认」button",
+        "holdVoiceHotkeyField": "语音按键 TextField",
+    }
+
+    def test_tab_button_plain_button_and_text_field_are_all_readable(self):
+        import json
+        import subprocess
+
+        env = dict(os.environ)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env["LOCALAPPDATA"] = tempfile.mkdtemp()
+        result = subprocess.run(
+            [sys.executable, "-c", _CONTRAST_PROBE_SCRIPT],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"contrast probe subprocess failed: {result.stdout}\n{result.stderr}",
+        )
+        last_line = result.stdout.strip().splitlines()[-1]
+        data = json.loads(last_line)
+        self.assertNotIn("error", data, data.get("error"))
+
+        for object_name, label in self._LABELS.items():
+            measurement = data[object_name]
+            ratio = _contrast_ratio(measurement["background"], measurement["darkest"])
+            self.assertGreaterEqual(
+                ratio,
+                self._MIN_CONTRAST_RATIO,
+                f"{label} contrast ratio {ratio:.2f} is below "
+                f"{self._MIN_CONTRAST_RATIO} - text is not reliably "
+                "readable against its own background",
+            )
+
+
+# Proves, against the real rendered ButtonsPage, that the compact left/right
+# card board remains contained, keeps three equal gesture cells, and shares
+# selection with the calibrated product photo.
+_MAPPING_CARD_BOARD_PROBE_SCRIPT = r"""
+import json
+import os
+
+from ovb import qt_settings_app as m, remote_layout
+from PySide6.QtCore import QMetaObject, QPoint, QPointF, Qt
+from PySide6.QtTest import QTest
+
+
+try:
+    from shiboken6 import getCppPointer as _qml_cpp_pointer
+except ImportError:
+    _qml_cpp_pointer = None
+
+_QML_INDEX = {}
+
+
+def _qml_node_key(node):
+    # C++ pointer, not id(): PySide wrappers are transient and ids recycle.
+    if _qml_cpp_pointer is None:
+        return id(node)
+    try:
+        return _qml_cpp_pointer(node)[0]
+    except Exception:
+        return id(node)
+
+
+def _qml_build_index(root):
+    index = {}
+    stack = [root]
+    seen = set()
+    while stack:
+        node = stack.pop()
+        key = _qml_node_key(node)
+        if key in seen:
+            continue
+        seen.add(key)
+        name = node.objectName()
+        if name and name not in index:
+            index[name] = node
+        children = list(node.children())
+        child_items = getattr(node, "childItems", None)
+        if callable(child_items):
+            children.extend(child_items())
+        stack.extend(reversed(children))
+    return index
+
+
+def _qml_reindex(root):
+    index = _qml_build_index(root)
+    _QML_INDEX[_qml_node_key(root)] = index
+    return index
+
+
+def _qml_lookup(root, name):
+    index = _QML_INDEX.get(_qml_node_key(root))
+    if index is None:
+        index = _qml_reindex(root)
+    node = index.get(name)
+    if node is None:
+        # Never cache a miss: QML creates delegates lazily.
+        return _qml_reindex(root).get(name)
+    try:
+        node.objectName()
+    except RuntimeError:
+        # QML deleted it (dialogs rebuild delegates): walk again.
+        node = _qml_reindex(root).get(name)
+    return node
+
+
+def _find(root, name):
+    return _qml_lookup(root, name)
+    children = list(root.children())
+    child_items = getattr(root, "childItems", None)
+    if callable(child_items):
+        children.extend(child for child in child_items() if child not in children)
+    for child in children:
+        if child.objectName() == name:
+            return child
+        found = _find(child, name)
+        if found is not None:
+            return found
+    return None
+
+
+def _render(window, app, count=10):
+    for _ in range(count):
+        window.grabWindow()
+        app.processEvents()
+
+
+def _geometry(item):
+    assert item is not None
+    position = item.mapToScene(QPointF(0.0, 0.0))
+    width = float(item.property("width"))
+    height = float(item.property("height"))
+    return {
+        "x": position.x(),
+        "y": position.y(),
+        "width": width,
+        "height": height,
+        "right": position.x() + width,
+        "bottom": position.y() + height,
+        "visible": bool(item.property("visible")),
+    }
+
+
+def _scroll_card_into_view(window, app, flickable, item):
+    # The 15-key Chromecast board is taller than the minimum window, so the
+    # last row starts below the fold. QTest clicks at real window coordinates,
+    # and a click outside the viewport hits nothing - scroll the Flickable the
+    # way a user would before clicking, so every viewport behaves alike.
+    top = item.mapToScene(QPointF(0.0, 0.0)).y()
+    bottom = top + float(item.property("height"))
+    view_top = flickable.mapToScene(QPointF(0.0, 0.0)).y()
+    view_bottom = view_top + float(flickable.property("height"))
+    if bottom <= view_bottom:
+        return
+    content_y = float(flickable.property("contentY"))
+    flickable.setProperty("contentY", content_y + (bottom - view_bottom))
+    _render(window, app, 5)
+
+
+classes = m._load_qt_classes()
+QGuiApplication = classes["QGuiApplication"]
+QQmlApplicationEngine = classes["QQmlApplicationEngine"]
+QQuickStyle = classes["QQuickStyle"]
+QUrl = classes["QUrl"]
+qmlRegisterSingletonInstance = classes["qmlRegisterSingletonInstance"]
+ButtonMappingModel = classes["ButtonMappingModel"]
+SettingsController = classes["SettingsController"]
+DiagnosticsController = classes["DiagnosticsController"]
+
+QQuickStyle.setStyle(os.environ["OVB_TEST_STYLE"])
+app = QGuiApplication.instance() or QGuiApplication([])
+model = ButtonMappingModel()
+controller = SettingsController(model)
+diagnostics_controller = DiagnosticsController(controller, m.config.config_root())
+qmlRegisterSingletonInstance(SettingsController, "OvbSettings", 1, 0, "SettingsController", controller)
+qmlRegisterSingletonInstance(ButtonMappingModel, "OvbSettings", 1, 0, "ButtonMappingModel", model)
+qmlRegisterSingletonInstance(DiagnosticsController, "OvbSettings", 1, 0, "DiagnosticsController", diagnostics_controller)
+
+engine = QQmlApplicationEngine()
+qml_dir = m._qml_directory()
+engine.addImportPath(str(qml_dir))
+engine.load(QUrl.fromLocalFile(str(qml_dir / "main.qml")))
+assert len(engine.rootObjects()) == 1, "main.qml failed to load"
+window = engine.rootObjects()[0]
+window.setProperty("width", int(os.environ["OVB_TEST_VIEWPORT_WIDTH"]))
+window.setProperty("height", int(os.environ["OVB_TEST_VIEWPORT_HEIGHT"]))
+window.show()
+_render(window, app)
+
+# Switch to the "按键" page so all mapping-card delegates lay out.
+tab_bar = _find(window, "tabBar")
+assert tab_bar is not None
+tab_bar.setProperty("currentIndex", 1)
+_render(window, app)
+
+mapping_list = _find(window, "mappingList")
+actions_panel = _find(window, "mappingActionsPanel")
+view_switcher = _find(window, "mappingViewSwitcher")
+device_button = _find(window, "deviceButton")
+mapping_lines = _find(window, "mappingLines")
+active_mapping_line = _find(window, "activeMappingLine")
+left_cards = _find(window, "leftMappingCards")
+right_cards = _find(window, "rightMappingCards")
+photo_sidebar = _find(window, "photoSidebar")
+photo_frame = _find(window, "photoFrame")
+photo_image = _find(window, "photoImage")
+assert mapping_list is not None, "mappingList not found"
+assert actions_panel is not None
+assert view_switcher is not None
+assert device_button is not None
+assert mapping_lines is not None and active_mapping_line is not None
+assert left_cards is not None and right_cards is not None
+assert photo_sidebar is not None, "photoSidebar not found"
+assert photo_frame is not None and photo_frame.property("visible"), "photoFrame not visible"
+assert photo_image is not None and photo_image.property("visible"), "photoImage not visible"
+# Row ids come from the model, so this probe follows the shipped 15-key
+# Chromecast board instead of any hardcoded key list.
+_button_id_role = ButtonMappingModel.ButtonIdRole
+card_ids = tuple(
+    str(model.data(model.index(row, 0), _button_id_role))
+    for row in range(model.rowCount())
+)
+assert card_ids, "mapping model is empty"
+assert mapping_list.property("count") == len(card_ids), (card_ids, mapping_list.property("count"))
+assert mapping_list.property("visible")
+assert device_button.property("highlighted")
+assert device_button.property("enabled")
+
+for _ in range(100):
+    if photo_image.property("paintedWidth") > 0 and photo_image.property("paintedHeight") > 0:
+        break
+    QTest.qWait(20)
+    _render(window, app, 1)
+assert photo_image.property("paintedWidth") > 0, "photo did not paint"
+
+cards = {button_id: _find(window, "editMapping_" + button_id) for button_id in card_ids}
+assert all(item is not None and item.property("visible") for item in cards.values())
+# Scroll once, up front: the photo sidebar scrolls with the cards (both live
+# inside the same Flickable), so every geometry below has to be read in one
+# consistent scroll position - and the click later needs the row on screen.
+_scroll_card_into_view(window, app, mapping_list, cards["power"])
+single_key_title = _find(window, "mappingKeyCell_power")
+assert single_key_title is not None and single_key_title.property("visible")
+hotspots = {
+    button_id: _find(window, "photoHotspot_" + button_id)
+    for button_id in card_ids
+}
+assert all(item is not None and item.property("visible") for item in hotspots.values())
+power_column_names = {
+    "key": "mappingKeyCell_power",
+    "single": "mappingSingleCell_power",
+    "double": "mappingDoubleCell_power",
+    "long": "mappingLongCell_power",
+}
+power_columns = {
+    key: _geometry(_find(window, object_name))
+    for key, object_name in power_column_names.items()
+}
+value_names = {
+    "single": "mappingSinglePrimaryText_power",
+    "double": "mappingDoublePrimaryText_power",
+    "long": "mappingLongPrimaryText_power",
+}
+value_baselines = {}
+value_geometries = {}
+for key, object_name in value_names.items():
+    item = _find(window, object_name)
+    assert item is not None, object_name
+    position = item.mapToScene(QPointF(0.0, 0.0))
+    value_baselines[key] = position.y() + float(item.property("baselineOffset"))
+    value_geometries[key] = _geometry(item)
+
+power_card = cards["power"]
+click_point = power_card.mapToScene(
+    QPointF(power_card.property("width") / 2.0, power_card.property("height") / 2.0)
+).toPoint()
+QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, click_point)
+_render(window, app, 5)
+
+power_hotspot = _find(window, "photoHotspot_power")
+ok_hotspot = _find(window, "photoHotspot_ok")
+power_marker = _find(window, "photoHotspotMarker_power")
+ok_marker = _find(window, "photoHotspotMarker_ok")
+editor = _find(window, "actionEditorDialog")
+assert power_hotspot is not None, "Power photo hotspot not found"
+assert ok_hotspot is not None, "OK photo hotspot not found"
+assert power_marker is not None, "Power photo marker not found"
+assert ok_marker is not None, "OK photo marker not found"
+assert editor is not None
+primary_title = _find(window, "actionEditorPrimaryTitle")
+primary_combo = _find(window, "actionEditorPrimaryCombo")
+assert primary_title is not None and primary_combo is not None
+primary_title_center = primary_title.mapToScene(QPointF(
+    primary_title.property("width") / 2.0,
+    primary_title.property("height") / 2.0,
+)).toPoint()
+QTest.mouseMove(window, primary_title_center)
+QTest.qWait(520)
+_render(window, app, 5)
+primary_help_background = _find(window, "actionEditorPrimaryHelp_background")
+assert primary_help_background is not None
+primary_help_geometry = {
+    "tooltip": _geometry(primary_help_background),
+    "input": _geometry(primary_combo),
+}
+editor_screenshot = os.environ.get("OVB_MAPPING_EDITOR_SCREENSHOT")
+if editor_screenshot:
+    _render(window, app, 2)
+    assert window.grabWindow().save(editor_screenshot)
+
+QTest.mouseMove(window, QPoint(2, 2))
+primary_combo.setProperty("editText", "not_a_key")
+assert QMetaObject.invokeMethod(editor, "saveDraft", Qt.ConnectionType.DirectConnection)
+_render(window, app, 5)
+validation_error = _find(window, "actionEditorValidationError")
+editor_cancel_button = _find(window, "actionEditorCancelButton")
+editor_save_button = _find(window, "actionEditorSaveButton")
+assert validation_error is not None
+assert editor_cancel_button is not None and editor_save_button is not None
+assert validation_error.property("visible")
+assert validation_error.property("text") == (
+    "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。"
+)
+assert editor_save_button.property("enabled")
+
+power_layout = remote_layout.hotspot_for("power")
+assert power_layout is not None
+letterbox_x = (photo_image.property("width") - photo_image.property("paintedWidth")) / 2.0
+letterbox_y = (photo_image.property("height") - photo_image.property("paintedHeight")) / 2.0
+expected_power_center = photo_image.mapToScene(QPointF(
+    letterbox_x + power_layout.x * photo_image.property("paintedWidth"),
+    letterbox_y + power_layout.y * photo_image.property("paintedHeight"),
+))
+actual_power_center = power_hotspot.mapToScene(QPointF(
+    power_hotspot.property("width") / 2.0,
+    power_hotspot.property("height") / 2.0,
+))
+
+results_out = {
+    "card_ids": list(card_ids),
+    "card_count": sum(bool(item.property("visible")) for item in cards.values()),
+    "selected_after_power_click": controller.property("selectedButtonId"),
+    "editor_visible": bool(editor.property("visible")),
+    "primary_help": primary_help_geometry,
+    "editor_error": {
+        "dialog": {
+            "x": float(editor.property("x")),
+            "y": float(editor.property("y")),
+            "width": float(editor.property("width")),
+            "height": float(editor.property("height")),
+            "bottom": (
+                float(editor.property("y")) + float(editor.property("height"))
+            ),
+        },
+        "message": _geometry(validation_error),
+        "cancel": _geometry(editor_cancel_button),
+        "save_enabled": bool(editor_save_button.property("enabled")),
+        "text": str(validation_error.property("text")),
+    },
+    "view_switcher": _geometry(view_switcher),
+    "device_track": {
+        "current": _geometry(device_button),
+        "current_text": str(device_button.property("text")),
+        "current_highlighted": bool(device_button.property("highlighted")),
+    },
+    "actions_panel": _geometry(actions_panel),
+    "mapping_list": _geometry(mapping_list),
+    "canvases": {
+        "base": _geometry(mapping_lines),
+        "active": _geometry(active_mapping_line),
+    },
+    "left_cards": _geometry(left_cards),
+    "right_cards": _geometry(right_cards),
+    "cards": {button_id: _geometry(item) for button_id, item in cards.items()},
+    "power_columns": power_columns,
+    "value_baselines": value_baselines,
+    "value_geometries": value_geometries,
+    "photo": {
+        "sidebar": _geometry(photo_sidebar),
+        "frame": _geometry(photo_frame),
+        "painted_width": photo_image.property("paintedWidth"),
+        "painted_height": photo_image.property("paintedHeight"),
+        "power_marker_visible": power_marker.property("visible"),
+        "ok_marker_visible": ok_marker.property("visible"),
+        "hotspots": {
+            button_id: _geometry(item)
+            for button_id, item in hotspots.items()
+        },
+        "power_center_error_x": actual_power_center.x() - expected_power_center.x(),
+        "power_center_error_y": actual_power_center.y() - expected_power_center.y(),
+    },
+    "viewport_width": window.property("width"),
+    "viewport_height": window.property("height"),
+    # The 15-key Chromecast board is taller than the minimum window, so the
+    # board legitimately scrolls. Report how far the probe scrolled it: the
+    # fit assertions below are about the board fitting horizontally and about
+    # nothing being clipped that scrolling cannot reach.
+    "board_scrolled": float(mapping_list.property("contentY")),
+    "board_content_height": float(mapping_list.property("contentHeight")),
+}
+controller.shutdownBackgroundTasks()
+m._shutdown_diagnostics_workers()
+print(json.dumps(results_out))
+"""
+
+
+@unittest.skipUnless(_HAS_PYSIDE6, _SKIP_REASON)
+class ButtonsPageMappingCardTests(unittest.TestCase):
+    """The compact card board, photo marker, and real editor stay connected."""
+
+    def _run_probe(self, width=1024, height=720, style="Basic"):
+        import json
+        import subprocess
+
+        env = dict(os.environ)
+        env.setdefault("QT_QPA_PLATFORM", "offscreen")
+        env["LOCALAPPDATA"] = tempfile.mkdtemp()
+        env["OVB_TEST_VIEWPORT_WIDTH"] = str(width)
+        env["OVB_TEST_VIEWPORT_HEIGHT"] = str(height)
+        env["OVB_TEST_STYLE"] = style
+        result = subprocess.run(
+            [sys.executable, "-c", _MAPPING_CARD_BOARD_PROBE_SCRIPT],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"mapping card probe subprocess failed: {result.stdout}\n{result.stderr}",
+        )
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_board_renders_every_mapping_card(self):
+        # The board follows the active layout (Chromecast: 15 keys), so assert
+        # against the model's own rows instead of a hardcoded count.
+        data = self._run_probe(720, 500)
+        self.assertGreater(len(data["card_ids"]), 0)
+        self.assertEqual(sorted(data["cards"]), sorted(data["card_ids"]))
+        self.assertEqual(data["card_count"], len(data["card_ids"]))
+        self.assertTrue(data["actions_panel"]["visible"])
+        self.assertTrue(data["canvases"]["base"]["visible"])
+        self.assertTrue(data["canvases"]["active"]["visible"])
+
+    def test_real_click_on_power_card_selects_power_and_opens_editor(self):
+        data = self._run_probe(720, 500)
+        self.assertEqual(
+            data["selected_after_power_click"],
+            "power",
+            "a real QTest click on the Power card did not select Power",
+        )
+        self.assertTrue(data["editor_visible"])
+
+    def test_editor_help_tooltip_is_compact_and_does_not_cover_the_input(self):
+        for style in ("Basic", "FluentWinUI3"):
+            with self.subTest(style=style):
+                data = self._run_probe(720, 500, style)
+                tooltip = data["primary_help"]["tooltip"]
+                action_input = data["primary_help"]["input"]
+                self.assertTrue(tooltip["visible"])
+                self.assertLessEqual(tooltip["width"], 274)
+                self.assertLessEqual(tooltip["bottom"], action_input["y"])
+
+    def test_editor_error_fits_above_buttons_in_the_minimum_window(self):
+        for style in ("Basic", "FluentWinUI3"):
+            with self.subTest(style=style):
+                data = self._run_probe(720, 500, style)
+                error = data["editor_error"]
+                self.assertEqual(
+                    error["text"],
+                    "单击：不认识按键“not_a_key”，请检查键名或使用按键录入。",
+                )
+                self.assertTrue(error["save_enabled"])
+                self.assertTrue(error["message"]["visible"])
+                self.assertLessEqual(
+                    error["message"]["bottom"],
+                    error["cancel"]["y"],
+                )
+                self.assertGreaterEqual(error["dialog"]["y"], 0)
+                self.assertLessEqual(
+                    error["dialog"]["bottom"],
+                    data["viewport_height"],
+                )
+
+    def test_selected_power_is_marked_at_its_calibrated_photo_position(self):
+        data = self._run_probe(720, 500)
+        self.assertTrue(data["photo"]["power_marker_visible"])
+        self.assertFalse(data["photo"]["ok_marker_visible"])
+        self.assertAlmostEqual(data["photo"]["power_center_error_x"], 0, delta=1)
+        self.assertAlmostEqual(data["photo"]["power_center_error_y"], 0, delta=1)
+
+    def test_curved_connector_routes_stay_ordered_without_overlap(self):
+        data = self._run_probe(720, 500)
+        cards = data["cards"]
+        hotspots = data["photo"]["hotspots"]
+        # Two visual columns discovered from geometry rather than hardcoded
+        # groups, so this follows whatever buttons the shipped board has.
+        columns = {}
+        for button_id, geometry in cards.items():
+            columns.setdefault(round(float(geometry["x"]), 1), []).append(button_id)
+        self.assertEqual(len(columns), 2, f"expected two card columns, got {sorted(columns)}")
+        groups = tuple(
+            tuple(sorted(members, key=lambda button_id: cards[button_id]["y"]))
+            for _x, members in sorted(columns.items())
+        )
+
+        def route_for(button_id, left_side):
+            card = cards[button_id]
+            hotspot = hotspots[button_id]
+            start_x = card["right"] if left_side else card["x"]
+            start_y = card["y"] + card["height"] / 2
+            end_x = hotspot["x"] + hotspot["width"] / 2
+            end_y = hotspot["y"] + hotspot["height"] / 2
+            span = abs(end_x - start_x)
+            preferred = max(12, min(72, span * 0.56))
+            radius = min(preferred, span * 0.48)
+            direction = 1 if left_side else -1
+            return (
+                (start_x, start_y),
+                (start_x + direction * radius, start_y),
+                (end_x - direction * radius, end_y),
+                (end_x, end_y),
+            )
+
+        def point_at(route, t):
+            one_minus_t = 1 - t
+            weights = (
+                one_minus_t ** 3,
+                3 * one_minus_t * one_minus_t * t,
+                3 * one_minus_t * t * t,
+                t ** 3,
+            )
+            return (
+                sum(point[0] * weight for point, weight in zip(route, weights)),
+                sum(point[1] * weight for point, weight in zip(route, weights)),
+            )
+
+        def y_at_x(route, x):
+            increasing = route[-1][0] >= route[0][0]
+            low = 0.0
+            high = 1.0
+            for _ in range(30):
+                t = (low + high) / 2
+                current_x = point_at(route, t)[0]
+                if (current_x < x) == increasing:
+                    low = t
+                else:
+                    high = t
+            return point_at(route, (low + high) / 2)[1]
+
+        for column_index, button_ids in enumerate(groups):
+            left_side = column_index == 0
+            routes = [route_for(button_id, left_side) for button_id in button_ids]
+            for first_route, second_route in zip(routes, routes[1:]):
+                low_x = max(
+                    min(point[0] for point in first_route),
+                    min(point[0] for point in second_route),
+                )
+                high_x = min(
+                    max(point[0] for point in first_route),
+                    max(point[0] for point in second_route),
+                )
+                self.assertLess(low_x, high_x)
+                for step in range(101):
+                    x = low_x + (high_x - low_x) * step / 100
+                    self.assertLess(
+                        y_at_x(first_route, x),
+                        y_at_x(second_route, x),
+                    )
+
+        right_hotspot = hotspots["right"]
+        ok_hotspot = hotspots["ok"]
+        right_center = right_hotspot["y"] + right_hotspot["height"] / 2
+        ok_center = ok_hotspot["y"] + ok_hotspot["height"] / 2
+        self.assertAlmostEqual(right_center, ok_center, delta=1)
+        self.assertNotAlmostEqual(right_hotspot["right"], ok_hotspot["right"], delta=1)
+        board = data["mapping_list"]
+        # The 15-key Chromecast board is taller than the minimum window (8 rows
+        # of >=48px cards plus gaps exceed the 353px the 640x480 viewport gives
+        # it), so it scrolls - that is what the Flickable's vertical ScrollBar
+        # is for. The canvases are children of the Flickable, so they span the
+        # whole scrollable content, not just the viewport.
+        scrolled = data["board_scrolled"]
+        content_top = board["y"] - scrolled
+        content_bottom = content_top + data["board_content_height"]
+        for canvas in data["canvases"].values():
+            self.assertAlmostEqual(canvas["x"], board["x"], delta=1)
+            self.assertAlmostEqual(canvas["y"], content_top, delta=1)
+            self.assertAlmostEqual(canvas["right"], board["right"], delta=1)
+            self.assertAlmostEqual(canvas["bottom"], content_bottom, delta=1)
+
+    def test_board_fits_default_minimum_and_large_windows(self):
+        viewports = (
+            ("Basic", 720, 500),
+            ("Basic", 640, 480),
+            ("FluentWinUI3", 720, 500),
+            ("FluentWinUI3", 640, 480),
+            ("FluentWinUI3", 840, 720),
+        )
+        for style, width, height in viewports:
+            data = self._run_probe(width, height, style)
+            self.assertAlmostEqual(data["photo"]["sidebar"]["width"], 114, delta=0.5)
+            self.assertLessEqual(data["mapping_list"]["right"], width + 1)
+            self.assertLessEqual(data["actions_panel"]["right"], width + 1)
+            self.assertLessEqual(
+                data["view_switcher"]["bottom"], data["mapping_list"]["y"] + 1
+            )
+            self.assertLessEqual(data["mapping_list"]["bottom"], data["actions_panel"]["y"] + 1)
+            self.assertEqual(
+                data["device_track"]["current_text"], "谷歌 Chromecast 遥控器"
+            )
+            self.assertTrue(data["device_track"]["current_highlighted"])
+            self.assertLess(data["left_cards"]["x"], data["photo"]["sidebar"]["x"])
+            self.assertLess(data["photo"]["sidebar"]["x"], data["right_cards"]["x"])
+            # The board may scroll at the minimum window; what must hold is
+            # that the content is tall enough to reach the lowest card, so
+            # nothing is unreachable, and that at a viewport tall enough for
+            # the whole board nothing scrolls at all.
+            scrolled = data["board_scrolled"]
+            content_top = data["mapping_list"]["y"] - scrolled
+            content_bottom = content_top + data["board_content_height"]
+            view_height = data["mapping_list"]["bottom"] - data["mapping_list"]["y"]
+            for card_column in (data["left_cards"], data["right_cards"]):
+                self.assertGreaterEqual(card_column["y"], content_top - 1)
+                self.assertLessEqual(card_column["bottom"], content_bottom + 1)
+            if data["board_content_height"] <= view_height + 1:
+                # e.g. 840x720: the whole board fits, so it must not scroll
+                # and every card must be on screen without scrolling.
+                self.assertAlmostEqual(scrolled, 0, delta=1)
+                for card in data["cards"].values():
+                    self.assertLessEqual(
+                        card["bottom"], data["mapping_list"]["bottom"] + 1
+                    )
+            for card in data["cards"].values():
+                self.assertGreaterEqual(card["height"], 48)
+                self.assertLessEqual(card["height"], 50)
+                self.assertLessEqual(card["right"], width + 1)
+                self.assertLessEqual(card["bottom"], height + 1)
+    def test_power_card_gesture_cells_are_equal_and_aligned(self):
+        for style, width, height in (("Basic", 720, 500), ("Basic", 640, 480), ("FluentWinUI3", 720, 500)):
+            data = self._run_probe(width, height, style)
+            columns = data["power_columns"]
+            for left, right in (("single", "double"), ("double", "long")):
+                self.assertAlmostEqual(columns[left]["width"], columns[right]["width"], delta=1)
+                self.assertLessEqual(columns[left]["right"], columns[right]["x"] + 1)
+            baselines = data["value_baselines"]
+            self.assertAlmostEqual(baselines["single"], baselines["double"], delta=1)
+            self.assertAlmostEqual(baselines["double"], baselines["long"], delta=1)
+            power_card = data["cards"]["power"]
+            for item in data["value_geometries"].values():
+                self.assertGreaterEqual(item["y"], power_card["y"] - 1)
+                self.assertLessEqual(item["bottom"], power_card["bottom"] + 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

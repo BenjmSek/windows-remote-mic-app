@@ -1,0 +1,200 @@
+"""Real QML selection/path/startup workflow; temporary config, no host launch."""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from tests.test_hid_runtime_upgrade_qml import _SETUP
+
+
+_PROBE = _SETUP.replace('QQuickStyle.setStyle("Basic")',
+                       'QQuickStyle.setStyle(os.environ.get("VOICE_SELECTION_STYLE", "Basic"))') + r'''
+from PySide6.QtCore import QMetaObject, Q_ARG
+from unittest import mock
+# Only the shipped profile exists, so the read-only "record mode" row that
+# the retired profile used to show is gone from the page entirely - this run
+# exercises the shipped profile through the real UI.
+controller._config["remote_selection"] = {
+    "schema": 1, "active": "b" * 64,
+    "devices": [{"key": "b" * 64, "profile": "chromecast-remote"}],
+}
+controller.remoteSelectionChanged.emit()
+controller.selectedDeviceChanged.emit()
+render(window, app)
+find(window, "bridgeStatusRefreshTimer").setProperty("running", False)
+find(window, "tabBar").setProperty("currentIndex", 2)
+window.setProperty("width", 640)
+window.setProperty("height", 480)
+render(window, app)
+assert find(window, "remoteRecordingModeRow").property("visible")
+combo = find(window, "voiceProgramCombo")
+assert combo.property("count") == 4
+assert combo.property("currentIndex") == -1, (combo.property("currentIndex"), controller.selectedVoiceProgramIndex)
+assert combo.property("displayText") == "请选择语音程序"
+assert not find(window, "voiceHotkeyRow").property("visible")
+assert not find(window, "voiceProgramAutoStartRow").property("visible")
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 4))
+assert controller.selectedVoiceProgramIndex == 0
+
+def choose(index, provider):
+    assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, index))
+    wait_for_voice_hotkey_idle(controller, app)
+    render(window, app)
+    assert controller._voice_program_settings["provider"] == provider
+    assert combo.property("currentIndex") == index
+
+choose(0, "sogou")
+switch = find(window, "voiceProgramAutoStartSwitch")
+assert not switch.property("visible")
+assert controller.voiceProgramLaunchOnBridgeStart
+for provider_index, provider in ((0, "sogou"), (1, "wetype"), (2, "doubao_ime")):
+    choose(provider_index, provider)
+    section = find(window, "voiceProgramSection")
+    row = find(window, "voiceHotkeyRow")
+    assert row.property("visible") and row.height() > 0
+    assert row.y() + row.height() <= section.height() + 1
+    for name in ("refreshVoiceHotkeyButton", "recordVoiceHotkeyButton"):
+        assert find(window, name).property("visible"), (provider, name)
+choose(3, "chatterfly")
+assert find(window, "voiceHotkeyRow").property("visible")
+assert find(window, "refreshVoiceHotkeyButton").property("visible")
+assert find(window, "recordVoiceHotkeyButton").property("visible")
+assert find(window, "openVoiceProgramSettingsButton").property("visible")
+choose(1, "wetype")
+assert not switch.property("visible")
+choose(2, "doubao_ime")
+assert not switch.property("visible")
+# Restore an existing configuration; the custom entry cannot be newly selected.
+def load_legacy_custom():
+    saved = dict(controller._config)
+    saved["voice_program"] = dict(controller._voice_program_settings, provider="custom")
+    m.config.save_config(m.config.config_path(m.config.config_root()), saved)
+    before = m.config.config_path(m.config.config_root()).read_bytes()
+    controller._config = m.config.load_config(m.config.config_path(m.config.config_root()))
+    controller._replace_voice_program_settings(controller._config["voice_program"])
+    render(window, app)
+    assert combo.property("currentIndex") == -1
+    assert combo.property("displayText") == "自定义程序（旧）"
+    assert combo.property("count") == 4
+    assert m.config.config_path(m.config.config_root()).read_bytes() == before
+
+load_legacy_custom()
+notice = find(window, "legacyVoiceProgramNotice")
+assert notice.property("visible") and not notice.property("truncated")
+# The seeded retired id migrates to the shipped Chromecast profile, so the
+# custom program is already the unsupported variant from the first render.
+assert "此旧配置不能用于谷歌语音" in notice.property("text")
+assert switch.property("visible")
+switch.setProperty("checked", True)
+assert QMetaObject.invokeMethod(switch, "toggled")
+switch.setProperty("checked", False)
+assert QMetaObject.invokeMethod(switch, "toggled")
+assert not controller.voiceProgramLaunchOnBridgeStart
+field = find(window, "voiceProgramCustomPathField")
+assert not field.property("readOnly")
+# A scratch file stands in for the custom program; using the config root
+# itself would leave a stray "voice test.exe" beside the real settings.
+import tempfile
+path = Path(tempfile.mkdtemp(prefix="voice-program-")) / "voice test.exe"
+path.parent.mkdir(parents=True, exist_ok=True)
+path.touch()
+field.setProperty("text", '"' + str(path) + '"')
+assert QMetaObject.invokeMethod(field, "editingFinished")
+render(window, app)
+assert controller.voiceProgramCustomPath == str(path)
+field.setProperty("text", str(path) + " --argument")
+assert QMetaObject.invokeMethod(field, "editingFinished")
+render(window, app)
+assert controller.voiceProgramCustomPath == str(path)
+assert field.property("text") == str(path)
+image_dir = os.environ.get("VOICE_SELECTION_SCREENSHOTS")
+if image_dir:
+    image_path = Path(image_dir)
+    image_path.mkdir(parents=True, exist_ok=True)
+    window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + ".png")))
+choose(0, "sogou")
+assert controller.voiceProgramLaunchOnBridgeStart
+assert QMetaObject.invokeMethod(combo, "activated", Q_ARG(int, 4))
+assert controller.selectedVoiceProgramIndex == 1
+load_legacy_custom()
+assert not controller.voiceProgramLaunchOnBridgeStart
+
+controller._config["remote_selection"] = {"schema": 1, "active": "a" * 64,
+    "devices": [{"key": "a" * 64, "profile": "chromecast-remote"}]}
+controller.remoteSelectionChanged.emit()
+controller.selectedDeviceChanged.emit()
+controller._voice_program_status_code = "running"
+controller.voiceProgramStatusCodeChanged.emit()
+render(window, app)
+assert find(window, "remoteRecordingModeRow").property("visible")
+row = find(window, "voiceProgramSelectionRow")
+assert row.property("stateText") == "尚未接通"
+assert "此旧配置不能用于谷歌语音" in notice.property("text")
+assert notice.property("visible") and not notice.property("truncated")
+editor_bounds = geometry(find(window, "voiceProgramSelectionRow_editorColumn"))
+permission_bounds = geometry(find(window, "voiceProgramElevatedCheckBox"))
+assert permission_bounds["right"] <= editor_bounds["right"] + 1, (editor_bounds, permission_bounds)
+assert notice.y() + notice.height() <= row.y() + 1
+if image_dir:
+    window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + "-unsupported.png")))
+# The current page remains usable at minimum width; horizontal overflow must
+# not hide the provider, permission option or custom path behind other columns.
+for name in ("voiceProgramCombo", "voiceProgramElevatedCheckBox"):
+    item = find(window, name)
+    bounds = geometry(item)
+    assert bounds["x"] >= 0 and bounds["right"] <= window.property("width"), (name, bounds)
+load_legacy_custom()
+assert not notice.property("truncated")
+if image_dir:
+    window.grabWindow().save(str(image_path / (os.environ["VOICE_SELECTION_STYLE"] + "-custom-unsupported.png")))
+choose(1, "wetype")
+assert not notice.property("visible")
+assert row.property("stateText") != "尚未接通"
+choose(2, "doubao_ime")
+assert controller.remoteRecordingModeIndex == 0
+assert row.property("stateText") != "尚未接通"
+controller.setRemoteRecordingPreferences(1, controller.remoteRecordingLimitIndex)
+render(window, app)
+assert row.property("stateText") != "尚未接通"
+assert row.property("descriptionText") == ""
+assert find(window, "remoteRecordingModeRow").property("descriptionText") == "按一下开始，再按结束；到时或操作键盘也会结束"
+assert find(window, "refreshVoiceHotkeyButton").property("enabled")
+assert find(window, "recordVoiceHotkeyButton").property("enabled")
+choose(3, "chatterfly")
+assert row.property("stateText") != "尚未接通"
+assert find(window, "refreshVoiceHotkeyButton").property("visible")
+
+# Re-selecting the same shipped profile re-renders the page without stealing
+# focus and without writing the config or restarting as a render side effect.
+config_path = m.config.config_path(m.config.config_root())
+config_before = config_path.read_bytes()
+controller.remoteSelectionChanged.emit()
+controller.selectedDeviceChanged.emit()
+with mock.patch.object(m.config, "save_config_and_load", wraps=m.config.save_config_and_load) as save, \
+        mock.patch.object(controller, "_start_bridge_process") as restart:
+    render(window, app)
+    recording_row = find(window, "remoteRecordingModeRow")
+    assert recording_row.property("visible")
+    assert not recording_row.property("activeFocus")
+    save.assert_not_called()
+    restart.assert_not_called()
+assert config_path.read_bytes() == config_before
+print(json.dumps({"warnings": [str(w) for w in warnings]}))
+window.hide()
+m._shutdown_diagnostics_workers()
+'''
+
+
+class VoiceProgramSelectionQmlTests(unittest.TestCase):
+    def test_real_selection_and_custom_path_controls(self):
+        for style in ("Basic", "Fusion", "FluentWinUI3"):
+            with self.subTest(style=style), tempfile.TemporaryDirectory() as root:
+                env = dict(os.environ, LOCALAPPDATA=root, QT_QPA_PLATFORM="offscreen",
+                           QT_SCALE_FACTOR="1.5", VOICE_SELECTION_STYLE=style)
+                result = subprocess.run([sys.executable, "-B", "-c", _PROBE],
+                                        env=env, capture_output=True, text=True,
+                                        errors="replace", timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1])["warnings"], [])

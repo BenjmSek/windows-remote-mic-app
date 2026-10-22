@@ -1,0 +1,13 @@
+* text=auto eol=lf
+
+# Preserve third-party license texts without treating upstream spacing as a project error.
+THIRD_PARTY_LICENSES/** -whitespace
+
+# The shipped device profile is data read at runtime, not code; keep LF anyway.
+config/chromecast-remote.json text eol=lf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.ico binary
+*.xz binary
+*.pdb binary

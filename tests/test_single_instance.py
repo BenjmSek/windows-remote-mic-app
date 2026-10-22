@@ -1,0 +1,1392 @@
+"""Exercises bridge/settings mutex and settings-window activation contracts
+with injected fake Win32 callables, so it runs on any OS without
+needing ``ctypes.windll`` (which does not exist off Windows) - the same
+dependency-injection seam win32_input.py's ``_sender`` parameter already
+established (see that module's docstring). ``BridgeInstanceGuard`` itself
+never calls ``_require_windows()`` - only the real ``_real_*`` functions do
+- so an injected fake exercises the full acquire/duplicate/release logic
+without fighting the platform gate (see single_instance.py's docstring).
+"""
+
+import ctypes
+from tests.source_contract import source_text
+import json
+import sys
+import tempfile
+import unittest
+from ctypes import wintypes
+from pathlib import Path
+
+from ovb import single_instance
+
+
+class _FakeMutexRegistry:
+    """Simulates a single named-mutex kernel object shared across multiple
+    "process" launches within one test: the first ``create_mutex()`` call
+    creates it (handle, last_error=0 - no prior owner); every subsequent
+    call returns a NEW handle but reports ``ERROR_ALREADY_EXISTS``,
+    matching real Win32 ``CreateMutexW`` semantics closely enough to
+    exercise ``BridgeInstanceGuard`` without any real OS mutex. Handle and
+    last-error are always returned TOGETHER from one call, mirroring the
+    atomic ``MutexCreationResult`` contract.
+    """
+
+    def __init__(self):
+        self._exists = False
+        self._next_handle = 1000
+        self.create_calls = []
+        self.release_calls = []
+        self.close_calls = []
+
+    def create_mutex(self, name):
+        self.create_calls.append(name)
+        handle = self._next_handle
+        self._next_handle += 1
+        last_error = single_instance._ERROR_ALREADY_EXISTS if self._exists else 0
+        self._exists = True
+        return single_instance.MutexCreationResult(handle=handle, last_error=last_error)
+
+    def release_mutex(self, handle):
+        self.release_calls.append(handle)
+        return True
+
+    def close_handle(self, handle):
+        self.close_calls.append(handle)
+        return True
+
+    def guard(self):
+        return single_instance.BridgeInstanceGuard(
+            _create_mutex=self.create_mutex,
+            _release_mutex=self.release_mutex,
+            _close_handle=self.close_handle,
+        )
+
+
+class BridgeInstanceGuardAcquisitionTests(unittest.TestCase):
+    def test_first_owner_acquires_successfully(self):
+        registry = _FakeMutexRegistry()
+        with registry.guard() as guard:
+            self.assertIsNotNone(guard)
+        self.assertEqual(len(registry.create_calls), 1)
+
+    def test_uses_a_local_session_scoped_mutex_name_by_default(self):
+        registry = _FakeMutexRegistry()
+        with registry.guard():
+            pass
+        self.assertTrue(registry.create_calls[0].startswith("Local\\"))
+
+    def test_first_owner_releases_then_closes_on_clean_exit(self):
+        registry = _FakeMutexRegistry()
+        with registry.guard():
+            pass
+        self.assertEqual(len(registry.release_calls), 1)
+        self.assertEqual(len(registry.close_calls), 1)
+        self.assertEqual(registry.release_calls[0], registry.close_calls[0])
+
+    def test_release_happens_before_close_deterministically(self):
+        order = []
+        registry = _FakeMutexRegistry()
+
+        def release(handle):
+            order.append(("release", handle))
+            return True
+
+        def close(handle):
+            order.append(("close", handle))
+            return True
+
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=release,
+            _close_handle=close,
+        )
+        with guard:
+            pass
+        self.assertEqual([kind for kind, _handle in order], ["release", "close"])
+
+    def test_first_owner_releases_even_when_the_wrapped_body_raises(self):
+        registry = _FakeMutexRegistry()
+        with self.assertRaises(RuntimeError):
+            with registry.guard():
+                raise RuntimeError("simulated app startup failure")
+        self.assertEqual(len(registry.release_calls), 1)
+        self.assertEqual(len(registry.close_calls), 1)
+
+    def test_close_still_runs_if_release_itself_raises(self):
+        registry = _FakeMutexRegistry()
+
+        def failing_release(handle):
+            raise OSError("simulated ReleaseMutex failure")
+
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=failing_release,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        self.assertEqual(len(registry.close_calls), 1)
+        self.assertIn("ReleaseMutex raised", str(ctx.exception))
+
+
+class BridgeInstanceGuardCleanupFailureObservabilityTests(unittest.TestCase):
+    """ReleaseMutex/CloseHandle returning FALSE (not just raising) must
+    become observable, both individually and when a body exception is also
+    in flight (which must take priority).
+    """
+
+    def test_release_returning_false_raises_mutex_cleanup_error(self):
+        registry = _FakeMutexRegistry()
+        registry.release_mutex = lambda handle: False
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        self.assertIn("ReleaseMutex returned FALSE", str(ctx.exception))
+        # Close must still have been attempted despite release's failure.
+        self.assertEqual(len(registry.close_calls), 1)
+
+    def test_close_returning_false_raises_mutex_cleanup_error(self):
+        registry = _FakeMutexRegistry()
+        registry.close_handle = lambda handle: False
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        self.assertIn("CloseHandle returned FALSE", str(ctx.exception))
+
+    def test_release_and_close_both_returning_false_reports_both(self):
+        # Matches the review's own adversarial probe shape:
+        # [('release', False), ('close', False)] must not complete silently.
+        registry = _FakeMutexRegistry()
+        registry.release_mutex = lambda handle: False
+        registry.close_handle = lambda handle: False
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        message = str(ctx.exception)
+        self.assertIn("ReleaseMutex returned FALSE", message)
+        self.assertIn("CloseHandle returned FALSE", message)
+
+    def test_a_body_exception_becomes_the_cleanup_errors_context_not_discarded(self):
+        # The previous version only raised MutexCleanupError when the body
+        # did NOT also raise, which meant a cleanup failure was silently
+        # accepted whenever a body
+        # exception happened to already be in flight - itself a "BOOL
+        # cleanup failures are silently accepted" instance. __exit__ now
+        # ALWAYS raises MutexCleanupError on a cleanup failure; Python's
+        # implicit exception chaining (PEP 3134) preserves the body's
+        # original exception as __context__ rather than discarding it, so
+        # both the cleanup failure and the original app failure remain
+        # observable - a caller can always recover the original via
+        # ``exc.__context__``.
+        registry = _FakeMutexRegistry()
+
+        def release(handle):
+            registry.release_calls.append(handle)
+            return False
+
+        def close(handle):
+            registry.close_calls.append(handle)
+            return False
+
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=release,
+            _close_handle=close,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                raise RuntimeError("simulated app startup failure")
+
+        self.assertIsInstance(ctx.exception.__context__, RuntimeError)
+        self.assertEqual(str(ctx.exception.__context__), "simulated app startup failure")
+        self.assertIn("ReleaseMutex returned FALSE", str(ctx.exception))
+        self.assertIn("CloseHandle returned FALSE", str(ctx.exception))
+        # Cleanup was still attempted (best-effort) despite the body's
+        # failure - both steps ran exactly once.
+        self.assertEqual(len(registry.release_calls), 1)
+        self.assertEqual(len(registry.close_calls), 1)
+
+    def test_cleanup_failure_message_never_contains_the_raw_handle_value(self):
+        plausible_handle = 0x0000_0140_0000_1000
+        registry = _FakeMutexRegistry()
+        registry._next_handle = plausible_handle
+        registry.release_mutex = lambda handle: False
+        registry.close_handle = lambda handle: False
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        message = str(ctx.exception)
+        self.assertNotIn(str(plausible_handle), message)
+        self.assertNotIn(hex(plausible_handle), message)
+        self.assertNotIn(f"{plausible_handle:x}", message)
+
+    def test_release_exception_text_is_never_included_in_the_failure_message(self):
+        # _safe_release() used to interpolate str(exc) directly into its
+        # diagnostic string, which could itself contain a raw
+        # handle/address (e.g. a real WinError
+        # message quoting the value ReleaseMutex was called with). Only a
+        # FIXED diagnostic string may appear now - never the injected
+        # exception's own text.
+        plausible_handle = 0x0000_0140_0000_1000
+
+        def release(handle):
+            raise RuntimeError(
+                f"simulated failure referencing handle {plausible_handle} "
+                f"(0x{plausible_handle:x})"
+            )
+
+        registry = _FakeMutexRegistry()
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=release,
+            _close_handle=registry.close_handle,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        message = str(ctx.exception)
+        self.assertIn("ReleaseMutex raised an exception", message)
+        self.assertNotIn(str(plausible_handle), message)
+        self.assertNotIn(hex(plausible_handle), message)
+        self.assertNotIn(f"{plausible_handle:x}", message)
+
+    def test_close_exception_text_is_never_included_in_the_failure_message(self):
+        plausible_handle = 0x0000_0140_0000_1000
+
+        def close(handle):
+            raise RuntimeError(
+                f"simulated failure referencing handle {plausible_handle} "
+                f"(0x{plausible_handle:x})"
+            )
+
+        registry = _FakeMutexRegistry()
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=close,
+        )
+        with self.assertRaises(single_instance.MutexCleanupError) as ctx:
+            with guard:
+                pass
+        message = str(ctx.exception)
+        self.assertIn("CloseHandle raised an exception", message)
+        self.assertNotIn(str(plausible_handle), message)
+        self.assertNotIn(hex(plausible_handle), message)
+        self.assertNotIn(f"{plausible_handle:x}", message)
+
+
+class BridgeInstanceGuardDuplicateTests(unittest.TestCase):
+    def test_two_concurrent_launches_cannot_both_own_the_mutex(self):
+        registry = _FakeMutexRegistry()
+        with registry.guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with registry.guard():
+                    self.fail("the duplicate guard's body must never run")
+
+    def test_duplicate_closes_its_own_handle_but_never_releases_it(self):
+        registry = _FakeMutexRegistry()
+        with registry.guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with registry.guard():
+                    pass
+        # First owner: 1 release + 1 close. Duplicate: 1 close, 0 release.
+        self.assertEqual(len(registry.release_calls), 1)
+        self.assertEqual(len(registry.close_calls), 2)
+
+    def test_duplicate_close_failure_is_folded_into_the_duplicate_error_not_raised_separately(self):
+        # A failed close of the duplicate's own probe handle must not
+        # replace the primary DuplicateInstanceError signal, but must still
+        # be
+        # observable in its message. Only the DUPLICATE guard's close is
+        # made to fail here - the first owner's own guard (registry.guard())
+        # uses the registry's normal, always-succeeding close/release, so
+        # this isolates the failure to exactly the path under test.
+        registry = _FakeMutexRegistry()
+        duplicate_close_calls = []
+
+        def always_failing_close(handle):
+            duplicate_close_calls.append(handle)
+            return False
+
+        with registry.guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError) as ctx:
+                with single_instance.BridgeInstanceGuard(
+                    _create_mutex=registry.create_mutex,
+                    _release_mutex=registry.release_mutex,
+                    _close_handle=always_failing_close,
+                ):
+                    self.fail("the duplicate guard's body must never run")
+        self.assertEqual(len(duplicate_close_calls), 1)
+        self.assertIn("无线麦Mod", str(ctx.exception))
+        self.assertIn("CloseHandle returned FALSE", str(ctx.exception))
+
+    def test_duplicate_error_message_never_contains_the_raw_handle_value(self):
+        # DoD 4: "no raw address/handle is persisted or logged". Use a
+        # large, plausible-pointer-sized handle value (same idea as
+        # _PLAUSIBLE_X64_HANDLE) so an accidental leak would be
+        # unambiguously detectable in either decimal or hex form.
+        plausible_handle = 0x0000_0140_0000_1000
+        registry = _FakeMutexRegistry()
+        registry._next_handle = plausible_handle
+        with registry.guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError) as ctx:
+                with registry.guard():
+                    pass
+        message = str(ctx.exception)
+        self.assertNotIn(str(plausible_handle), message)
+        self.assertNotIn(hex(plausible_handle), message)
+        self.assertNotIn(f"{plausible_handle:x}", message)
+
+
+class BridgeInstanceGuardAcquisitionFailureTests(unittest.TestCase):
+    def test_null_handle_raises_unavailable_error(self):
+        def failing_create(_name):
+            return single_instance.MutexCreationResult(handle=0, last_error=5)  # ERROR_ACCESS_DENIED
+
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=failing_create,
+            _release_mutex=lambda h: True,
+            _close_handle=lambda h: True,
+        )
+        with self.assertRaises(single_instance.SingleInstanceUnavailableError):
+            with guard:
+                self.fail("must not enter on acquisition failure")
+
+    def test_acquisition_failure_message_never_contains_a_raw_handle_value(self):
+        guard = single_instance.BridgeInstanceGuard(
+            _create_mutex=lambda _name: single_instance.MutexCreationResult(handle=0, last_error=5),
+            _release_mutex=lambda h: True,
+            _close_handle=lambda h: True,
+        )
+        with self.assertRaises(single_instance.SingleInstanceUnavailableError) as ctx:
+            with guard:
+                pass
+        # The failure message may legitimately mention the small Win32
+        # error CODE (5), but never a handle value - there is none here,
+        # since a failed CreateMutexW returns NULL/0.
+        self.assertIn("5", str(ctx.exception))
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "only exercises the off-Windows _require_windows() gate; on a real "
+        "Windows runner the real guard should acquire successfully instead",
+    )
+    def test_default_real_implementation_is_unavailable_off_windows(self):
+        # No injected fakes: exercises the REAL _real_create_mutex, which
+        # calls _require_windows() first - on this non-Windows test host it
+        # must raise before ever touching ctypes.windll (which does not
+        # exist here).
+        with self.assertRaises(single_instance.SingleInstanceUnavailableError):
+            with single_instance.BridgeInstanceGuard():
+                self.fail("must not enter off Windows")
+
+
+class SettingsInstanceGuardTests(unittest.TestCase):
+    def test_settings_uses_a_distinct_local_mutex(self):
+        registry = _FakeMutexRegistry()
+        with single_instance.SettingsInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        ):
+            pass
+
+        self.assertTrue(registry.create_calls[0].startswith("Local\\"))
+        self.assertNotEqual(registry.create_calls[0], single_instance._MUTEX_NAME)
+
+    def test_second_settings_launch_cannot_enter(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.SettingsInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("duplicate settings launch must never enter")
+
+    def test_access_denied_is_treated_as_an_existing_settings_instance(self):
+        guard = single_instance.SettingsInstanceGuard(
+            _create_mutex=lambda _name: single_instance.MutexCreationResult(
+                handle=0,
+                last_error=single_instance._ERROR_ACCESS_DENIED,
+            ),
+            _release_mutex=lambda _handle: True,
+            _close_handle=lambda _handle: True,
+        )
+        with self.assertRaises(single_instance.DuplicateInstanceError):
+            with guard:
+                self.fail("an inaccessible existing settings mutex must block a duplicate")
+
+    def test_settings_guard_does_not_publish_exit_capability_before_window_ready(self):
+        create_calls = []
+        release_calls = []
+        close_calls = []
+
+        def create(name):
+            create_calls.append(name)
+            return single_instance.MutexCreationResult(
+                handle=1000 + len(create_calls), last_error=0
+            )
+
+        with single_instance.SettingsInstanceGuard(
+            _create_mutex=create,
+            _release_mutex=lambda handle: release_calls.append(handle) or True,
+            _close_handle=lambda handle: close_calls.append(handle) or True,
+        ):
+            self.assertEqual(create_calls, [single_instance._SETTINGS_MUTEX_NAME])
+
+        self.assertEqual(release_calls, [1001])
+        self.assertEqual(close_calls, [1001])
+
+
+class ApplicationRuntimeInstanceGuardTests(unittest.TestCase):
+    def test_runtime_identity_changes_with_version_or_location(self):
+        first = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Apps\无线麦Mod win版 1.0.51-candidate.51.exe",
+            version="1.0.0",
+        )
+        same = single_instance.application_runtime_mutex_name(
+            executable_path=r"c:\apps\无线麦Mod win版 1.0.51-candidate.51.exe",
+            version="1.0.0",
+        )
+        other_version = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Apps\无线麦Mod win版 1.0.51-candidate.51.exe",
+            version="1.0.1",
+        )
+        other_location = single_instance.application_runtime_mutex_name(
+            executable_path=r"C:\Portable\无线麦Mod win版 1.0.51-candidate.51.exe",
+            version="1.0.0",
+        )
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, other_version)
+        self.assertNotEqual(first, other_location)
+        self.assertTrue(first.startswith("Local\\"))
+        self.assertNotIn("Apps", first)
+
+    def test_runtime_window_property_uses_the_same_private_identity(self):
+        first = single_instance.application_runtime_window_property(
+            executable_path=r"C:\Apps\无线麦Mod win版 1.0.51-candidate.51.exe",
+            version="1.0.0",
+        )
+        same = single_instance.application_runtime_window_property(
+            executable_path=r"c:\apps\无线麦Mod win版 1.0.51-candidate.51.exe",
+            version="1.0.0",
+        )
+        other_location = single_instance.application_runtime_window_property(
+            executable_path=r"C:\Portable\无线麦Mod win版 1.0.51-candidate.51.exe",
+            version="1.0.0",
+        )
+
+        self.assertEqual(first, same)
+        self.assertNotEqual(first, other_location)
+        self.assertTrue(first.startswith(single_instance._SETTINGS_WINDOW_PROPERTY + "."))
+        self.assertNotIn("Apps", first)
+
+    def test_runtime_guard_blocks_a_second_waiter_or_owner_of_the_same_copy(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationRuntimeInstanceGuard(
+                name=r"Local\RemoteMicGoogle_Runtime_test",
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("the same runtime must have only one owner or waiter")
+
+    def test_handoff_confirmation_is_concise_and_names_the_clicked_version(self):
+        calls = []
+
+        result = single_instance.confirm_application_handoff(
+            "0.2.0-candidate.7",
+            _confirm=lambda title, message: calls.append((title, message)) or True,
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(len(calls), 1)
+        title, message = calls[0]
+        self.assertEqual(title, "无线麦Mod 0.2.0-candidate.7")
+        self.assertEqual(
+            message,
+            "旧版正在运行。\n\n"
+            "是否退出旧版并打开当前版本？",
+        )
+
+    def test_only_one_cross_version_handoff_guard_can_enter(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationHandoffInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("only one version handoff may wait at a time")
+
+    def test_only_one_full_exit_sender_can_enter_per_session(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ApplicationExitRequestGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("exit senders must not overwrite each other")
+
+    def test_installer_maintenance_mutex_is_global(self):
+        self.assertEqual(
+            single_instance._INSTALLER_MAINTENANCE_MUTEX_NAME,
+            r"Global\RemoteMicGoogle_InstallerMaintenance",
+        )
+
+class ElementNavigationInstanceGuardTests(unittest.TestCase):
+    def test_element_navigation_uses_a_distinct_local_mutex(self):
+        registry = _FakeMutexRegistry()
+        with single_instance.ElementNavigationInstanceGuard(
+            _create_mutex=registry.create_mutex,
+            _release_mutex=registry.release_mutex,
+            _close_handle=registry.close_handle,
+        ):
+            pass
+
+        name = registry.create_calls[0]
+        self.assertTrue(name.startswith("Local\\"))
+        self.assertNotEqual(name, single_instance._MUTEX_NAME)
+        self.assertNotEqual(name, single_instance._SETTINGS_MUTEX_NAME)
+
+    def test_second_element_navigation_launch_cannot_enter(self):
+        registry = _FakeMutexRegistry()
+
+        def guard():
+            return single_instance.ElementNavigationInstanceGuard(
+                _create_mutex=registry.create_mutex,
+                _release_mutex=registry.release_mutex,
+                _close_handle=registry.close_handle,
+            )
+
+        with guard():
+            with self.assertRaises(single_instance.DuplicateInstanceError):
+                with guard():
+                    self.fail("duplicate element navigation launch must never enter")
+
+    def test_access_denied_is_treated_as_an_existing_navigation_instance(self):
+        guard = single_instance.ElementNavigationInstanceGuard(
+            _create_mutex=lambda _name: single_instance.MutexCreationResult(
+                handle=0,
+                last_error=single_instance._ERROR_ACCESS_DENIED,
+            ),
+            _release_mutex=lambda _handle: True,
+            _close_handle=lambda _handle: True,
+        )
+        with self.assertRaises(single_instance.DuplicateInstanceError):
+            with guard:
+                self.fail("an inaccessible navigation mutex must block a duplicate")
+
+
+class SettingsWindowActivationTests(unittest.TestCase):
+    def test_marks_the_native_window_with_the_shared_private_property(self):
+        calls = []
+        marked = single_instance.mark_settings_window(
+            321,
+            _set_property=lambda hwnd, name: calls.append((hwnd, name)) or True,
+        )
+
+        self.assertTrue(marked)
+        self.assertEqual(
+            calls,
+            [
+                (321, single_instance._SETTINGS_WINDOW_PROPERTY),
+                (321, single_instance.application_runtime_window_property()),
+                (
+                    321,
+                    single_instance._SETTINGS_WINDOW_RESTORE_CAPABILITY_PROPERTY,
+                ),
+                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY_V2),
+                (321, single_instance._APPLICATION_EXIT_CAPABILITY_PROPERTY),
+                (
+                    321,
+                    single_instance._APPLICATION_EXIT_WINDOW_SIGNAL_CAPABILITY_PROPERTY,
+                ),
+            ],
+        )
+
+    def test_marker_failure_does_not_block_the_first_window(self):
+        self.assertFalse(
+            single_instance.mark_settings_window(
+                321,
+                _set_property=lambda _hwnd, _name: (_ for _ in ()).throw(OSError()),
+            )
+        )
+
+    def test_restore_request_is_consumed_once_from_the_settings_hwnd(self):
+        calls = []
+
+        self.assertTrue(
+            single_instance.consume_settings_window_restore_request(
+                321,
+                _remove_property=lambda hwnd, name: (
+                    calls.append((hwnd, name)) or 1
+                ),
+            )
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    321,
+                    single_instance._SETTINGS_WINDOW_RESTORE_REQUEST_PROPERTY,
+                )
+            ],
+        )
+
+    def test_restore_request_probe_failure_is_safe(self):
+        self.assertFalse(
+            single_instance.consume_settings_window_restore_request(
+                321,
+                _remove_property=lambda _hwnd, _name: (
+                    (_ for _ in ()).throw(OSError("unavailable"))
+                ),
+            )
+        )
+
+    def test_duplicate_activation_uses_the_same_private_property(self):
+        calls = []
+        activated = single_instance.activate_existing_settings_window(
+            _activate=lambda name: calls.append(name) or True
+        )
+
+        self.assertTrue(activated)
+        self.assertEqual(calls, [single_instance._SETTINGS_WINDOW_PROPERTY])
+
+    def test_current_runtime_activation_uses_the_runtime_private_property(self):
+        calls = []
+        activated = single_instance.activate_current_runtime_settings_window(
+            _activate=lambda name: calls.append(name) or True
+        )
+
+        self.assertTrue(activated)
+        self.assertEqual(
+            calls,
+            [single_instance.application_runtime_window_property()],
+        )
+
+    def test_current_runtime_real_activation_requires_the_qt_restore_path(self):
+        source = source_text(
+            single_instance._real_request_marked_window_restore
+        )
+        self.assertIn("_require_restore_request=True", source)
+
+    def test_activation_failure_is_best_effort_and_nonfatal(self):
+        self.assertFalse(
+            single_instance.activate_existing_settings_window(
+                _activate=lambda _name: (_ for _ in ()).throw(OSError())
+            )
+        )
+
+
+class ShowBridgeStartupBlockedNoticeTests(unittest.TestCase):
+    def test_calls_the_injected_message_box_with_title_and_message(self):
+        calls = []
+
+        def fake_message_box(title, message):
+            calls.append((title, message))
+            return 1
+
+        single_instance.show_bridge_startup_blocked_notice(
+            "custom duplicate message", _message_box=fake_message_box
+        )
+        self.assertEqual(len(calls), 1)
+        title, message = calls[0]
+        self.assertEqual(title, "无线麦Mod")
+        self.assertEqual(message, "custom duplicate message")
+
+    def test_falls_back_to_stderr_when_the_message_box_itself_fails(self):
+        def failing_message_box(_title, _message):
+            raise OSError("simulated MessageBoxW failure")
+
+        # Must not raise - this is a best-effort user notice, not a
+        # resource-ownership operation.
+        single_instance.show_bridge_startup_blocked_notice(
+            "unavailable case", _message_box=failing_message_box
+        )
+
+
+class BridgeStartRequestTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_fresh_request_is_consumed_exactly_once(self):
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+    def test_stale_or_invalid_request_is_discarded(self):
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+        self.assertFalse(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 131.0,
+            )
+        )
+
+        path = single_instance.bridge_start_request_path(self.root)
+        path.write_text(
+            json.dumps({"schema": 1, "action": "other"}),
+            encoding="utf-8",
+        )
+        self.assertFalse(single_instance.consume_bridge_start_request(self.root))
+        self.assertFalse(path.exists())
+
+    def test_session_bridge_requests_do_not_cross_sessions(self):
+        first = single_instance.write_bridge_start_request(
+            self.root,
+            session_id=11,
+            session_scoped=True,
+        )
+        second = single_instance.write_bridge_start_request(
+            self.root,
+            session_id=22,
+            session_scoped=True,
+        )
+
+        self.assertNotEqual(first, second)
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(second.exists())
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                session_id=22,
+                session_scoped=True,
+            )
+        )
+
+
+class ApplicationExitRequestTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_window_exit_request_is_consumed_once_from_the_settings_hwnd(self):
+        removed = []
+        request_values = iter((731, 0))
+
+        def remove_property(hwnd, property_name):
+            removed.append((hwnd, property_name))
+            if property_name == single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY:
+                return next(request_values)
+            return 0
+
+        self.assertEqual(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=remove_property,
+            ),
+            731,
+        )
+        self.assertIsNone(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=remove_property,
+            )
+        )
+        self.assertEqual(
+            removed,
+            [
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY),
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REJECTED_PROPERTY),
+                (321, single_instance._APPLICATION_EXIT_WINDOW_REQUEST_PROPERTY),
+            ],
+        )
+
+    def test_window_exit_request_probe_failure_is_safe(self):
+        self.assertFalse(
+            single_instance.consume_settings_window_exit_request(
+                321,
+                _remove_property=lambda *_args: (_ for _ in ()).throw(
+                    OSError("blocked")
+                ),
+            )
+        )
+
+    def test_window_exit_rejection_echoes_the_request_token(self):
+        calls = []
+        self.assertTrue(
+            single_instance.publish_settings_window_exit_rejection(
+                321,
+                731,
+                _set_property=lambda hwnd, name, value: calls.append(
+                    (hwnd, name, value)
+                )
+                or True,
+            )
+        )
+        self.assertEqual(
+            calls,
+            [
+                (
+                    321,
+                    single_instance._APPLICATION_EXIT_WINDOW_REJECTED_PROPERTY,
+                    731,
+                )
+            ],
+        )
+
+    def test_fresh_request_is_consumed_exactly_once(self):
+        path = single_instance.write_application_exit_request(
+            self.root, now=lambda: 100.0
+        )
+
+        self.assertEqual(
+            path,
+            single_instance.application_exit_request_path(self.root),
+        )
+        self.assertTrue(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+    def test_stale_or_wrong_action_is_discarded_without_touching_bridge_request(self):
+        single_instance.write_application_exit_request(
+            self.root, now=lambda: 100.0
+        )
+        single_instance.write_bridge_start_request(self.root, now=lambda: 100.0)
+
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 131.0,
+            )
+        )
+        self.assertTrue(
+            single_instance.consume_bridge_start_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+
+        path = single_instance.application_exit_request_path(self.root)
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "action": "start_bridge",
+                    "created_at": 100.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.assertFalse(
+            single_instance.consume_application_exit_request(
+                self.root,
+                now=lambda: 110.0,
+            )
+        )
+        self.assertFalse(path.exists())
+
+    def test_application_probe_uses_the_product_wide_settings_mutex(self):
+        opened = []
+
+        self.assertFalse(
+            single_instance.application_instance_running(
+                _open_mutex=lambda name: opened.append(name)
+                or single_instance.MutexOpenResult(
+                    handle=0,
+                    last_error=single_instance._ERROR_FILE_NOT_FOUND,
+                )
+            )
+        )
+        self.assertEqual(opened, [single_instance._SETTINGS_MUTEX_NAME])
+
+    def test_exit_capability_requires_a_ready_window_marker(self):
+        self.assertEqual(
+            single_instance._real_application_exit_request_capability(
+                _probe=lambda: single_instance.ApplicationExitWindowMarkers(
+                    settings_window_found=True,
+                    supported_window_found=True,
+                    legacy_supported_window_found=False,
+                )
+            ),
+            single_instance.ApplicationExitRequestCapability.SUPPORTED,
+        )
+
+    def test_candidate_007_runtime_marker_is_recognized_as_legacy_supported(self):
+        self.assertTrue(
+            single_instance._is_legacy_exit_capability_property(
+                "RemoteMicChromecast.SettingsWindow." + ("a" * 64)
+            )
+        )
+        self.assertFalse(
+            single_instance._is_legacy_exit_capability_property(
+                "RemoteMicChromecast.SettingsWindow." + ("g" * 64)
+            )
+        )
+        self.assertEqual(
+            single_instance._real_application_exit_request_capability(
+                _probe=lambda: single_instance.ApplicationExitWindowMarkers(
+                    settings_window_found=True,
+                    supported_window_found=False,
+                    legacy_supported_window_found=True,
+                )
+            ),
+            single_instance.ApplicationExitRequestCapability.LEGACY_SUPPORTED,
+        )
+
+    def test_handoff_can_observe_its_own_request_until_the_old_copy_consumes_it(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+
+        self.assertTrue(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(single_instance.consume_application_exit_request(self.root))
+        self.assertFalse(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_consuming_an_owned_exit_request_writes_a_matching_acknowledgement(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+            now=lambda: 100.0,
+        )
+
+        self.assertEqual(
+            single_instance.consume_and_acknowledge_application_exit_request(
+                self.root,
+                now=lambda: 101.0,
+            ),
+            single_instance.ApplicationExitRequest(request_id="ours"),
+        )
+        self.assertTrue(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_rejected_exit_request_replaces_ack_and_can_be_cleared_by_owner(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root
+        )
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(request_id="ours"),
+        )
+
+        single_instance.write_application_exit_rejection(self.root, "ours")
+
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_response(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertFalse(single_instance.application_exit_ack_path(self.root).exists())
+
+    def test_request_disappearance_without_acknowledgement_is_not_acceptance(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        path.unlink()
+
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_acknowledgement_cleanup_preserves_a_replacement(self):
+        path = single_instance.write_application_exit_acknowledgement(
+            self.root,
+            "ours",
+        )
+        single_instance.write_application_exit_acknowledgement(
+            self.root,
+            "newer",
+        )
+
+        self.assertFalse(
+            single_instance.clear_owned_application_exit_acknowledgement(
+                self.root,
+                "ours",
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["request_id"], "newer")
+
+    def test_handoff_never_treats_a_replacement_request_as_its_own(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="newer",
+        )
+
+        self.assertFalse(
+            single_instance.owned_application_exit_request_pending(
+                self.root,
+                "ours",
+            )
+        )
+
+    def test_handoff_can_clear_only_its_own_pending_request(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_request(
+                self.root,
+                "ours",
+            )
+        )
+        self.assertFalse(path.exists())
+
+    def test_handoff_cleanup_preserves_a_replacement_request(self):
+        path = single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+        )
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="newer",
+        )
+
+        self.assertFalse(
+            single_instance.clear_owned_application_exit_request(
+                self.root,
+                "ours",
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["request_id"], "newer")
+
+    def test_session_exit_request_round_trip_is_isolated_by_session(self):
+        first = single_instance.write_application_exit_request(
+            self.root,
+            request_id="first",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+        second = single_instance.write_application_exit_request(
+            self.root,
+            request_id="second",
+            session_id=22,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root,
+            session_id=11,
+            now=lambda: 101.0,
+        )
+
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(
+                request_id="first",
+                session_id=11,
+                session_scoped=True,
+            ),
+        )
+        self.assertFalse(first.exists())
+        self.assertTrue(second.exists())
+        self.assertTrue(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "first",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertFalse(
+            single_instance.application_exit_request_acknowledged(
+                self.root,
+                "first",
+                session_id=22,
+                session_scoped=True,
+            )
+        )
+
+    def test_session_rejection_and_cleanup_touch_only_the_owned_response(self):
+        single_instance.write_application_exit_rejection(
+            self.root,
+            "same-id",
+            session_id=11,
+            session_scoped=True,
+        )
+        other = single_instance.write_application_exit_rejection(
+            self.root,
+            "same-id",
+            session_id=22,
+            session_scoped=True,
+        )
+
+        self.assertTrue(
+            single_instance.application_exit_request_rejected(
+                self.root,
+                "same-id",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(
+            single_instance.clear_owned_application_exit_response(
+                self.root,
+                "same-id",
+                session_id=11,
+                session_scoped=True,
+            )
+        )
+        self.assertTrue(other.exists())
+
+    def test_acknowledgement_write_failure_does_not_cancel_consumed_exit(self):
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="ours",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+        original = single_instance.write_application_exit_acknowledgement
+        single_instance.write_application_exit_acknowledgement = (
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("full"))
+        )
+        try:
+            request = single_instance.consume_and_acknowledge_application_exit_request(
+                self.root,
+                session_id=11,
+                now=lambda: 101.0,
+            )
+        finally:
+            single_instance.write_application_exit_acknowledgement = original
+
+        self.assertEqual(
+            request,
+            single_instance.ApplicationExitRequest(
+                request_id="ours",
+                session_id=11,
+                session_scoped=True,
+            ),
+        )
+
+    def test_v3_request_is_consumed_before_legacy_compatibility_request(self):
+        legacy = single_instance.write_application_exit_request(
+            self.root,
+            request_id="legacy",
+            now=lambda: 100.0,
+        )
+        single_instance.write_application_exit_request(
+            self.root,
+            request_id="current",
+            session_id=11,
+            session_scoped=True,
+            now=lambda: 100.0,
+        )
+
+        request = single_instance.consume_and_acknowledge_application_exit_request(
+            self.root,
+            session_id=11,
+            now=lambda: 101.0,
+        )
+
+        self.assertEqual(request.request_id, "current")
+        self.assertTrue(request.session_scoped)
+        self.assertTrue(legacy.exists())
+
+    def test_current_session_query_is_validated_through_an_injected_probe(self):
+        self.assertEqual(
+            single_instance.current_process_session_id(_query=lambda: 7),
+            7,
+        )
+        with self.assertRaises(single_instance.SingleInstanceUnavailableError):
+            single_instance.current_process_session_id(_query=lambda: -1)
+
+
+class MutexCtypesPrototypeTests(unittest.TestCase):
+    """Structural exact-prototype coverage, matching the convention
+    established by tests/test_win32_ctypes_argtypes.py: every Win32 call
+    here must declare argtypes/restype using pointer-sized ctypes.wintypes
+    aliases rather than being left at ctypes' unprototyped defaults, which
+    silently truncates a 64-bit value to 32 bits.
+    """
+
+    def test_handle_is_genuinely_pointer_sized(self):
+        self.assertEqual(ctypes.sizeof(wintypes.HANDLE), ctypes.sizeof(ctypes.c_void_p))
+
+    def test_create_mutex_declares_the_full_real_prototype(self):
+        source = source_text(single_instance._real_create_mutex)
+        self.assertIn("CreateMutexW.argtypes", source)
+        self.assertIn("CreateMutexW.restype", source)
+        for token in ("wintypes.LPVOID", "wintypes.BOOL", "wintypes.LPCWSTR", "wintypes.HANDLE"):
+            self.assertIn(token, source)
+
+    def test_create_mutex_captures_last_error_atomically(self):
+        # GetLastError must be captured via a use_last_error=True WinDLL
+        # handle immediately after CreateMutexW, inside the SAME function -
+        # never via a separate,
+        # later, independently-callable GetLastError wrapper.
+        source = source_text(single_instance._real_create_mutex)
+        self.assertIn("use_last_error=True", source)
+        self.assertIn("ctypes.get_last_error()", source)
+        self.assertNotIn("windll.kernel32", source)  # must use the WinDLL(...) form, not the shared cache
+
+    def test_no_standalone_get_last_error_wrapper_exists(self):
+        # There must be no independently-callable "fetch the last error
+        # now" function for a caller to accidentally call too late - the
+        # error is only ever available bundled in MutexCreationResult.
+        self.assertFalse(hasattr(single_instance, "_real_get_last_error"))
+        self.assertFalse(hasattr(single_instance, "GetLastErrorFn"))
+
+    def test_release_mutex_declares_the_full_real_prototype(self):
+        source = source_text(single_instance._real_release_mutex)
+        self.assertIn("ReleaseMutex.argtypes", source)
+        self.assertIn("ReleaseMutex.restype", source)
+        self.assertIn("wintypes.HANDLE", source)
+        self.assertIn("wintypes.BOOL", source)
+
+    def test_close_handle_declares_the_full_real_prototype(self):
+        source = source_text(single_instance._real_close_handle)
+        self.assertIn("CloseHandle.argtypes", source)
+        self.assertIn("CloseHandle.restype", source)
+        self.assertIn("wintypes.HANDLE", source)
+        self.assertIn("wintypes.BOOL", source)
+
+    def test_message_box_declares_the_full_real_prototype(self):
+        source = source_text(single_instance._real_message_box)
+        self.assertIn("MessageBoxW.argtypes", source)
+        self.assertIn("MessageBoxW.restype", source)
+        for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.UINT"):
+            self.assertIn(token, source)
+
+    def test_settings_window_marker_declares_the_full_real_prototype(self):
+        source = source_text(
+            single_instance._real_set_window_property_value
+        )
+        self.assertIn("SetPropW.argtypes", source)
+        self.assertIn("SetPropW.restype", source)
+        for token in ("wintypes.HWND", "wintypes.LPCWSTR", "wintypes.HANDLE"):
+            self.assertIn(token, source)
+
+    def test_settings_window_activation_declares_pointer_safe_prototypes(self):
+        source = source_text(single_instance._real_activate_marked_window)
+        for api in (
+            "EnumWindows",
+            "GetPropW",
+            "SetPropW",
+            "IsWindowVisible",
+            "IsIconic",
+            "ShowWindow",
+            "BringWindowToTop",
+            "SetForegroundWindow",
+            "FlashWindow",
+        ):
+            self.assertIn(f"{api}.argtypes", source)
+            self.assertIn(f"{api}.restype", source)
+        self.assertLess(
+            source.index("_SETTINGS_WINDOW_RESTORE_REQUEST_PROPERTY"),
+            source.index("user32.ShowWindow(hwnd"),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

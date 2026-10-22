@@ -1,0 +1,946 @@
+import ctypes
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from ovb import doubao_rpc, voice_program_manager
+
+
+class _FakeFunction:
+    def __init__(self, result=0):
+        self.result = result
+        self.calls = []
+        self.argtypes = None
+        self.restype = None
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        return self.result
+
+
+class _FakeLibrary:
+    def __init__(self, result=0):
+        self.RpcPipe_KeyDown = _FakeFunction(result)
+        self.RpcPipe_KeyUp = _FakeFunction(result)
+        self.RpcPipe_SimpleMessageEx = _FakeFunction(result)
+
+
+def _ready_script():
+    script = mock.Mock()
+    callbacks = {}
+    script.on.side_effect = lambda name, callback: callbacks.__setitem__(name, callback)
+    script.load.side_effect = lambda: callbacks["message"](
+        {"type": "send", "payload": {"type": "ready"}},
+        None,
+    )
+    return script
+
+
+class DoubaoRpcTests(unittest.TestCase):
+    def tearDown(self):
+        doubao_rpc.clear_cached_api()
+
+    def test_voice_stop_requires_matching_modules_for_each_verified_build(self):
+        path = Path(r"C:\Program Files\DoubaoIME\rpc.dll")
+        builds = tuple(doubao_rpc._VERIFIED_VOICE_STOP_BUILDS.items())
+        for rpc_hash, (service_hash, tsf_hash, stop_wparam) in builds:
+            hashes = {
+                "rpc.dll": rpc_hash,
+                "ImeService.exe": service_hash,
+                "tsf-oime-core.dll": tsf_hash,
+            }
+            with self.subTest(rpc_hash=rpc_hash), mock.patch.object(
+                doubao_rpc, "_module_sha256",
+                side_effect=lambda value: hashes[Path(value).name],
+            ):
+                self.assertTrue(doubao_rpc._verified_voice_stop_build(str(path)))
+                self.assertEqual(
+                    doubao_rpc._verified_voice_stop_layout(str(path)),
+                    (service_hash, tsf_hash, stop_wparam),
+                )
+                for changed_name in ("ImeService.exe", "tsf-oime-core.dll"):
+                    original = hashes[changed_name]
+                    for other_hash, other in builds:
+                        if other_hash == rpc_hash:
+                            continue
+                        hashes[changed_name] = other[
+                            0 if changed_name == "ImeService.exe" else 1
+                        ]
+                        self.assertFalse(doubao_rpc._verified_voice_stop_build(str(path)))
+                    hashes[changed_name] = original
+
+    def test_voice_stop_rejects_unknown_rpc_or_missing_companion(self):
+        path = r"C:\Program Files\DoubaoIME\rpc.dll"
+        with mock.patch.object(
+            doubao_rpc, "_module_sha256", return_value="unverified"
+        ) as digest:
+            self.assertFalse(doubao_rpc._verified_voice_stop_build(path))
+            digest.assert_called_once_with(path)
+        with mock.patch.object(
+            doubao_rpc, "_module_sha256", side_effect=OSError("missing")
+        ):
+            self.assertFalse(doubao_rpc._verified_voice_stop_build(path))
+
+    def test_same_path_hash_reads_current_contents_without_cache_clear(self):
+
+        with tempfile.TemporaryDirectory() as directory:
+            module = Path(directory) / "ImeService.exe"
+            module.write_bytes(b"first")
+            first = doubao_rpc._module_sha256(str(module))
+
+            module.write_bytes(b"other")
+            refreshed = doubao_rpc._module_sha256(str(module))
+            self.assertNotEqual(refreshed, first)
+
+    def test_key_down_configures_native_abi_and_passes_endpoint(self):
+        library = _FakeLibrary()
+        with mock.patch.object(
+            doubao_rpc.sys, "platform", "win32"
+        ), mock.patch.object(
+            doubao_rpc.os.path, "isfile", return_value=True
+        ), mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", return_value=library
+        ):
+            doubao_rpc.send_key_edge(0xA5, False)
+
+        self.assertEqual(
+            library.RpcPipe_KeyDown.calls,
+            [(b"\\\\.\\pipe\\ObricIme\\oime-server", 0xA5, 0, None)],
+        )
+        self.assertEqual(
+            library.RpcPipe_KeyDown.argtypes,
+            (ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint64, ctypes.c_char_p),
+        )
+
+    def test_key_up_uses_reverse_edge_without_context_arguments(self):
+        library = _FakeLibrary()
+        with mock.patch.object(
+            doubao_rpc,
+            "_load_api",
+            return_value=(library.RpcPipe_KeyDown, library.RpcPipe_KeyUp),
+        ):
+            doubao_rpc.send_key_edge(0xA5, True)
+
+        self.assertEqual(
+            library.RpcPipe_KeyUp.calls,
+            [(b"\\\\.\\pipe\\ObricIme\\oime-server", 0xA5)],
+        )
+
+    def test_nonzero_status_is_a_call_error(self):
+        library = _FakeLibrary(result=5)
+        with mock.patch.object(
+            doubao_rpc,
+            "_load_api",
+            return_value=(library.RpcPipe_KeyDown, library.RpcPipe_KeyUp),
+        ):
+            with self.assertRaises(doubao_rpc.DoubaoRpcCallError):
+                doubao_rpc.send_key_edge(0xA5, False)
+
+    def test_missing_rpc_is_distinguishable_from_call_failure(self):
+        with mock.patch.object(
+            doubao_rpc,
+            "_load_api",
+            side_effect=doubao_rpc.DoubaoRpcUnavailableError("not installed"),
+        ):
+            with self.assertRaises(doubao_rpc.DoubaoRpcUnavailableError):
+                doubao_rpc.send_key_edge(0xA5, False)
+
+    def test_voice_press_stop_uses_verified_builtin_message_once(self):
+        library = _FakeLibrary()
+        with mock.patch.object(
+            doubao_rpc,
+            "_load_voice_stop_api",
+            return_value=(library.RpcPipe_SimpleMessageEx, 0),
+        ):
+            doubao_rpc.send_voice_press_stop()
+
+        self.assertEqual(
+            library.RpcPipe_SimpleMessageEx.calls,
+            [
+                (
+                    b"\\\\.\\pipe\\ObricIme\\oime-server",
+                    doubao_rpc.VOICE_PRESS_STOP_MESSAGE,
+                    0,
+                    0,
+                    None,
+                )
+            ],
+        )
+
+    def test_voice_stop_uses_each_verified_build_parameter_once(self):
+        for stop_wparam in (0, 1):
+            function = _FakeFunction()
+            with self.subTest(stop_wparam=stop_wparam), mock.patch.object(
+                doubao_rpc,
+                "_load_voice_stop_api",
+                return_value=(function, stop_wparam),
+            ):
+                doubao_rpc.send_voice_press_stop()
+            self.assertEqual(len(function.calls), 1)
+            self.assertEqual(function.calls[0][1:4], (0x3E9, stop_wparam, 0))
+
+    def test_voice_stop_loader_rejects_unverified_build_before_loading(self):
+        loader = mock.Mock()
+        with mock.patch.object(
+            doubao_rpc.sys, "platform", "win32"
+        ), mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path", return_value=r"C:\DoubaoIME\rpc.dll"
+        ), mock.patch.object(
+            doubao_rpc, "_verified_voice_stop_layout", return_value=None
+        ), mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", loader
+        ):
+            with self.assertRaises(doubao_rpc.DoubaoRpcUnavailableError):
+                doubao_rpc._load_voice_stop_api()
+
+        loader.assert_not_called()
+
+    def test_voice_stop_loader_configures_the_verified_native_abi(self):
+        library = _FakeLibrary()
+        dll_path = r"C:\Program Files\DoubaoIME\versions\v0.9.0.0\rpc.dll"
+        with mock.patch.object(
+            doubao_rpc.sys, "platform", "win32"
+        ), mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path", return_value=dll_path
+        ), mock.patch.object(
+            doubao_rpc, "_verified_voice_stop_layout",
+            return_value=("service", "tsf", 0)
+        ), mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", return_value=library
+        ) as loader:
+            function, stop_wparam = doubao_rpc._load_voice_stop_api()
+
+        self.assertIs(function, library.RpcPipe_SimpleMessageEx)
+        self.assertEqual(stop_wparam, 0)
+        loader.assert_called_once_with(dll_path)
+        self.assertEqual(
+            function.argtypes,
+            (
+                ctypes.c_char_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_char_p,
+            ),
+        )
+        self.assertIs(function.restype, ctypes.c_int32)
+
+    def test_voice_stop_loader_reverifies_the_current_build_on_each_binding(self):
+        library = _FakeLibrary()
+        dll_path = r"C:\Program Files\DoubaoIME\versions\v0.9.0.0\rpc.dll"
+        with mock.patch.object(
+            doubao_rpc.sys, "platform", "win32"
+        ), mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path", return_value=dll_path
+        ), mock.patch.object(
+            doubao_rpc,
+            "_verified_voice_stop_layout",
+            side_effect=(("service", "tsf", 0), None),
+        ) as verified, mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", return_value=library
+        ) as loader:
+            doubao_rpc._load_voice_stop_api()
+            with self.assertRaises(doubao_rpc.DoubaoRpcUnavailableError):
+                doubao_rpc._load_voice_stop_api()
+
+        self.assertEqual(verified.call_count, 2)
+        loader.assert_called_once_with(dll_path)
+
+    def test_new_build_loader_uses_native_button_stop_parameter(self):
+        library = _FakeLibrary()
+        hashes = {
+            "rpc.dll": "0be0cb35d864d06b2c8b5267d9f0669a1383493f557a45c6a1ebbfa203e85e53",
+            "ImeService.exe": "94ace7e504e6aa70c15095d5219604aee93e17247eb85429a046c7a4fdb95e90",
+            "tsf-oime-core.dll": "8544bfb87d8d2cc847b13e2ccc9bbd2220b20bceafdd1fc88ad5eaff5a28bb02",
+        }
+        with mock.patch.object(
+            doubao_rpc.sys, "platform", "win32"
+        ), mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.1.22\rpc.dll",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            side_effect=lambda value: hashes[Path(value).name],
+        ), mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", return_value=library
+        ):
+            function, stop_wparam = doubao_rpc._load_voice_stop_api()
+        self.assertIs(function, library.RpcPipe_SimpleMessageEx)
+        self.assertEqual(stop_wparam, 1)
+
+    def test_0927_stop_loads_native_button_parameter_with_matching_modules(self):
+        library = _FakeLibrary()
+        hashes = {
+            "rpc.dll": "e3ee88527bf6bd38156e86b93413ca004a829809ad51f064a42db44814e9a5d5",
+            "ImeService.exe": "38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad",
+            "tsf-oime-core.dll": "ef827968a374de491529f65eade36d58c7eab78933ebe8508bd2fed8563290c0",
+        }
+        with mock.patch.object(
+            doubao_rpc, "_resolve_rpc_dll_path",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.2.7\rpc.dll",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            side_effect=lambda value: hashes[Path(value).name],
+        ), mock.patch.object(
+            doubao_rpc.ctypes, "WinDLL", return_value=library
+        ):
+            function, stop_wparam = doubao_rpc._load_voice_stop_api()
+            doubao_rpc.send_voice_press_stop()
+        self.assertIs(function, library.RpcPipe_SimpleMessageEx)
+        self.assertEqual(stop_wparam, 1)
+        self.assertEqual(library.RpcPipe_SimpleMessageEx.calls, [
+            (b"\\\\.\\pipe\\ObricIme\\oime-server", 0x3E9, 1, 0, None),
+        ])
+
+    def test_voice_stop_nonzero_status_is_a_call_error(self):
+        function = _FakeFunction(result=7)
+        with mock.patch.object(
+            doubao_rpc,
+            "_load_voice_stop_api",
+            return_value=(function, 0),
+        ):
+            with self.assertRaises(doubao_rpc.DoubaoRpcCallError):
+                doubao_rpc.send_voice_press_stop()
+
+
+class DoubaoPhysicalizerTests(unittest.TestCase):
+    def setUp(self):
+        # Never discover or attach to a real input method during unit tests.
+        self.processes = self.enterContext(mock.patch.object(
+            voice_program_manager, "_iter_windows_processes", return_value=[]
+        ))
+
+    def tearDown(self):
+        doubao_rpc.set_diagnostic_trace(None)
+        doubao_rpc.clear_cached_api()
+
+    def test_each_build_checks_its_own_gate_bytes_before_installing_hooks(self):
+        cases = (
+            ((0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38),
+             "0xFF, 0x15, 0x59, 0x9B, 0x8A, 0x00, 0xE9, 0xFB, 0x09, 0x00, 0x00",
+             "0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x14"),
+            ((0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x38),
+             "0xFF, 0x15, 0xD0, 0xF4, 0x95, 0x00, 0xE9, 0xE9, 0x0C, 0x00, 0x00",
+             "0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x16"),
+            ((0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x38),
+             "0xFF, 0x15, 0x40, 0xE8, 0x95, 0x00, 0xE9, 0xE9, 0x0C, 0x00, 0x00",
+             "0x80, 0x7C, 0x24, 0x38, 0x00, 0x75, 0x16"),
+        )
+        for layout, early_bytes, decision_bytes in cases:
+            with self.subTest(callback=layout[0]):
+                source = doubao_rpc._physicalizer_source((0xA3, 0x4C), *layout)
+                self.assertIn(f"hasBytes(earlyForward, [{early_bytes}])", source)
+                self.assertIn(f"hasBytes(decisionGate, [{decision_bytes}])", source)
+                self.assertLess(
+                    source.index("throw new Error('verified Doubao hook layout changed')"),
+                    source.index("Interceptor.attach(callback"),
+                )
+
+    def test_mixed_or_unknown_layout_cannot_create_a_hook_script(self):
+        for layout in (
+            (0x782D80, 0x7427F1, 0x7427F7, 0x7431CD, 0x38),
+            (0x782D80, 0x782EB2, 0x782EB8, 0x783B7A, 0x40),
+            (0x7829E0, 0x782EB2, 0x782EB8, 0x783B7A, 0x38),
+            (0x7829E0, 0x782B12, 0x782B18, 0x7837DA, 0x40),
+        ):
+            with self.subTest(layout=layout):
+                with self.assertRaises(doubao_rpc.DoubaoRpcUnavailableError):
+                    doubao_rpc._physicalizer_source((0xA3, 0x4C), *layout)
+
+    def test_new_build_starts_with_new_layout_and_cleans_up(self):
+        script = _ready_script()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        ]
+        fake_frida = types.SimpleNamespace(attach=mock.Mock(return_value=session))
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.dict(sys.modules, {"frida": fake_frida}), mock.patch.object(
+            physicalizer, "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.1.22\ImeService.exe",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            return_value="94ace7e504e6aa70c15095d5219604aee93e17247eb85429a046c7a4fdb95e90",
+        ):
+            self.assertTrue(physicalizer.start((0xA3, 0x4C)))
+        source = session.create_script.call_args.args[0]
+        self.assertIn("module.base.add(0x782D80)", source)
+        self.assertIn("module.base.add(0x783B7A)", source)
+        self.assertEqual(physicalizer.status, "active")
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
+
+    def test_0927_starts_at_verified_callback_and_cleans_up(self):
+        script = _ready_script()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        ]
+        fake_frida = types.SimpleNamespace(attach=mock.Mock(return_value=session))
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.dict(sys.modules, {"frida": fake_frida}), mock.patch.object(
+            physicalizer, "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\versions\v0.9.2.7\ImeService.exe",
+        ), mock.patch.object(
+            doubao_rpc, "_module_sha256",
+            return_value="38742f838d58b6e5b87a08564c6917da1d75ac6b81ec6ee3388ffaaac7c9f3ad",
+        ):
+            self.assertTrue(physicalizer.start((0xA3, 0x4C)))
+        source = session.create_script.call_args.args[0]
+        self.assertIn("module.base.add(0x7829E0)", source)
+        self.assertIn("module.base.add(0x782B12)", source)
+        self.assertIn("module.base.add(0x7837DA)", source)
+        self.assertEqual(physicalizer.status, "active")
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
+
+    def test_script_only_clears_marked_configured_keys_in_doubao_callback(self):
+        source = doubao_rpc._physicalizer_source(
+            (0xA5, 0x41), 0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38
+        )
+
+        self.assertIn("new Set([0xA5, 0x41])", source)
+        self.assertIn("const suppressVks = new Set([0x41])", source)
+        self.assertIn("flags & 0x10", source)
+        self.assertIn("marker.and(markerMask)", source)
+        self.assertIn("flags & ~0x12", source)
+        self.assertIn("event.add(16).writeU64(0)", source)
+        self.assertIn("type: 'marker_processed'", source)
+        self.assertIn("flags_before", source)
+        self.assertIn("extra_after_zero", source)
+        self.assertIn("module.base.add(0x7427F1)", source)
+        self.assertIn("module.base.add(0x7427F7)", source)
+        self.assertIn("module.base.add(0x7431CD)", source)
+        self.assertIn("verified Doubao hook layout changed", source)
+        self.assertIn("const frame = { payload: null }", source)
+        self.assertLess(
+            source.index("stack.push(frame)"),
+            source.index("if (args[0].toInt32() < 0) return"),
+        )
+        self.assertIn("this.context.rax = ptr(1)", source)
+        self.assertIn("this.context.pc = earlyContinue", source)
+        self.assertIn("const consumed = this.context.rsp.add(consumedStackOffset)", source)
+        self.assertIn("consumed.writeU8(1)", source)
+        self.assertNotIn("retval.replace", source)
+        self.assertIn("callback_suppressed", source)
+        self.assertIn("callback_path = 'early_bypass'", source)
+        self.assertIn("callback_path = 'normal_decision'", source)
+
+    def test_single_key_shortcut_is_not_suppressed_at_either_forward_gate(self):
+        source = doubao_rpc._physicalizer_source(
+            (0xA5,), 0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38
+        )
+
+        self.assertIn("const suppressVks = new Set([])", source)
+
+    def test_modifier_only_shortcuts_never_enter_forward_suppression(self):
+        modifier_shortcuts = (
+            (0xA3, 0xA5),
+            (0xA5, 0xA3),
+            (0x10, 0x11, 0x12),
+            (0xA0, 0xA2, 0x5B),
+            (0xA1, 0xA4, 0x5C),
+        )
+
+        for shortcut in modifier_shortcuts:
+            with self.subTest(shortcut=shortcut):
+                self.assertEqual(doubao_rpc._shortcut_vks_to_suppress(shortcut), ())
+                source = doubao_rpc._physicalizer_source(
+                    shortcut, 0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38
+                )
+                self.assertIn("const suppressVks = new Set([])", source)
+
+    def test_only_final_non_modifier_remains_suppressed(self):
+        self.assertEqual(
+            doubao_rpc._shortcut_vks_to_suppress((0xA5, 0x20)),
+            (0x20,),
+        )
+        self.assertEqual(
+            doubao_rpc._shortcut_vks_to_suppress((0xA5, 0x49)),
+            (0x49,),
+        )
+
+    def test_marker_expectation_confirms_without_blocking_the_hotkey_path(self):
+        trace = mock.Mock()
+        trace.current_context.return_value = {
+            "gesture_id": "gesture-1",
+            "attempt_id": "attempt-1",
+        }
+        doubao_rpc.set_diagnostic_trace(trace)
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        physicalizer._status = "active"
+        physicalizer._script = object()
+
+        token = physicalizer.expect_markers("down", 1)
+        self.assertIsNotNone(token)
+        physicalizer._on_marker_processed(
+            {
+                "marker": "123",
+                "vk": 0xA5,
+                "message": 0x0104,
+                "key_up": False,
+                "flags_before": 0x10,
+                "flags_after": 0,
+                "extra_before_nonzero": True,
+                "extra_after_zero": True,
+            }
+        )
+
+        results = [
+            call.kwargs.get("result")
+            for call in trace.emit.call_args_list
+            if call.args[0] == "doubao_marker_expectation"
+        ]
+        self.assertEqual(results, ["started", "confirmed"])
+        marker = next(
+            call
+            for call in trace.emit.call_args_list
+            if call.args[0] == "doubao_marker_processed"
+        )
+        self.assertEqual(marker.kwargs["attempt_id"], "attempt-1")
+        self.assertTrue(marker.kwargs["extra_after_zero"])
+
+    def test_marker_expectation_records_timeout_without_raising(self):
+        trace = mock.Mock()
+        trace.current_context.return_value = {
+            "gesture_id": "gesture-2",
+            "attempt_id": "attempt-2",
+        }
+        doubao_rpc.set_diagnostic_trace(trace)
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        physicalizer._status = "active"
+        physicalizer._script = object()
+
+        class ImmediateTimer:
+            def __init__(self, _delay, callback, args=()):
+                self.callback = callback
+                self.args = args
+                self.daemon = False
+
+            def start(self):
+                self.callback(*self.args)
+
+            def cancel(self):
+                pass
+
+        with mock.patch.object(doubao_rpc.threading, "Timer", ImmediateTimer):
+            self.assertIsNotNone(physicalizer.expect_markers("down", 2))
+
+        results = [
+            call.kwargs.get("result")
+            for call in trace.emit.call_args_list
+            if call.args[0] == "doubao_marker_expectation"
+        ]
+        self.assertEqual(results, ["started", "timeout"])
+        timeout = trace.emit.call_args_list[-1]
+        self.assertEqual(timeout.kwargs["expected"], 2)
+        self.assertEqual(timeout.kwargs["received"], 0)
+
+    def test_verified_module_requires_the_installed_doubao_path_and_hash(self):
+        with mock.patch.object(
+            doubao_rpc.hashlib,
+            "sha256",
+            return_value=mock.Mock(
+                hexdigest=lambda: next(
+                    iter(doubao_rpc._VERIFIED_IME_SERVICE_BUILDS)
+                )
+            ),
+        ), mock.patch.object(doubao_rpc.Path, "read_bytes", return_value=b"verified"):
+            self.assertTrue(
+                doubao_rpc.DoubaoPhysicalizer._verify_module(
+                    r"C:\Program Files\DoubaoIME\ImeService.exe"
+                )
+            )
+            self.assertFalse(
+                doubao_rpc.DoubaoPhysicalizer._verify_module(
+                    r"C:\Program Files\Other\ImeService.exe"
+                )
+            )
+
+    def test_windows_discovery_finds_service_missing_from_frida_enumeration(self):
+        script = _ready_script()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        process = types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        self.processes.return_value = [process]
+        device = mock.Mock()
+        device.enumerate_processes.return_value = []
+        fake_frida = types.SimpleNamespace(
+            get_local_device=lambda: device,
+            attach=mock.Mock(return_value=session),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verified_hook_layout",
+            return_value=(0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)
+        ):
+            self.assertTrue(physicalizer.start((0xA5,)))
+
+        self.assertEqual(physicalizer.status, "active")
+        device.enumerate_processes.assert_not_called()
+        script.load.assert_called_once()
+        fake_frida.attach.assert_called_once_with(46500)
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
+
+    def test_next_start_reattaches_after_the_previous_session_detaches(self):
+        old_script = mock.Mock()
+        old_session = mock.Mock()
+        old_session.is_detached = True
+        new_script = _ready_script()
+        new_session = mock.Mock()
+        new_session.is_detached = False
+        new_session.create_script.return_value = new_script
+        process = types.SimpleNamespace(pid=46501, name="ImeService.exe")
+        self.processes.return_value = [process]
+        device = mock.Mock()
+        device.enumerate_processes.return_value = [process]
+        fake_frida = types.SimpleNamespace(
+            get_local_device=lambda: device,
+            attach=mock.Mock(return_value=new_session),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        physicalizer._session = old_session
+        physicalizer._script = old_script
+        physicalizer._frida = object()
+        physicalizer._vk_codes = (0xA5,)
+        physicalizer._status = "active"
+
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verified_hook_layout",
+            return_value=(0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)
+        ):
+            self.assertTrue(physicalizer.start((0xA5,)))
+
+        fake_frida.attach.assert_called_once_with(46501)
+        self.assertIs(physicalizer._session, new_session)
+        self.assertIs(physicalizer._script, new_script)
+        self.assertEqual(physicalizer.status, "active")
+        old_script.unload.assert_not_called()
+        old_session.detach.assert_not_called()
+        physicalizer.stop()
+
+    def test_stale_global_frida_manager_uses_one_owned_recovery_manager(self):
+        class TransportError(Exception):
+            pass
+
+        script = _ready_script()
+        session = mock.Mock()
+        session.is_detached = False
+        session.create_script.return_value = script
+        manager = mock.Mock()
+        manager.get_local_device.return_value.attach.return_value = session
+        process = types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        self.processes.return_value = [process]
+        fake_frida = types.SimpleNamespace(
+            attach=mock.Mock(side_effect=TransportError("closed")),
+            core=types.SimpleNamespace(DeviceManager=mock.Mock(return_value=manager)),
+            _frida=types.SimpleNamespace(DeviceManager=mock.Mock()),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verified_hook_layout",
+            return_value=(0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38),
+        ):
+            self.assertTrue(physicalizer.start((0xA5,)))
+
+        fake_frida.attach.assert_called_once_with(46500)
+        manager.get_local_device.return_value.attach.assert_called_once_with(46500)
+        self.assertIs(physicalizer._frida_manager, manager)
+        physicalizer.stop()
+        session.detach.assert_called_once()
+        manager._impl.close.assert_called_once()
+        self.assertIsNone(physicalizer._frida_manager)
+
+    def test_recovery_attach_failure_closes_manager_and_stays_unavailable(self):
+        class TransportError(Exception):
+            pass
+
+        class InvalidArgumentError(Exception):
+            pass
+
+        manager = mock.Mock()
+        manager.get_local_device.return_value.attach.side_effect = InvalidArgumentError()
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        ]
+        fake_frida = types.SimpleNamespace(
+            attach=mock.Mock(side_effect=TransportError()),
+            core=types.SimpleNamespace(DeviceManager=mock.Mock(return_value=manager)),
+            _frida=types.SimpleNamespace(DeviceManager=mock.Mock()),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ):
+            self.assertFalse(physicalizer.start((0xA5,)))
+
+        self.assertEqual(physicalizer.status, "unavailable")
+        self.assertEqual(physicalizer.error, "InvalidArgumentError")
+        self.assertIsNone(physicalizer._session)
+        self.assertIsNone(physicalizer._frida_manager)
+        manager._impl.close.assert_called_once()
+
+    def test_missing_ime_process_is_a_clean_optional_failure(self):
+        device = mock.Mock()
+        device.enumerate_processes.return_value = []
+        fake_frida = types.SimpleNamespace(get_local_device=lambda: device)
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ):
+            self.assertFalse(physicalizer.start((0xA5,)))
+
+        self.assertEqual(physicalizer.status, "unavailable")
+        self.assertIn("not running", physicalizer.error or "")
+
+    def test_watchdog_and_similarly_named_processes_are_not_voice_targets(self):
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46501, name="ImeWatchdog.exe"),
+            types.SimpleNamespace(pid=46502, name="OtherImeService.exe"),
+        ]
+        fake_frida = types.SimpleNamespace(attach=mock.Mock())
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ):
+            physicalizer = doubao_rpc.DoubaoPhysicalizer()
+            self.assertFalse(physicalizer.start((0xA5,)))
+
+        self.assertEqual(physicalizer.error, "ImeService.exe is not running")
+        fake_frida.attach.assert_not_called()
+
+    def test_windows_discovery_failure_does_not_attach(self):
+        self.processes.side_effect = OSError("snapshot unavailable")
+        fake_frida = types.SimpleNamespace(attach=mock.Mock())
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ):
+            physicalizer = doubao_rpc.DoubaoPhysicalizer()
+            self.assertFalse(physicalizer.start((0xA5,)))
+
+        self.assertEqual(physicalizer.status, "unavailable")
+        self.assertEqual(physicalizer.error, "OSError")
+        fake_frida.attach.assert_not_called()
+
+    def test_discovered_process_exit_or_access_denied_is_a_clean_failure(self):
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46500, name="IMESERVICE.EXE")
+        ]
+        for error in (ProcessLookupError("exited"), PermissionError("denied")):
+            fake_frida = types.SimpleNamespace(attach=mock.Mock(side_effect=error))
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                doubao_rpc.sys, "platform", "win32"
+            ), mock.patch.dict(sys.modules, {"frida": fake_frida}):
+                physicalizer = doubao_rpc.DoubaoPhysicalizer()
+                self.assertFalse(physicalizer.start((0xA5,)))
+                self.assertEqual(physicalizer.status, "unavailable")
+                self.assertEqual(physicalizer.error, type(error).__name__)
+                self.assertIsNone(physicalizer._session)
+                self.assertIsNone(physicalizer._script)
+                fake_frida.attach.assert_called_once_with(46500)
+
+    def test_each_windows_candidate_must_pass_existing_module_verification(self):
+        self.processes.return_value = [
+            types.SimpleNamespace(pid=46500, name="ImeService.exe"),
+            types.SimpleNamespace(pid=46501, name="ImeService.exe"),
+        ]
+        rejected, accepted = mock.Mock(), mock.Mock()
+        script = _ready_script()
+        accepted.create_script.return_value = script
+        fake_frida = types.SimpleNamespace(
+            attach=mock.Mock(side_effect=[rejected, accepted])
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(physicalizer, "_probe_module", side_effect=[
+            r"C:\Other\ImeService.exe", r"C:\Program Files\DoubaoIME\ImeService.exe"
+        ]), mock.patch.object(
+            physicalizer, "_verified_hook_layout",
+            side_effect=[None, (0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)]
+        ) as verify:
+            self.assertTrue(physicalizer.start((0xA5,)))
+
+        self.assertEqual(verify.call_count, 2)
+        rejected.create_script.assert_not_called()
+        rejected.detach.assert_called_once()
+        self.assertEqual(fake_frida.attach.call_args_list,
+                         [mock.call(46500), mock.call(46501)])
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        accepted.detach.assert_called_once()
+
+    def test_unknown_ime_build_is_rejected_without_guessing_an_address(self):
+        session = mock.Mock()
+        session.create_script.side_effect = AssertionError(
+            "unknown builds must not load a callback hook"
+        )
+        process = types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        self.processes.return_value = [process]
+        device = mock.Mock()
+        device.enumerate_processes.return_value = [process]
+        fake_frida = types.SimpleNamespace(
+            get_local_device=lambda: device,
+            attach=mock.Mock(return_value=session),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verified_hook_layout", return_value=None
+        ):
+            self.assertFalse(physicalizer.start((0xA5,)))
+
+        self.assertEqual(physicalizer.status, "unsupported_version")
+        session.create_script.assert_not_called()
+        session.detach.assert_called_once()
+
+    def test_native_failure_detail_is_reduced_to_exception_type(self):
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        physicalizer._set_failure(
+            "unavailable",
+            RuntimeError("sensitive native device detail"),
+        )
+
+        self.assertEqual(physicalizer.error, "RuntimeError")
+
+    def test_process_level_interrupt_is_cleaned_up_and_propagated(self):
+        script = mock.Mock()
+        script.load.side_effect = KeyboardInterrupt()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        process = types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        self.processes.return_value = [process]
+        device = mock.Mock()
+        device.enumerate_processes.return_value = [process]
+        fake_frida = types.SimpleNamespace(
+            get_local_device=lambda: device,
+            attach=mock.Mock(return_value=session),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verified_hook_layout",
+            return_value=(0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)
+        ), self.assertRaises(KeyboardInterrupt):
+            physicalizer.start((0xA5,))
+
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+
+    def test_stop_failure_retains_resources_for_a_later_retry(self):
+        script = mock.Mock()
+        session = mock.Mock()
+        script.unload.side_effect = RuntimeError("unload failed")
+        session.detach.side_effect = RuntimeError("detach failed")
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        physicalizer._script = script
+        physicalizer._session = session
+        physicalizer._status = "active"
+
+        with self.assertRaises(RuntimeError):
+            physicalizer.stop()
+
+        self.assertIs(physicalizer._script, script)
+        self.assertIs(physicalizer._session, session)
+        self.assertEqual(physicalizer.status, "cleanup_required")
+
+        script.unload.side_effect = None
+        session.detach.side_effect = None
+        physicalizer.stop()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+
+    def test_successful_session_detach_clears_a_script_that_failed_to_unload(self):
+        script = mock.Mock()
+        session = mock.Mock()
+        script.unload.side_effect = RuntimeError("unload failed")
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        physicalizer._script = script
+        physicalizer._session = session
+        physicalizer._status = "active"
+
+        physicalizer.stop()
+
+        session.detach.assert_called_once()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+        self.assertEqual(physicalizer.status, "stopped")
+
+    def test_start_cleanup_accepts_detach_after_script_unload_failure(self):
+        script = mock.Mock()
+        script.load.side_effect = RuntimeError("load failed")
+        script.unload.side_effect = RuntimeError("unload failed")
+        session = mock.Mock()
+        session.create_script.return_value = script
+        process = types.SimpleNamespace(pid=46500, name="ImeService.exe")
+        self.processes.return_value = [process]
+        device = mock.Mock()
+        device.enumerate_processes.return_value = [process]
+        fake_frida = types.SimpleNamespace(
+            get_local_device=lambda: device,
+            attach=mock.Mock(return_value=session),
+        )
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+
+        with mock.patch.object(doubao_rpc.sys, "platform", "win32"), mock.patch.dict(
+            sys.modules, {"frida": fake_frida}
+        ), mock.patch.object(
+            physicalizer,
+            "_probe_module",
+            return_value=r"C:\Program Files\DoubaoIME\ImeService.exe",
+        ), mock.patch.object(
+            physicalizer, "_verified_hook_layout",
+            return_value=(0x7426C0, 0x7427F1, 0x7427F7, 0x7431CD, 0x38)
+        ):
+            self.assertFalse(physicalizer.start((0xA5,)))
+
+        session.detach.assert_called_once()
+        self.assertIsNone(physicalizer._script)
+        self.assertIsNone(physicalizer._session)
+        self.assertEqual(physicalizer.status, "unavailable")
+
+
+if __name__ == "__main__":
+    unittest.main()
