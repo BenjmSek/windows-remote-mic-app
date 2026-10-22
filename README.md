@@ -68,12 +68,37 @@
 环境：Windows 10 1809（build 17763）及以上，Python 3.14。Qt 与部分依赖只提供 Windows
 wheel，非 Windows 平台只能跑纯逻辑的单元测试。
 
+### 运行环境
+
+实测通过的组合：**Windows 10（build 19045）+ Python 3.14.7**（CPython 官方 64 位安装包）。
+
+Python 版本要求是 **3.14**，不是「3.14 及以上都可以」——依赖 wheel 与 `asyncio`、
+`ctypes` 行为都按这个版本验证过，换成 3.13 或 3.15 没有跑过测试。
+
+必须安装的依赖见 [`requirements.txt`](requirements.txt)，版本必须一致（Qt 与 PySide6
+的版本要对应，改动任一版本都要同步更新 `THIRD_PARTY_NOTICES.md` 与
+`THIRD_PARTY_SOURCE.md`）：
+
+| 依赖 | 版本 | 用途 |
+| --- | --- | --- |
+| PySide6-Essentials | 6.12.0 | Qt 界面 |
+| shiboken6 | 6.12.0 | PySide6 绑定生成器 |
+| numpy | 2.5.1 | 音频缓冲处理 |
+| sounddevice | 0.5.6 | 音频采集与播放 |
+| frida | 17.24.0 | 豆包输入法的进程内注入 |
+| comtypes | 1.4.17 | COM 接口 |
+| uiautomation | 2.0.29 | UI 自动化 |
+| pefile | 2024.8.26 | PE 文件解析 |
+
 ```powershell
 py -3.14 -m pip install -r requirements.txt
 $env:PYTHONPATH = Join-Path (Get-Location) 'src'
 $env:PYTHONUTF8 = '1'
 python -m ovb --settings
 ```
+
+`$env:PYTHONUTF8 = '1'` 不是可选项：界面文案和配置文件都是 UTF-8，不设这个环境变量，
+Windows 下中文会按 GBK 解码而乱码。
 
 仓库根下已备好两个 `.bat`：
 
@@ -102,7 +127,7 @@ python -m ovb --version    打印版本号后退出
 
 - **首次配置前，请先暂时退出 360 等杀毒软件；配置和测试完成后及时恢复防护。**
 - **首次使用语音前，必须先安装虚拟音频组件 VB-CABLE，并重启电脑；重启后再配置语音。**
-- 开发环境为 Windows 11 23H2。较早 Windows 版本的兼容性尚未全面验证。
+- 开发环境为 Windows 10（build 19045）。较早 Windows 版本的兼容性尚未全面验证。
 
 ### 先让遥控器按键可用
 
