@@ -1,43 +1,44 @@
-# Corresponding source for Qt for Python
+# Third-party corresponding source
 
-Qt for Python (PySide6) is licensed `LGPL-3.0-only OR GPL-2.0-only OR
-GPL-3.0-only`. This project relies on the LGPL-3.0-only option. LGPL-3.0
-section 4 requires that a binary distribution ship the Corresponding Source for
-the LGPL-licensed libraries it contains, or a written offer valid for at least
-three years to supply it on request.
+Release status: READY
 
-This file records exactly what to ship. The digests below are the values
-published by Qt next to each archive, not values computed by this project; the
-sidecar URL is given so anyone can re-verify them.
+The Windows binary bundles the open-source Qt for Python 6.11.1 runtime. The
+application source is already available in this GPL-3.0-only repository, but a
+formal binary release must also keep the exact Qt and PySide/Shiboken
+corresponding source available from a location controlled by this project.
 
-## Qt 6.12.0
+## Required source archives
 
-| Field | Value |
-| --- | --- |
-| Archive | `qt-everywhere-src-6.12.0.tar.xz` |
-| URL | <https://download.qt.io/official_releases/qt/6.12/6.12.0/single/qt-everywhere-src-6.12.0.tar.xz> |
-| SHA-256 | `98ff4f44bac6ec3e1e62ee2a4316ae0e3d15badb015d753cc0268a20db52f165` |
-| Digest source | <https://download.qt.io/official_releases/qt/6.12/6.12.0/single/qt-everywhere-src-6.12.0.tar.xz.sha256> |
+### Qt 6.11.1
 
-## PySide6 6.12.0
+- File: `qt-everywhere-src-6.11.1.tar.xz`
+- Official source: <https://download.qt.io/official_releases/qt/6.11/6.11.1/single/qt-everywhere-src-6.11.1.tar.xz>
+- Size: 1,017,723,080 bytes
+- SHA-256: `252acef8c5ae68074d91cadba2ee4a83465051bbb970dd26e8f0daa0f3904e03`
+- Project-controlled release URL: <https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/third-party-source-qt-6.11.1/qt-everywhere-src-6.11.1.tar.xz>
 
-| Field | Value |
-| --- | --- |
-| Archive | `pyside-setup-everywhere-src-6.12.0.tar.xz` |
-| URL | <https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/pyside-setup-everywhere-src-6.12.0.tar.xz> |
-| SHA-256 | `099c1a597cf33c1b000e11cf68a0b82d216fb802bf81726efc720394f10c7751` |
-| Digest source | <https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.12.0-src/pyside-setup-everywhere-src-6.12.0.tar.xz.sha256> |
+### Qt for Python / PySide6 6.11.1
 
-## What this means in practice
+- File: `pyside-setup-everywhere-src-6.11.1.tar.xz`
+- Official source: <https://download.qt.io/official_releases/QtForPython/pyside6/PySide6-6.11.1-src/pyside-setup-everywhere-src-6.11.1.tar.xz>
+- Size: 17,963,432 bytes
+- SHA-256: `6ffd9835bb0dd2c56f061d62f1616bb1707cfc0202b80e3165d6be087f3965e2`
+- Project-controlled release URL: <https://github.com/ZSTDJan/windows-remote-mic-app/releases/download/third-party-source-qt-6.11.1/pyside-setup-everywhere-src-6.11.1.tar.xz>
 
-- **Source-only checkout (this repository as published): no obligation
-  arises.** No Qt or PySide6 binary is distributed here; `requirements.txt`
-  only names the wheels, and the user installs them from PyPI.
-- **If you publish a Windows installer or portable archive that bundles the
-  PySide6/Qt DLLs, the obligation does arise.** Ship the two archives above, or
-  ship a written offer naming them and stating that you will supply them on
-  request for at least three years.
+## Distribution statement
 
-The version pair above is what this branch is built and tested against. If you
-change the pinned `PySide6-Essentials` version, update both tables to the
-matching Qt release — the Qt version and the PySide6 version must correspond.
+The Windows build installs the official `PySide6-Essentials==6.11.1` and
+`shiboken6==6.11.1` PyPI wheels and does not patch their source. PyInstaller
+keeps Qt as replaceable DLLs and QML/plugin files under the application's
+`程序文件/PySide6` directory rather than statically linking them into the main
+executable.
+
+The corresponding-source delivery was verified on 2026-09-01:
+
+1. both archives were uploaded to the project-controlled GitHub prerelease;
+2. both public URLs were downloaded once after publication;
+3. the downloaded sizes and SHA-256 values matched the records above.
+
+Official Qt download links remain recorded as provenance. The project-controlled
+release URLs above are the corresponding-source delivery used by the Windows
+binary release gate.

@@ -1,0 +1,373 @@
+{
+  "applied_ids": {
+    "chromecast-remote": "automatic"
+  },
+  "presets": [
+    {
+      "id": "ca7f35bc-6735-4b1b-8653-a0774c527362",
+      "mapping": {
+        "bindings": {
+          "back": {
+            "keys": [],
+            "kind": "delete_backward"
+          },
+          "down": {
+            "keys": [],
+            "kind": "arrow_down"
+          },
+          "home": {
+            "keys": [],
+            "kind": "show_desktop"
+          },
+          "input_source": {
+            "keys": [
+              "ctrl",
+              "f9"
+            ],
+            "kind": "key_combo"
+          },
+          "left": {
+            "keys": [],
+            "kind": "arrow_left"
+          },
+          "mic": {
+            "keys": [],
+            "kind": "voice_hold"
+          },
+          "netflix": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "ok": {
+            "keys": [],
+            "kind": "return"
+          },
+          "power": {
+            "keys": [],
+            "kind": "escape"
+          },
+          "right": {
+            "keys": [],
+            "kind": "arrow_right"
+          },
+          "up": {
+            "keys": [],
+            "kind": "arrow_up"
+          },
+          "volume_down": {
+            "keys": [],
+            "kind": "system_volume_down"
+          },
+          "volume_mute": {
+            "keys": [],
+            "kind": "system_volume_mute"
+          },
+          "volume_up": {
+            "keys": [],
+            "kind": "system_volume_up"
+          },
+          "youtube": {
+            "keys": [],
+            "kind": "disabled"
+          }
+        },
+        "display_notes": {
+          "input_source": {
+            "single_click": "\u6211\u7684\u8f93\u5165\u6e90\u64cd\u4f5c"
+          },
+          "ok": {
+            "single_click": "\u786e\u5b9a"
+          }
+        },
+        "secondary_bindings": {
+          "ok": {
+            "double_click": {
+              "kind": "disabled"
+            }
+          },
+          "power": {
+            "long_press": {
+              "keys": [
+                "f5"
+              ],
+              "kind": "key_combo"
+            }
+          }
+        }
+      },
+      "name": "\u5907\u4efd (2)",
+      "profile": "chromecast-remote"
+    },
+    {
+      "id": "eab3adaa-38eb-4b68-87d7-515555523a21",
+      "mapping": {
+        "bindings": {
+          "back": {
+            "keys": [],
+            "kind": "delete_backward"
+          },
+          "down": {
+            "keys": [],
+            "kind": "arrow_down"
+          },
+          "home": {
+            "keys": [],
+            "kind": "show_desktop"
+          },
+          "input_source": {
+            "keys": [
+              "ctrl",
+              "f9"
+            ],
+            "kind": "key_combo"
+          },
+          "left": {
+            "keys": [],
+            "kind": "arrow_left"
+          },
+          "mic": {
+            "keys": [],
+            "kind": "voice_hold"
+          },
+          "netflix": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "ok": {
+            "keys": [],
+            "kind": "mouse_right_click"
+          },
+          "power": {
+            "keys": [],
+            "kind": "escape"
+          },
+          "right": {
+            "keys": [],
+            "kind": "arrow_right"
+          },
+          "up": {
+            "keys": [],
+            "kind": "arrow_up"
+          },
+          "volume_down": {
+            "keys": [],
+            "kind": "system_volume_down"
+          },
+          "volume_mute": {
+            "keys": [],
+            "kind": "system_volume_mute"
+          },
+          "volume_up": {
+            "keys": [],
+            "kind": "system_volume_up"
+          },
+          "youtube": {
+            "keys": [],
+            "kind": "disabled"
+          }
+        },
+        "display_notes": {
+          "input_source": {
+            "single_click": "\u6211\u7684\u8f93\u5165\u6e90\u64cd\u4f5c"
+          },
+          "ok": {
+            "single_click": "\u786e\u5b9a"
+          }
+        },
+        "secondary_bindings": {
+          "power": {
+            "long_press": {
+              "keys": [
+                "f5"
+              ],
+              "kind": "key_combo"
+            }
+          }
+        }
+      },
+      "name": "A\u6539\u540d",
+      "profile": "chromecast-remote"
+    },
+    {
+      "id": "64b4f34e-9b44-4120-9d01-3f13fdc2ebc7",
+      "mapping": {
+        "bindings": {
+          "back": {
+            "keys": [],
+            "kind": "delete_backward"
+          },
+          "down": {
+            "keys": [],
+            "kind": "arrow_down"
+          },
+          "home": {
+            "keys": [],
+            "kind": "show_desktop"
+          },
+          "input_source": {
+            "keys": [
+              "ctrl",
+              "f9"
+            ],
+            "kind": "key_combo"
+          },
+          "left": {
+            "keys": [],
+            "kind": "arrow_left"
+          },
+          "mic": {
+            "keys": [],
+            "kind": "voice_hold"
+          },
+          "netflix": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "ok": {
+            "keys": [],
+            "kind": "mouse_right_click"
+          },
+          "power": {
+            "keys": [],
+            "kind": "escape"
+          },
+          "right": {
+            "keys": [],
+            "kind": "arrow_right"
+          },
+          "up": {
+            "keys": [],
+            "kind": "arrow_up"
+          },
+          "volume_down": {
+            "keys": [],
+            "kind": "system_volume_down"
+          },
+          "volume_mute": {
+            "keys": [],
+            "kind": "system_volume_mute"
+          },
+          "volume_up": {
+            "keys": [],
+            "kind": "system_volume_up"
+          },
+          "youtube": {
+            "keys": [],
+            "kind": "disabled"
+          }
+        },
+        "display_notes": {
+          "input_source": {
+            "single_click": "\u6211\u7684\u8f93\u5165\u6e90\u64cd\u4f5c"
+          },
+          "ok": {
+            "single_click": "\u786e\u5b9a"
+          }
+        },
+        "secondary_bindings": {
+          "power": {
+            "long_press": {
+              "keys": [
+                "f5"
+              ],
+              "kind": "key_combo"
+            }
+          }
+        }
+      },
+      "name": "\u914d\u7f6e A \u526f\u672c",
+      "profile": "chromecast-remote"
+    },
+    {
+      "id": "cfd96ae1-3a75-45b7-bf49-9e0df213ac35",
+      "mapping": {
+        "bindings": {
+          "back": {
+            "keys": [],
+            "kind": "delete_backward"
+          },
+          "down": {
+            "keys": [],
+            "kind": "arrow_down"
+          },
+          "home": {
+            "keys": [],
+            "kind": "show_desktop"
+          },
+          "input_source": {
+            "keys": [
+              "ctrl",
+              "f9"
+            ],
+            "kind": "key_combo"
+          },
+          "left": {
+            "keys": [],
+            "kind": "arrow_left"
+          },
+          "mic": {
+            "keys": [],
+            "kind": "voice_hold"
+          },
+          "netflix": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "ok": {
+            "keys": [],
+            "kind": "mouse_right_click"
+          },
+          "power": {
+            "keys": [],
+            "kind": "escape"
+          },
+          "right": {
+            "keys": [],
+            "kind": "arrow_right"
+          },
+          "up": {
+            "keys": [],
+            "kind": "arrow_up"
+          },
+          "volume_down": {
+            "keys": [],
+            "kind": "system_volume_down"
+          },
+          "volume_mute": {
+            "keys": [],
+            "kind": "system_volume_mute"
+          },
+          "volume_up": {
+            "keys": [],
+            "kind": "system_volume_up"
+          },
+          "youtube": {
+            "keys": [],
+            "kind": "disabled"
+          }
+        },
+        "display_notes": {
+          "input_source": {
+            "single_click": "\u6211\u7684\u8f93\u5165\u6e90\u64cd\u4f5c"
+          },
+          "ok": {
+            "single_click": "\u786e\u5b9a"
+          }
+        },
+        "secondary_bindings": {
+          "power": {
+            "long_press": {
+              "keys": [
+                "f5"
+              ],
+              "kind": "key_combo"
+            }
+          }
+        }
+      },
+      "name": "\u6709\u6548\u526f\u672c",
+      "profile": "chromecast-remote"
+    }
+  ],
+  "schema_version": 2
+}

@@ -1427,6 +1427,7 @@ def send_key_combo_tap(
     _sender: Optional[RawSender] = None,
     _key_down_query: Optional[PhysicalKeyDownQuery] = None,
     _lock_sender: Optional[WorkstationLockSender] = None,
+    _skip_physical_guard: bool = False,
 ) -> None:
     """Presses and releases every key in ``tokens`` as ONE batched SendInput
     call (all key-downs in order, then all key-ups in reverse order).
@@ -1463,7 +1464,7 @@ def send_key_combo_tap(
         _sender is not None,
         _key_down_query,
     )
-    if preflight_query is not None:
+    if preflight_query is not None and not _skip_physical_guard:
         _ensure_keys_not_physically_down(vk_codes, preflight_query)
     sender = _sender or _real_send_input_batch
     down_events: List[Tuple[int, bool]] = [(vk, False) for vk in vk_codes]
@@ -2126,11 +2127,15 @@ def send_voice_key_combo_tap(
 
 
 def send_volume_up(*, _sender: Optional[RawSender] = None) -> None:
-    _send_semantic_tap(("volume_up",), _sender=_sender)
+    # Volume keys are translated from the remote and must be injected
+    # unconditionally; the physical-key guard mislabels the remote's own
+    # Consumer HID volume event as a held key and would block the injection
+    # (see the guard self-lock in raw_input_windows physical tracking).
+    _send_semantic_tap(("volume_up",), _sender=_sender, _skip_physical_guard=True)
 
 
 def send_volume_down(*, _sender: Optional[RawSender] = None) -> None:
-    _send_semantic_tap(("volume_down",), _sender=_sender)
+    _send_semantic_tap(("volume_down",), _sender=_sender, _skip_physical_guard=True)
 
 
 # Semantic Windows actions.  These wrappers deliberately keep the action
@@ -2139,15 +2144,19 @@ def send_volume_down(*, _sender: Optional[RawSender] = None) -> None:
 # the token ``up``.  Tests can inject the same sender used by the low-level
 # helpers, while production still emits one atomic SendInput batch.
 def _send_semantic_tap(
-    tokens: Sequence[str], *, _sender: Optional[RawSender] = None
+    tokens: Sequence[str],
+    *,
+    _sender: Optional[RawSender] = None,
+    _skip_physical_guard: bool = False,
 ) -> None:
     # Calling the default path without a keyword keeps these wrappers
     # compatible with simple injected senders used by callers/tests; the
     # explicit sender path remains available for ABI/batch tests.
-    if _sender is None:
-        send_key_combo_tap(tokens)
-    else:
-        send_key_combo_tap(tokens, _sender=_sender)
+    send_key_combo_tap(
+        tokens,
+        _sender=_sender,
+        _skip_physical_guard=_skip_physical_guard,
+    )
 
 
 def send_escape(*, _sender: Optional[RawSender] = None) -> None:
@@ -2198,7 +2207,7 @@ def send_app_switcher(*, _sender: Optional[RawSender] = None) -> None:
 
 
 def send_volume_mute(*, _sender: Optional[RawSender] = None) -> None:
-    _send_semantic_tap(("volume_mute",), _sender=_sender)
+    _send_semantic_tap(("volume_mute",), _sender=_sender, _skip_physical_guard=True)
 
 
 def send_play_pause(*, _sender: Optional[RawSender] = None) -> None:

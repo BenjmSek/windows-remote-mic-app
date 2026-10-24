@@ -1,0 +1,347 @@
+{
+  "remote_settings": {
+    "records": {
+      "48524c1aa9e626abe99b0d339b3cba3ae612491c928fedcd1b2c646ae718ace2": {
+        "bindings": {
+          "back": {
+            "keys": [],
+            "kind": "delete_backward"
+          },
+          "down": {
+            "keys": [],
+            "kind": "arrow_down"
+          },
+          "home": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "input_source": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "left": {
+            "keys": [],
+            "kind": "arrow_left"
+          },
+          "mic": {
+            "keys": [],
+            "kind": "voice_hold"
+          },
+          "netflix": {
+            "keys": [],
+            "kind": "play_pause"
+          },
+          "ok": {
+            "keys": [],
+            "kind": "return"
+          },
+          "power": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "right": {
+            "keys": [],
+            "kind": "arrow_right"
+          },
+          "up": {
+            "keys": [],
+            "kind": "arrow_up"
+          },
+          "volume_down": {
+            "keys": [],
+            "kind": "system_volume_down"
+          },
+          "volume_mute": {
+            "keys": [],
+            "kind": "return"
+          },
+          "volume_up": {
+            "keys": [],
+            "kind": "system_volume_up"
+          },
+          "youtube": {
+            "keys": [],
+            "kind": "disabled"
+          }
+        },
+        "combo_bindings": {
+          "bindings": {},
+          "display_notes": {},
+          "modifier": "tv"
+        },
+        "display_notes": {},
+        "physical_bindings": {},
+        "secondary_bindings": {}
+      },
+      "5c9c4cb92e474060c466c423cc41f0c38d97ce4d391bcadcdd4f06e252887dad": {
+        "bindings": {
+          "back": {
+            "keys": [],
+            "kind": "delete_backward"
+          },
+          "down": {
+            "keys": [],
+            "kind": "arrow_down"
+          },
+          "home": {
+            "keys": [],
+            "kind": "show_desktop"
+          },
+          "input_source": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "left": {
+            "keys": [],
+            "kind": "arrow_left"
+          },
+          "mic": {
+            "keys": [],
+            "kind": "voice_hold"
+          },
+          "netflix": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "ok": {
+            "keys": [],
+            "kind": "return"
+          },
+          "power": {
+            "keys": [
+              "ctrl",
+              "c"
+            ],
+            "kind": "key_combo"
+          },
+          "right": {
+            "keys": [],
+            "kind": "arrow_right"
+          },
+          "up": {
+            "keys": [],
+            "kind": "arrow_up"
+          },
+          "volume_down": {
+            "keys": [],
+            "kind": "system_volume_down"
+          },
+          "volume_mute": {
+            "keys": [],
+            "kind": "system_volume_mute"
+          },
+          "volume_up": {
+            "keys": [],
+            "kind": "system_volume_up"
+          },
+          "youtube": {
+            "keys": [],
+            "kind": "disabled"
+          }
+        },
+        "combo_bindings": {
+          "bindings": {},
+          "display_notes": {},
+          "modifier": "tv"
+        },
+        "display_notes": {
+          "power": {
+            "single_click": "\u590d\u5236"
+          }
+        },
+        "physical_bindings": {},
+        "secondary_bindings": {}
+      },
+      "7f08b04d0fae680a96c1392a3c95e652587516d72485b4b3c84ccb13ed7866d7": {
+        "bindings": {
+          "back": {
+            "keys": [],
+            "kind": "delete_backward"
+          },
+          "down": {
+            "keys": [],
+            "kind": "arrow_down"
+          },
+          "home": {
+            "keys": [],
+            "kind": "show_desktop"
+          },
+          "input_source": {
+            "keys": [
+              "ctrl",
+              "f9"
+            ],
+            "kind": "key_combo"
+          },
+          "left": {
+            "keys": [],
+            "kind": "arrow_left"
+          },
+          "mic": {
+            "keys": [],
+            "kind": "voice_toggle"
+          },
+          "netflix": {
+            "keys": [],
+            "kind": "disabled"
+          },
+          "ok": {
+            "keys": [],
+            "kind": "mouse_right_click"
+          },
+          "power": {
+            "keys": [
+              "vk_a2",
+              "shift"
+            ],
+            "kind": "key_combo"
+          },
+          "right": {
+            "keys": [],
+            "kind": "arrow_right"
+          },
+          "up": {
+            "keys": [],
+            "kind": "arrow_up"
+          },
+          "volume_down": {
+            "keys": [],
+            "kind": "system_volume_down"
+          },
+          "volume_mute": {
+            "keys": [],
+            "kind": "system_volume_mute"
+          },
+          "volume_up": {
+            "keys": [],
+            "kind": "system_volume_up"
+          },
+          "youtube": {
+            "keys": [],
+            "kind": "disabled"
+          }
+        },
+        "combo_bindings": {
+          "bindings": {},
+          "display_notes": {},
+          "modifier": "tv"
+        },
+        "display_notes": {
+          "input_source": {
+            "single_click": "\u6211\u7684\u8f93\u5165\u6e90\u64cd\u4f5c"
+          },
+          "ok": {
+            "single_click": "\u786e\u5b9a"
+          }
+        },
+        "physical_bindings": {},
+        "secondary_bindings": {
+          "power": {
+            "double_click": {
+              "keys": [
+                "vk_11"
+              ],
+              "kind": "key_combo"
+            },
+            "long_press": {
+              "keys": [
+                "vk_00"
+              ],
+              "kind": "key_combo"
+            }
+          }
+        }
+      }
+    },
+    "schema": 1,
+    "unassigned": {
+      "bindings": {
+        "back": {
+          "keys": [],
+          "kind": "delete_backward"
+        },
+        "down": {
+          "keys": [],
+          "kind": "arrow_down"
+        },
+        "home": {
+          "keys": [],
+          "kind": "show_desktop"
+        },
+        "left": {
+          "keys": [],
+          "kind": "arrow_left"
+        },
+        "mic": {
+          "keys": [],
+          "kind": "voice_hold"
+        },
+        "ok": {
+          "keys": [],
+          "kind": "escape"
+        },
+        "power": {
+          "keys": [
+            "ctrl",
+            "l"
+          ],
+          "kind": "key_combo"
+        },
+        "right": {
+          "keys": [],
+          "kind": "arrow_right"
+        },
+        "up": {
+          "keys": [],
+          "kind": "arrow_up"
+        },
+        "volume_down": {
+          "keys": [],
+          "kind": "system_volume_down"
+        },
+        "volume_up": {
+          "keys": [],
+          "kind": "system_volume_up"
+        }
+      },
+      "combo_bindings": {
+        "bindings": {},
+        "display_notes": {},
+        "modifier": "tv"
+      },
+      "display_notes": {
+        "power": {
+          "double_click": "\u53d6\u6d88",
+          "long_press": "\u786e\u8ba4",
+          "single_click": "\u590d\u5236"
+        }
+      },
+      "physical_bindings": {},
+      "secondary_bindings": {
+        "ok": {
+          "double_click": {
+            "keys": [
+              "f5"
+            ],
+            "kind": "key_combo"
+          },
+          "long_press": {
+            "keys": [],
+            "kind": "system_volume_up"
+          }
+        },
+        "power": {
+          "double_click": {
+            "keys": [],
+            "kind": "escape"
+          },
+          "long_press": {
+            "keys": [],
+            "kind": "return"
+          }
+        }
+      }
+    }
+  },
+  "schema_version": 17
+}

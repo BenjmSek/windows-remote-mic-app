@@ -18,8 +18,8 @@ WINDOWS_RUNTIME_DIRECTORY_NAME = "程序文件"
 
 _VERSION_PATTERN = re.compile(
     r"(?P<major>0|[1-9][0-9]*)\."
-    r"(?P<minor>0|[1-9][0-9]*)"
-    r"(?:\.(?P<patch>0|[1-9][0-9]*))?"
+    r"(?P<minor>0|[1-9][0-9]*)\."
+    r"(?P<patch>0|[1-9][0-9]*)"
     r"(?:-(?P<suffix>[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*))?"
 )
 _WINDOWS_EXECUTABLE_PATTERN = re.compile(
@@ -63,18 +63,11 @@ def windows_executable_name(version: str) -> str:
 
 
 def windows_fixed_file_version(version: str) -> tuple[int, int, int, int]:
-    """Map the semantic version to the numeric Windows fixed-file tuple.
-
-    The patch component is optional in a VERSION file ("0.1" is legal), but the
-    Windows fixed-file tuple is always four numbers, so a missing patch is
-    reported as 0 rather than rejected.
-    """
+    """Map the semantic version to the numeric Windows fixed-file tuple."""
 
     match = _VERSION_PATTERN.fullmatch(validate_version(version))
     assert match is not None
-    values = tuple(
-        int(match.group(name) or 0) for name in ("major", "minor", "patch")
-    )
+    values = tuple(int(match.group(name)) for name in ("major", "minor", "patch"))
     if any(value > _WINDOWS_VERSION_COMPONENT_MAX for value in values):
         raise ValueError("Windows version component exceeds 65535")
     return (*values, 0)

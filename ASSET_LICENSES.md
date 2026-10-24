@@ -1,44 +1,82 @@
 # Asset licenses
 
-This file covers files that are **not** covered by a software license: photos and
-icon art. Software licenses are in `THIRD_PARTY_NOTICES.md`.
+Release status: APPROVED
 
-## Remote photo
+## Chromecast product photo
 
-| Field | Value |
-| --- | --- |
-| File | `Resources/Chromecast-remote-photo.png` |
-| SHA-256 | `72f0350e9cafd91f2d13c7aa8618fbd5e6c89f27effdb46d74ededdb093f9712` |
-| Size | 284,603 bytes |
-| Status | Permission granted, redistributed unchanged |
+- File: `Resources/Chromecast-remote-photo.png`
+- Origin: user-supplied JANN.library image selected for the Chromecast mapping page on 2026-09-16
+- Import: copied without pixel changes; SHA-256 `72F0350E9CAFD91F2D13C7AA8618FBD5E6C89F27EFFDB46D74EDEDDB093F9712`
+- Copyright owner: the repository maintainer, confirmed on 2026-09-24
+- Permission: the owner authorized public redistribution of this unchanged image
+  with Remote Mic on 2026-09-24; no broader reuse or modification license is
+  implied by this record
 
-The photo is a photograph of a Google Chromecast voice remote. Its owner
-authorized public redistribution of this unchanged image with Remote Mic on
-2026-09-24. That authorization was recorded by the upstream project
-[`ZSTDJan/windows-remote-mic-app`](https://github.com/ZSTDJan/windows-remote-mic-app)
-in its own `ASSET_LICENSES.md`, and the SHA-256 above matches the digest
-recorded there byte for byte — this branch ships the same, unmodified file.
+## Windows application icons
 
-The permission covers redistribution of this image with this project. It does
-not transfer any trademark right in Google or Chromecast branding, and it does
-not authorize anyone to reuse the photo for other purposes. If the permission is
-ever withdrawn, remove the file and the two `_PHOTO_FILENAMES` entries in
-`src/ovb/resources.py`; the device page then renders as text only.
+- Files: `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-connected.svg`,
+  `apps/windows/rc003/src/ovb_rc003/assets/icons/remote-mic-unavailable.svg`, and
+  the generated `remote-mic.ico`
+- Origin: the maintainer's selected `JANN.library` microphone and
+  microphone-off designs, finalized for Remote Mic with `#4AA8FF` strokes
+- Copyright owner: the repository maintainer, confirmed on 2026-09-24
+- Permission: the owner approved public distribution of these exact finalized
+  blue SVGs and the ICO generated from the connected SVG with Remote Mic on
+  2026-09-24. This record does not authorize other changes to the designs.
 
-## Application icon
+## RC003 product image
 
-| File | SHA-256 | Size |
-| --- | --- | --- |
-| `src/ovb/assets/icons/remote-mic.ico` | `e937bbe408e5de2c6a4d9c34f8d5a8834fc7bb979d2f40d8697fca9019d12c43` | 17,198 |
-| `src/ovb/assets/icons/remote-mic-connected.svg` | `61c6688992d3beaa2aff43cae9bd49bc5a4776b39c8945d90b2b12e6697ecefc` | 320 |
-| `src/ovb/assets/icons/remote-mic-unavailable.svg` | `24b7ab46bdb7d58fe85ce2c2e921449fe1bf80cf50a0aebb76d2c2c577dfd3de` | 437 |
+- File: `Resources/RC003-remote-photo.png`
+- Origin: independently created by the repository maintainer from a personally
+  owned RC003 product; no third-party photograph or promotional image was used
+- Copyright: Copyright (C) 2026 Remote Mic contributors
+- License: GPL-3.0-only, the same license as this repository
+- Public redistribution and modification: permitted under GPL-3.0-only
 
-These are original artwork for this project and are covered by the repository's
-`GPL-3.0-only` license. `COPYRIGHT.md` names the contributors. The brand blue
-`#4AA8FF` in the two SVG state icons is asserted by
-`tests/test_application_icon.py`; changing it turns that test red.
+The product name, product appearance and any visible third-party marks remain
+the property of their respective owners. They are shown only to identify the
+compatible device and do not imply endorsement.
 
-## Not shipped
+## Windows application screenshots
 
-The upstream project's `RC003-remote-photo.png` (Xiaomi remote) is **not**
-included in this branch — the Xiaomi remote path is not part of this fork.
+- Files: `docs/screenshots/settings-buttons.png`,
+  `docs/screenshots/settings-connection.png`, and
+  `docs/screenshots/settings-voice.png`, plus the annotated configuration
+  examples `docs/screenshots/device-ready-status.jpg` and
+  `docs/screenshots/voice-configuration-example.jpg`
+- Origin: captured by the repository maintainer from this repository's own
+  Windows application on a personally controlled test system
+- Private data: the published copies contain no user identity, local file
+  path, device address, account credential, or secret
+- Copyright: Copyright (C) 2026 Remote Mic contributors
+- License: GPL-3.0-only, the same license as this repository
+- Public redistribution and modification: permitted under GPL-3.0-only
+
+Third-party product names visible in the interface are compatibility examples
+only. Their names and marks remain the property of their respective owners and
+do not imply inclusion in, sponsorship of, or endorsement of this project.
+
+## Homepage interface screenshots
+
+- Files: `docs/screenshots/google-buttons.jpg`,
+  `docs/screenshots/xiaomi-buttons.jpg`,
+  `docs/screenshots/device-overview.jpg`, and
+  `docs/screenshots/voice-overview.jpg`
+- Origin: application screenshots supplied by the repository maintainer on
+  2026-09-24 for the public GitHub homepage
+- Modification: dark outer corner pixels were replaced with white and the
+  JPEG files were re-encoded; the displayed interface content was unchanged
+- Permission: the maintainer expressly authorized publication in this
+  repository's README; this entry does not assign a license to unrelated uses
+
+## Homepage remote comparison and QQ code
+
+- File: `docs/images/remote-comparison.png`
+- Origin: the side-by-side remote photograph and illustrations supplied by the
+  repository maintainer on 2026-09-24 for the public GitHub homepage
+- Modification: copied unchanged from the supplied PNG
+- Permission: publication in this repository's README as requested by the
+  maintainer; visible device and store names do not imply endorsement
+- File: `docs/images/qq-group-89641716.png`
+- Modification: cropped the existing poster to its QR square and white quiet
+  zone; every pixel inside the retained rectangle is unchanged

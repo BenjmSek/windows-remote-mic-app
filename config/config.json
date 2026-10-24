@@ -1,0 +1,126 @@
+{
+  "app_log_enabled": false,
+  "audio_ducking_enabled": true,
+  "close_behavior": "hide_to_tray",
+  "diagnostic_trace_enabled": false,
+  "disable_audio_sending": true,
+  "hid_helper_setup_prompted_offer_id": "",
+  "launch_bridge_on_app_start": true,
+  "remote_selection": {
+    "active": "48524c1aa9e626abe99b0d339b3cba3ae612491c928fedcd1b2c646ae718ace2",
+    "devices": [
+      {
+        "key": "48524c1aa9e626abe99b0d339b3cba3ae612491c928fedcd1b2c646ae718ace2",
+        "profile": "chromecast-remote"
+      }
+    ],
+    "schema": 1
+  },
+  "remote_settings": {
+    "records": {
+      "48524c1aa9e626abe99b0d339b3cba3ae612491c928fedcd1b2c646ae718ace2": {
+        "gain_db": 10.0,
+        "output_endpoint_host_api": "Windows WASAPI",
+        "output_endpoint_name": "CABLE Input (VB-Audio Virtual Cable)",
+        "remote_recording_limit_seconds": 120,
+        "remote_recording_mode": "hold",
+        "voice_hotkey": "lctrl+lwin+lalt",
+        "voice_hotkeys": {
+          "hold": "lctrl+lwin+lalt"
+        },
+        "voice_hotkeys_by_provider": {
+          "chatterfly": {
+            "hold": "",
+            "source": "default"
+          },
+          "custom": {
+            "hold": "ralt",
+            "source": "default"
+          },
+          "doubao_ime": {
+            "hold": "lctrl+lwin+lalt",
+            "source": "manual"
+          },
+          "none": {
+            "hold": "ralt",
+            "source": "manual"
+          },
+          "sogou": {
+            "hold": "rctrl",
+            "source": "default"
+          },
+          "wetype": {
+            "hold": "ctrl+shift+f9",
+            "source": "manual"
+          }
+        },
+        "voice_program": {
+          "custom_executable": "",
+          "launch_elevated": true,
+          "launch_elevated_by_provider": {
+            "custom": false,
+            "sogou": true
+          },
+          "launch_on_bridge_start": false,
+          "launch_on_bridge_start_by_provider": {
+            "sogou": true
+          },
+          "provider": "doubao_ime"
+        },
+        "voice_trigger_mode": "hold"
+      }
+    },
+    "schema": 1,
+    "unassigned": {
+      "gain_db": 10.0,
+      "output_endpoint_host_api": "Windows WASAPI",
+      "output_endpoint_name": "CABLE Input",
+      "remote_recording_limit_seconds": 120,
+      "remote_recording_mode": "hold",
+      "voice_hotkey": "ralt",
+      "voice_hotkeys": {
+        "hold": "ralt"
+      },
+      "voice_hotkeys_by_provider": {
+        "chatterfly": {
+          "hold": "",
+          "source": "default"
+        },
+        "custom": {
+          "hold": "ralt",
+          "source": "default"
+        },
+        "doubao_ime": {
+          "hold": "ralt",
+          "source": "default"
+        },
+        "none": {
+          "hold": "ralt",
+          "source": "default"
+        },
+        "sogou": {
+          "hold": "rctrl",
+          "source": "default"
+        },
+        "wetype": {
+          "hold": "lctrl+lwin",
+          "source": "default"
+        }
+      },
+      "voice_program": {
+        "custom_executable": "",
+        "launch_elevated": false,
+        "launch_elevated_by_provider": {
+          "custom": false,
+          "sogou": true
+        },
+        "launch_on_bridge_start": false,
+        "launch_on_bridge_start_by_provider": {},
+        "provider": "none"
+      },
+      "voice_trigger_mode": "hold"
+    }
+  },
+  "schema_version": 17,
+  "voice_physical_key": "lwin"
+}

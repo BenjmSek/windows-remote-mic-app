@@ -41,8 +41,6 @@ class ProductIdentityTests(unittest.TestCase):
             "无线麦Mod win版 1.0.51-candidate.51.exe": "current",
             "无线麦Mod WIN版 1.0.51-candidate.51.EXE": "current",
             "无线麦Mod win版 1.0.51.exe": "current",
-            # A two-component version is legal, so it is a shipped layout too.
-            "无线麦Mod win版 0.1.exe": "current",
         }
         for name, layout in cases.items():
             with self.subTest(name=name):
@@ -60,6 +58,7 @@ class ProductIdentityTests(unittest.TestCase):
             "REMOTEMICChromecast.EXE",
             "RemoteMicChromecast-old.exe",
             "无线麦Mod win版.exe",
+            "无线麦Mod win版 1.0.exe",
             "无线麦Mod win版 01.0.51.exe",
             "无线麦Mod win版 1.0.51-.exe",
             "C:\\Apps\\无线麦Mod win版 1.0.51.exe",
@@ -85,6 +84,7 @@ class ProductIdentityTests(unittest.TestCase):
     def test_windows_version_rejects_unsafe_or_unrepresentable_values(self):
         for version in (
             " 1.0.51",
+            "1.0",
             "1.0.51-",
             "1.0.51/other",
             "1.0.51\\other",
@@ -105,32 +105,6 @@ class ProductIdentityTests(unittest.TestCase):
             product_identity.windows_fixed_file_version("1.0.51"), (1, 0, 51, 0)
         )
         self.assertFalse(product_identity.windows_version_is_prerelease("1.0.51"))
-
-    def test_two_component_version_keeps_a_zero_patch(self):
-        """A VERSION file may omit the patch component ("0.1").
-
-        The Windows fixed-file tuple is always four numbers, so the missing
-        patch becomes 0 instead of being rejected.
-        """
-
-        self.assertEqual(product_identity.validate_version("0.1"), "0.1")
-        self.assertEqual(
-            product_identity.windows_fixed_file_version("0.1"), (0, 1, 0, 0)
-        )
-        self.assertEqual(
-            product_identity.windows_executable_name("0.1"),
-            "无线麦Mod win版 0.1.exe",
-        )
-        self.assertFalse(product_identity.windows_version_is_prerelease("0.1"))
-        self.assertEqual(
-            product_identity.windows_runtime_relative_directory_for_executable(
-                "无线麦Mod win版 0.1.exe"
-            ),
-            Path("程序文件"),
-        )
-        # A bare major alone is still not a version.
-        with self.assertRaises(ValueError):
-            product_identity.validate_version("1")
 
     def test_user_visible_name_has_one_runtime_source(self):
         self.assertEqual(product_identity.DISPLAY_NAME, "无线麦Mod")
