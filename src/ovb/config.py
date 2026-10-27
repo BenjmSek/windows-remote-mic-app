@@ -49,6 +49,25 @@ VALID_CLOSE_BEHAVIORS = frozenset(
     {CLOSE_BEHAVIOR_HIDE_TO_TRAY, CLOSE_BEHAVIOR_QUIT}
 )
 
+# How the TSF input-profile switch around a voice shortcut behaves.
+#   persistent - activate the voice input method and leave it active (this is
+#                the historical behaviour; stop() never switches back).
+#   temporary  - activate it, then restore whatever was active before once the
+#                shortcut is released (after a short grace period).
+#   off        - never touch the active input method.
+VOICE_INPUT_PROFILE_MODE_PERSISTENT = "persistent"
+VOICE_INPUT_PROFILE_MODE_TEMPORARY = "temporary"
+VOICE_INPUT_PROFILE_MODE_OFF = "off"
+VALID_VOICE_INPUT_PROFILE_MODES = frozenset(
+    {
+        VOICE_INPUT_PROFILE_MODE_PERSISTENT,
+        VOICE_INPUT_PROFILE_MODE_TEMPORARY,
+        VOICE_INPUT_PROFILE_MODE_OFF,
+    }
+)
+# Legacy boolean key replaced by voice_input_profile_mode.
+LEGACY_ACTIVATE_VOICE_INPUT_PROFILE_KEY = "activate_voice_input_profile"
+
 # The physical-key tri-state feature watches exactly one modifier. Chords are
 # rejected on purpose: the whole design needs a single key whose tap keeps a
 # native meaning while a hold stands in for the voice shortcut.
@@ -187,7 +206,9 @@ def default_config() -> Dict[str, Any]:
         # WeType can be summoned while another input method stays active, so
         # turning this off leaves the current input method alone and relies on
         # that provider's own global hotkey instead.
-        "activate_voice_input_profile": True,
+        # "persistent" keeps the voice input method active after the shortcut,
+        # "temporary" restores the previously active one, "off" never switches.
+        "voice_input_profile_mode": VOICE_INPUT_PROFILE_MODE_PERSISTENT,
         # Opt in to sending the voice key even when no playback endpoint can
         # be opened. Voice normally fails closed on the audio output so a
         # broken sink is reported instead of silently dropped.
@@ -591,6 +612,26 @@ def normalize_voice_physical_key(value: object) -> str:
     return canonical
 
 
+def normalize_voice_input_profile_mode(
+    value: Any, legacy_value: Any = None
+) -> str:
+    """Return one of VALID_VOICE_INPUT_PROFILE_MODES.
+
+    ``legacy_value`` accepts the retired boolean ``activate_voice_input_profile``
+    so an existing config keeps its meaning: True -> persistent (switch and keep
+    it), False -> off (never switch). An explicit new key always wins.
+    """
+    if isinstance(value, str):
+        mode = value.strip().lower()
+        if mode in VALID_VOICE_INPUT_PROFILE_MODES:
+            return mode
+    if isinstance(legacy_value, bool):
+        if legacy_value:
+            return VOICE_INPUT_PROFILE_MODE_PERSISTENT
+        return VOICE_INPUT_PROFILE_MODE_OFF
+    return VOICE_INPUT_PROFILE_MODE_PERSISTENT
+
+
 def _normalize_desktop_behavior(config: Dict[str, Any]) -> None:
     config["voice_physical_key"] = normalize_voice_physical_key(
         config.get("voice_physical_key", "")
@@ -604,8 +645,9 @@ def _normalize_desktop_behavior(config: Dict[str, Any]) -> None:
     config["app_log_enabled"] = bool(
         config.get("app_log_enabled", True)
     )
-    config["activate_voice_input_profile"] = bool(
-        config.get("activate_voice_input_profile", True)
+    config["voice_input_profile_mode"] = normalize_voice_input_profile_mode(
+        config.get("voice_input_profile_mode"),
+        config.pop(LEGACY_ACTIVATE_VOICE_INPUT_PROFILE_KEY, None),
     )
     config["disable_audio_sending"] = bool(
         config.get("disable_audio_sending", False)

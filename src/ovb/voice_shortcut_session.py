@@ -8,9 +8,9 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
-from . import (hotkey, voice_controller, voice_program_manager, wetype_control_windows,
-               win32_input, win32_keys, bridge_runtime_status, doubao_rpc,
-               chatterfly_control_windows)
+from . import (config, hotkey, voice_controller, voice_program_manager,
+               wetype_control_windows, win32_input, win32_keys,
+               bridge_runtime_status, doubao_rpc, chatterfly_control_windows)
 
 _VOICE_HOTKEY_RELEASE_RETRY_INITIAL_SECONDS = 0.1
 _VOICE_HOTKEY_RELEASE_RETRY_MAX_SECONDS = 2.0
@@ -21,6 +21,20 @@ _VOICE_HOTKEY_BACKEND_DOUBAO = "doubao_hotkey"
 _INPUT_PROFILE_VOICE_HOTKEY_BACKENDS = frozenset(
     {_VOICE_HOTKEY_BACKEND_WETYPE, _VOICE_HOTKEY_BACKEND_DOUBAO}
 )
+
+
+def voice_input_profile_mode(settings: dict) -> str:
+    """Resolve the TSF mode from a settings snapshot.
+
+    Accepts both the current string key and the retired boolean so a config
+    that has not been rewritten yet still resolves predictably.
+    """
+    if not isinstance(settings, dict):
+        return config.VOICE_INPUT_PROFILE_MODE_PERSISTENT
+    return config.normalize_voice_input_profile_mode(
+        settings.get("voice_input_profile_mode"),
+        settings.get(config.LEGACY_ACTIVATE_VOICE_INPUT_PROFILE_KEY),
+    )
 
 @dataclass(frozen=True)
 class ShortcutServices:
@@ -369,25 +383,32 @@ class VoiceShortcutSession:
                 )
             # The provider is summoned by its own global hotkey when the user
             # turns the input-profile switch off; hold/toggle both honour it.
+            # The mode is read fresh on every key so a settings change takes
+            # effect on the next press without restarting anything.
             activate_profile = True
+            restore_profile = False
             if action == voice_controller.VoiceHostAction.KEY_DOWN:
                 try:
-                    activate_profile = bool(
-                        (self.services.settings() or {}).get(
-                            "activate_voice_input_profile", True
-                        )
-                    )
+                    settings = self.services.settings() or {}
                 except Exception:
-                    activate_profile = True
+                    settings = {}
+                mode = voice_input_profile_mode(settings)
+                activate_profile = mode != config.VOICE_INPUT_PROFILE_MODE_OFF
+                restore_profile = mode == config.VOICE_INPUT_PROFILE_MODE_TEMPORARY
             try:
                 if action == voice_controller.VoiceHostAction.KEY_DOWN:
                     delivered = (
-                        control.start(tokens, activate_profile=activate_profile)
+                        control.start(
+                            tokens,
+                            activate_profile=activate_profile,
+                            restore_profile=restore_profile,
+                        )
                         if cancelled is None
                         else control.start(
                             tokens,
                             cancelled=cancelled,
                             activate_profile=activate_profile,
+                            restore_profile=restore_profile,
                         )
                     )
                 else:

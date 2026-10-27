@@ -60,7 +60,11 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(defaults["gain_db"], 10.0)
         self.assertFalse(defaults["launch_bridge_on_app_start"])
         self.assertFalse(defaults["diagnostic_trace_enabled"])
-        self.assertTrue(defaults["activate_voice_input_profile"])
+        self.assertEqual(
+            defaults["voice_input_profile_mode"],
+            config.VOICE_INPUT_PROFILE_MODE_PERSISTENT,
+        )
+        self.assertNotIn("activate_voice_input_profile", defaults)
         self.assertEqual(
             defaults["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )
@@ -106,15 +110,49 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
             loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )
 
-    def test_voice_input_profile_switch_is_persisted_as_a_boolean(self):
+    def test_voice_input_profile_mode_is_normalised(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
             path.write_text(
-                json.dumps({"activate_voice_input_profile": 0}),
+                json.dumps({"voice_input_profile_mode": "temporary"}),
                 encoding="utf-8",
             )
             loaded = config.load_config(path)
-        self.assertFalse(loaded["activate_voice_input_profile"])
+        self.assertEqual(
+            loaded["voice_input_profile_mode"],
+            config.VOICE_INPUT_PROFILE_MODE_TEMPORARY,
+        )
+        self.assertNotIn("activate_voice_input_profile", loaded)
+
+    def test_voice_input_profile_mode_rejects_unknown_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"voice_input_profile_mode": "nonsense"}),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertEqual(
+            loaded["voice_input_profile_mode"],
+            config.VOICE_INPUT_PROFILE_MODE_PERSISTENT,
+        )
+
+    def test_legacy_boolean_switch_migrates_to_the_mode(self):
+        cases = {
+            True: config.VOICE_INPUT_PROFILE_MODE_PERSISTENT,
+            False: config.VOICE_INPUT_PROFILE_MODE_OFF,
+        }
+        for legacy, expected in cases.items():
+            with self.subTest(legacy=legacy):
+                with tempfile.TemporaryDirectory() as tmp:
+                    path = Path(tmp) / "config.json"
+                    path.write_text(
+                        json.dumps({"activate_voice_input_profile": legacy}),
+                        encoding="utf-8",
+                    )
+                    loaded = config.load_config(path)
+                self.assertEqual(loaded["voice_input_profile_mode"], expected)
+                self.assertNotIn("activate_voice_input_profile", loaded)
 
     def test_legacy_hide_to_tray_choice_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:

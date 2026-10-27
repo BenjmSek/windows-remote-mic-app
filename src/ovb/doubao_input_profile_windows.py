@@ -17,6 +17,11 @@ from . import wetype_control_windows as profiles
 
 _AIC_PROXY_IID = profiles._guid_bytes("c1a97c88-de59-470f-adcb-a6c916fca6c2")
 _SWITCH_TIMEOUT_SECONDS = 0.4
+# A restore happens 1.5s after key-up, with no user gesture in flight and no
+# voice capture waiting on it. The press path must stay tight because Doubao
+# is about to receive the shortcut, but a restore that gives up after 0.4s
+# never landed (measured: TimeoutError on every restore attempt).
+_RESTORE_TIMEOUT_SECONDS = 2.0
 # Observed Doubao 0.9 caches its foreground decision for 100 ms. After a cold
 # switch, keep the confirmed profile stable past that cache; not voice readiness.
 _COLD_PROFILE_STABLE_SECONDS = 0.12
@@ -152,9 +157,14 @@ class _ActiveContextProxy:
     def activate(self, target):
         clsid = profiles._native_guid(target.clsid)
         guid = profiles._native_guid(target.profile_guid)
+        # hkl is the ONLY identity for a keyboard-layout profile: its clsid and
+        # profile GUID are all-zero, so passing NULL here makes the switch
+        # unidentifiable and it can never converge (measured: restoring to an
+        # English layout always hit the 0.4s timeout and never switched back).
         _require_ok(_method(self._proxy, 12, ctypes.c_uint16, wintypes.HKL,
             ctypes.POINTER(profiles._GUID), ctypes.POINTER(profiles._GUID))(
-                self._proxy, target.language_id, None, ctypes.byref(clsid), ctypes.byref(guid)),
+                self._proxy, target.language_id, wintypes.HKL(int(target.hkl)),
+                ctypes.byref(clsid), ctypes.byref(guid)),
             "request targeted switch")
 
     def pump(self, seconds):
@@ -175,14 +185,19 @@ class _ActiveContextProxy:
             time.sleep(min(.005, max(0, end - time.monotonic())))
 
 
-def activate_for_target(target, *, cancelled, trace, expected=None):
+def activate_for_target(target, *, cancelled, trace, expected=None, timeout_seconds=None):
     """Request once, confirm the same input target, never roll back or broadcast.
 
     Profile confirmation is not proof that Doubao has started voice capture.
     The caller still uses the existing capture confirmation for that decision.
+
+    ``timeout_seconds`` widens the budget for a deferred restore, which has no
+    gesture waiting on it; the press path keeps the tight default.
     """
     expected = expected or current_target()
-    deadline = time.monotonic() + _SWITCH_TIMEOUT_SECONDS
+    deadline = time.monotonic() + (
+        _SWITCH_TIMEOUT_SECONDS if timeout_seconds is None else float(timeout_seconds)
+    )
     requested = False
     confirmed_since = None
     last_snapshot = None

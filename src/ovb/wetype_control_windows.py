@@ -9,6 +9,7 @@ SendInput edges. Window visibility is diagnostic only and never gates audio.
 from __future__ import annotations
 
 import ctypes
+import itertools
 import logging
 import os
 import threading
@@ -88,6 +89,265 @@ _STA_DISPATCH_LOCK = threading.Lock()
 _selection_operation = None
 _STA_REQUEST_LOCAL = threading.local()
 _diagnostic_trace: Optional[diagnostic_trace.DiagnosticTrace] = None
+
+# "Temporary" profile mode: the shortcut is released before the input method
+# has finished capturing, so the restore is deferred by this grace period.
+# Tuned by hand; make it a module constant so it stays adjustable.
+_PROFILE_RESTORE_DELAY_SECONDS = 1.0
+# Bounds for the targeted (focused-thread) snapshot/restore helpers.
+_FOCUSED_PROFILE_WAIT_SECONDS = 1.0
+_FOCUSED_PROFILE_TIMEOUT_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class _PendingProfileRestore:
+    """One deferred input-profile restore owned by a control session."""
+
+    generation: int
+    previous: "_InputProfileSnapshot"
+    provider: str = "wetype"
+
+
+_PROFILE_RESTORE_LOCK = threading.Lock()
+_profile_restores: "dict[int, _PendingProfileRestore]" = {}
+_profile_restore_timers: "dict[int, threading.Timer]" = {}
+_profile_restore_generation = itertools.count(1)
+
+
+def _read_active_profile() -> Optional["_InputProfileSnapshot"]:
+    """Snapshot the globally active TSF keyboard profile, or None on failure.
+
+    This is the *session default*, read through ``GetActiveProfile`` on a
+    throwaway STA thread. It does NOT see a per-window switch made through
+    the targeted active-context proxy (see ``_read_focused_profile``): the
+    two can legitimately differ, which is why "temporary" restore must not
+    compare one against the other.
+    """
+
+    try:
+        with _InputProfileManager() as manager:
+            return manager.get_active_profile()
+    except Exception:  # noqa: BLE001 - restore is best effort
+        return None
+
+
+def _focused_profile_snapshot() -> Optional["_InputProfileSnapshot"]:
+    """Snapshot the profile of the *focused window's thread*. Must run on STA.
+
+    Kept separate from ``_read_focused_profile`` because callers such as
+    ``WeTypeVoiceControl.start`` already wrap this in ``_run_sta``; nesting
+    another ``_run_on_sta_thread`` would hit the single-operation lock and
+    fail, silently downgrading every caller to the session-level scope.
+    """
+
+    try:
+        from . import doubao_input_profile_windows as directed
+
+        target = directed.current_target()
+        with directed._ActiveContextProxy() as proxy:
+            deadline = time.monotonic() + _FOCUSED_PROFILE_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                proxy.pump(0.005)
+                if proxy.context() == (target.focus_thread_id, target.focus_hwnd):
+                    return proxy.active_profile()
+            return None
+    except Exception:  # noqa: BLE001 - snapshot is best effort
+        return None
+
+
+def _read_focused_profile() -> Optional["_InputProfileSnapshot"]:
+    """Snapshot the focused thread's profile from any caller.
+
+    ``prepare()``/``start()`` invoke this *through* ``_run_sta``, i.e. already
+    on the STA worker that owns ``_STA_OPERATION_LOCK``. Dispatching another
+    STA operation from there would fail the single-operation lock, and the
+    swallowed failure made ``_previous_profile`` None - so "temporary" never
+    armed a restore at all. Run inline when we are already the worker.
+    """
+
+    if getattr(_STA_REQUEST_LOCAL, "operation", None) is not None:
+        return _focused_profile_snapshot()
+    try:
+        return _run_on_sta_thread(_focused_profile_snapshot)
+    except Exception:  # noqa: BLE001 - snapshot is best effort
+        return None
+
+
+def _restore_focused_profile(
+    previous: "_InputProfileSnapshot", provider: str = "wetype"
+) -> Optional[bool]:
+    """Switch the focused thread's profile back through the targeted proxy.
+
+    Must run on an STA thread. Best effort, never raises.
+
+    Returns True when it switched, False when the focused thread already sat
+    on ``previous`` (``activate_for_target`` reports ``switched=False``), and
+    None when the targeted channel failed. The caller must distinguish the
+    last two: ``False`` means "nothing to do", whereas ``None`` means the
+    fallback still has to act - its "already restored" check reads the
+    *session default*, a different scope, and would otherwise skip the only
+    remaining switch (measured: restore reported success, window stayed put).
+    """
+
+    started = time.monotonic()
+    try:
+        from . import doubao_input_profile_windows as directed
+
+        target = directed.current_target()
+        switched, _input_target = directed.activate_for_target(
+            previous,
+            cancelled=lambda: False,
+            trace=_trace,
+            expected=target,
+            timeout_seconds=directed._RESTORE_TIMEOUT_SECONDS,
+        )
+        switched = bool(switched)
+        _trace(
+            "input_profile_restore",
+            provider=str(provider),
+            route="active_context_proxy",
+            success=switched,
+            switched=switched,
+            **_profile_trace_fields("restored", previous),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+        return switched
+    except Exception as exc:  # noqa: BLE001 - restore never breaks voice
+        _trace(
+            "input_profile_restore",
+            provider=str(provider),
+            route="active_context_proxy",
+            success=False,
+            error_type=type(exc).__name__,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+        return False
+
+
+def _restore_input_profile(
+    previous: "_InputProfileSnapshot", provider: str = "wetype"
+) -> bool:
+    """Switch the active TSF profile back. Best effort, never raises."""
+
+    started = time.monotonic()
+    # A switch made through the targeted proxy only affects one thread, so
+    # undo it there first; the session-level path below cannot see it and
+    # would otherwise report "already restored" without switching anything.
+    focused = _restore_focused_profile(previous, provider)
+    if focused is True:
+        return True
+    if focused is False:
+        # Already on ``previous`` in the focused scope: genuinely done.
+        _trace(
+            "input_profile_restore",
+            provider=str(provider),
+            success=True,
+            switched=False,
+            reason="already_restored_focused",
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+        return True
+    try:
+        with _InputProfileManager() as manager:
+            # Never skip on a session-level equality check here: it reads the
+            # session default, a different scope from the focused window, and
+            # the focused path above already reported it could not confirm.
+            # Trusting it left the window stuck while reporting success.
+            manager.activate_profile(previous)
+        _trace(
+            "input_profile_restore",
+            provider=str(provider),
+            success=True,
+            switched=True,
+            **_profile_trace_fields("restored", previous),
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - restore never breaks voice
+        _trace(
+            "input_profile_restore",
+            provider=str(provider),
+            success=False,
+            error_type=type(exc).__name__,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+        return None
+
+
+def cancel_profile_restore(token: Optional[int]) -> None:
+    """Drop a pending restore so a new session is not switched back mid-flight."""
+
+    if token is None:
+        return
+    with _PROFILE_RESTORE_LOCK:
+        _profile_restores.pop(int(token), None)
+        timer = _profile_restore_timers.pop(int(token), None)
+    if timer is not None:
+        timer.cancel()
+
+
+def _run_profile_restore(token: int) -> None:
+    with _PROFILE_RESTORE_LOCK:
+        pending = _profile_restores.pop(int(token), None)
+        _profile_restore_timers.pop(int(token), None)
+    if pending is None:
+        return
+    _trace(
+        "input_profile_restore",
+        provider=pending.provider,
+        phase="dispatched",
+        generation=int(pending.generation),
+    )
+    # TSF/COM calls need the apartment they were created in.
+    try:
+        _run_on_sta_thread(lambda: _restore_input_profile(
+            pending.previous, pending.provider
+        ))
+    except Exception as exc:  # noqa: BLE001 - restore is best effort
+        _trace(
+            "input_profile_restore",
+            provider=pending.provider,
+            phase="dispatch_failed",
+            error_type=type(exc).__name__,
+        )
+
+
+def schedule_profile_restore(
+    previous: "_InputProfileSnapshot",
+    *,
+    generation: int,
+    provider: str = "wetype",
+    delay_seconds: float = _PROFILE_RESTORE_DELAY_SECONDS,
+    timer_factory: Callable[..., object] = threading.Timer,
+) -> Optional[int]:
+    """Queue one deferred restore. Returns a token used to cancel it."""
+
+    token = next(_profile_restore_generation)
+    pending = _PendingProfileRestore(
+        generation=int(generation), previous=previous, provider=str(provider)
+    )
+    with _PROFILE_RESTORE_LOCK:
+        _profile_restores[token] = pending
+    try:
+        timer = timer_factory(
+            max(0.0, float(delay_seconds)), _run_profile_restore, args=(token,)
+        )
+    except Exception:  # noqa: BLE001 - never block the shortcut release
+        with _PROFILE_RESTORE_LOCK:
+            _profile_restores.pop(token, None)
+        return None
+    with _PROFILE_RESTORE_LOCK:
+        _profile_restore_timers[token] = timer
+    timer.daemon = True
+    timer.start()
+    _trace(
+        "input_profile_restore",
+        provider=str(provider),
+        phase="scheduled",
+        generation=int(generation),
+        delay_ms=int(max(0.0, float(delay_seconds)) * 1000),
+    )
+    return token
 
 
 def set_diagnostic_trace(trace: Optional[diagnostic_trace.DiagnosticTrace]) -> None:
@@ -408,6 +668,7 @@ def _activate_input_profile(
     provider_name: str,
     *,
     _sleep: Callable[[float], None] = time.sleep,
+    _focused_reader: Callable[[], object] = None,
 ) -> bool:
     if provider_id == "doubao":
         return _activate_doubao_for_voice_start(_sleep=_sleep)
@@ -421,19 +682,34 @@ def _activate_input_profile(
         with _InputProfileManager() as manager:
             target = _discover_input_profile(manager, provider_id)
             previous = manager.get_active_profile()
+            # ``previous`` above is the session DEFAULT. The profile that has
+            # to change is the one under the focused window, and the two can
+            # differ: with WeType as the default but Doubao raised in the
+            # focused window, comparing the default reported "already active"
+            # and skipped the switch, so 拉起 never happened there. Fall back
+            # to the default when the focused scope cannot be read.
+            focused = (
+                _focused_profile_snapshot()
+                if _focused_reader is None
+                else _focused_reader()
+            )
+            active_before = focused if focused is not None else previous
             _trace(
                 "input_profile_snapshot",
                 provider=str(provider_id),
                 phase="before",
-                **_profile_trace_fields("active", previous),
+                scope="focused" if focused is not None else "session_default",
+                **_profile_trace_fields("active", active_before),
+                **_profile_trace_fields("session_default", previous),
                 **_profile_trace_fields("target", target),
             )
-            if _same_profile(previous, target):
+            if _same_profile(active_before, target):
                 if _sta_cancelled():
                     raise TimeoutError(f"{provider_name} input profile request was cancelled")
                 _trace(
                     "input_profile_activation_finished",
                     provider=str(provider_id),
+                    scope="focused" if focused is not None else "session_default",
                     success=True,
                     switched=False,
                     confirmed=True,
@@ -494,10 +770,14 @@ def _activate_input_profile(
         raise
 
 
-def _activate_wetype_input_profile() -> bool:
+def _activate_wetype_input_profile(
+    *, _focused_reader: Callable[[], object] = None
+) -> bool:
     """Activate WeType for the current Windows session; return whether it switched."""
 
-    return _activate_input_profile("wetype", "WeType")
+    return _activate_input_profile(
+        "wetype", "WeType", _focused_reader=_focused_reader
+    )
 
 
 def _activate_doubao_input_profile() -> bool:
@@ -506,44 +786,61 @@ def _activate_doubao_input_profile() -> bool:
     return _activate_doubao_for_voice_start()
 
 
-def _activate_wetype_for_voice_start(
-    *, _sleep: Callable[[float], None] = time.sleep
+def _activate_targeted_for_voice_start(
+    provider_id: str, provider_name: str
 ) -> bool:
-    return _activate_input_profile("wetype", "WeType", _sleep=_sleep)
+    """Switch the focused thread's profile to ``provider_id``.
 
+    Shared by Doubao and WeType: both need the input method under the
+    window the user is actually typing into, and only the active-context
+    proxy addresses that scope.
+    """
 
-def _activate_doubao_for_voice_start(
-    *, _sleep: Callable[[float], None] = time.sleep
-) -> bool:
     from . import doubao_input_profile_windows as directed
 
     started = time.monotonic()
-    _trace("input_profile_activation_started", provider="doubao",
-           provider_name="Doubao", route="active_context_proxy")
+    _trace("input_profile_activation_started", provider=str(provider_id),
+           provider_name=str(provider_name), route="active_context_proxy")
     try:
         expected = directed.current_target()
         if _sta_cancelled():
-            raise TimeoutError("Doubao input profile request was cancelled")
+            raise TimeoutError(f"{provider_name} input profile request was cancelled")
         with _InputProfileManager() as manager:
-            target = _discover_input_profile(manager, "doubao")
-            switched, input_target = directed.activate_for_target(
-                target, cancelled=_sta_cancelled, trace=_trace, expected=expected)
+            target = _discover_input_profile(manager, provider_id)
+        switched, input_target = directed.activate_for_target(
+            target, cancelled=_sta_cancelled, trace=_trace, expected=expected)
         if _sta_cancelled():
-            raise TimeoutError("Doubao input profile request was cancelled")
+            raise TimeoutError(f"{provider_name} input profile request was cancelled")
         operation = getattr(_STA_REQUEST_LOCAL, "operation", None)
         if operation is not None:
             operation.input_target = input_target
-        _trace("input_profile_activation_finished", provider="doubao",
+        _trace("input_profile_activation_finished", provider=str(provider_id),
                route="active_context_proxy", success=True, switched=switched,
                confirmed=True, elapsed_ms=int((time.monotonic() - started) * 1000))
         return switched
     except BaseException as exc:
-        _trace("input_profile_activation_finished", provider="doubao",
+        _trace("input_profile_activation_finished", provider=str(provider_id),
                route="active_context_proxy", success=False, confirmed=False,
                error_type=type(exc).__name__, error=str(exc),
                cancelled=isinstance(exc, TimeoutError),
                elapsed_ms=int((time.monotonic() - started) * 1000))
         raise
+
+
+def _activate_wetype_for_voice_start(
+    *,
+    _sleep: Callable[[float], None] = time.sleep,
+    _focused_reader: Callable[[], object] = None,
+) -> bool:
+    return _activate_input_profile(
+        "wetype", "WeType", _sleep=_sleep, _focused_reader=_focused_reader
+    )
+
+
+def _activate_doubao_for_voice_start(
+    *, _sleep: Callable[[float], None] = time.sleep
+) -> bool:
+    return _activate_targeted_for_voice_start("doubao", "Doubao")
 
 
 _T = TypeVar("_T")
@@ -761,6 +1058,12 @@ class WeTypeVoiceControl:
         prepare_playback_mute_guard: Optional[
             Callable[[], Optional[voice_playback_session_windows.PlaybackMuteGuard]]
         ] = None,
+        # "Temporary" profile mode support. Injected so tests can observe the
+        # restore without touching TSF. The default reads the focused
+        # thread's profile: activation switches that scope, so the snapshot
+        # has to come from the same scope or the restore is a no-op.
+        read_profile: Callable[[], object] = _read_focused_profile,
+        schedule_restore: Callable[..., object] = schedule_profile_restore,
     ) -> None:
         self._logger = logger or logging.getLogger(__name__)
         self._activate_profile = activate_profile
@@ -778,6 +1081,11 @@ class WeTypeVoiceControl:
             continue_after_activation_error
         )
         self._prepare_playback_mute_guard = prepare_playback_mute_guard
+        self._read_profile = read_profile
+        self._schedule_restore = schedule_restore
+        self._profile_restore_token: Optional[int] = None
+        self._restore_profile_after_release = False
+        self._previous_profile: object = None
         self._state_lock = threading.Lock()
         self._io_lock = threading.Lock()
         self._generation = 0
@@ -1058,6 +1366,7 @@ class WeTypeVoiceControl:
         *,
         cancelled: Optional[Callable[[], bool]] = None,
         activate_profile: bool = True,
+        restore_profile: bool = False,
     ) -> bool:
         session_keys = tuple(str(key) for key in keys)
         if not session_keys:
@@ -1096,6 +1405,25 @@ class WeTypeVoiceControl:
             generation=int(generation),
             keys=list(session_keys),
         )
+        # A restore left over from an earlier session would switch the profile
+        # back while this one is still starting.
+        cancel_profile_restore(self._profile_restore_token)
+        self._profile_restore_token = None
+        self._restore_profile_after_release = bool(activate_profile and restore_profile)
+        self._previous_profile = None
+        if self._restore_profile_after_release:
+            try:
+                self._previous_profile = self._run_sta(self._read_profile)
+            except Exception as exc:  # noqa: BLE001 - snapshot is best effort
+                _trace(
+                    "voice_hotkey_control",
+                    provider=self._provider_name.casefold(),
+                    phase="profile_snapshot",
+                    generation=int(generation),
+                    success=False,
+                    error_type=type(exc).__name__,
+                )
+                self._previous_profile = None
         if activate_profile:
             try:
                 switched = self._run_sta(self._activate_profile)
@@ -1286,7 +1614,28 @@ class WeTypeVoiceControl:
             keys=list(session_keys),
         )
         self._logger.info("%s configured voice shortcut released", self._provider_name)
+        self._start_profile_restore(int(generation))
         return True
+
+    def _start_profile_restore(self, generation: int) -> None:
+        """Switch the profile back after a "temporary" session, if armed."""
+
+        if not self._restore_profile_after_release or self._previous_profile is None:
+            return
+        self._restore_profile_after_release = False
+        previous = self._previous_profile
+        self._previous_profile = None
+        try:
+            self._profile_restore_token = self._schedule_restore(
+                previous,
+                generation=generation,
+                provider=self._provider_name.casefold(),
+            )
+        except Exception:  # noqa: BLE001 - restore never breaks release
+            self._logger.exception(
+                "%s input profile restore could not be scheduled",
+                self._provider_name,
+            )
 
 
 @dataclass(frozen=True)
@@ -1325,6 +1674,8 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
         press_keys: Callable[[Sequence[str]], None] = win32_input.send_voice_key_combo_down,
         release_keys: Callable[[Sequence[str]], None] = win32_input.send_voice_key_combo_up,
         on_completion: Optional[Callable[[int, bool], None]] = None,
+        read_profile: Callable[[], object] = _read_focused_profile,
+        schedule_restore: Callable[..., object] = schedule_profile_restore,
     ) -> None:
         super().__init__(
             logger=logger,
@@ -1337,6 +1688,8 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
             capture_reader=None,
             provider_name="Doubao",
             continue_after_activation_error=False,
+            read_profile=read_profile,
+            schedule_restore=schedule_restore,
         )
         self._doubao_start_sta = (
             _start_sta_operation if run_sta is _run_on_sta_thread else None
@@ -1386,6 +1739,7 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
         cancelled: Optional[Callable[[], bool]] = None,
         cancel_event: Optional[threading.Event] = None,
         activate_profile: bool = True,
+        restore_profile: bool = False,
     ) -> Optional[PreparedDoubaoVoiceStart]:
         """Activate the IME profile without dispatching the shortcut yet."""
 
@@ -1408,6 +1762,25 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
             generation=int(generation),
             keys=list(session_keys),
         )
+        # A restore left over from an earlier session would switch the profile
+        # back while this one is still starting.
+        cancel_profile_restore(self._profile_restore_token)
+        self._profile_restore_token = None
+        self._restore_profile_after_release = bool(activate_profile and restore_profile)
+        self._previous_profile = None
+        if self._restore_profile_after_release:
+            try:
+                self._previous_profile = self._run_sta(self._read_profile)
+            except Exception as exc:  # noqa: BLE001 - snapshot is best effort
+                _trace(
+                    "voice_hotkey_control",
+                    provider="doubao",
+                    phase="profile_snapshot",
+                    generation=int(generation),
+                    success=False,
+                    error_type=type(exc).__name__,
+                )
+                self._previous_profile = None
         operation: Optional[_StaOperation] = None
         if not activate_profile:
             _trace(
@@ -1596,9 +1969,13 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
         *,
         cancelled: Optional[Callable[[], bool]] = None,
         activate_profile: bool = True,
+        restore_profile: bool = False,
     ) -> bool:
         prepared = self.prepare(
-            keys, cancelled=cancelled, activate_profile=activate_profile
+            keys,
+            cancelled=cancelled,
+            activate_profile=activate_profile,
+            restore_profile=restore_profile,
         )
         if prepared is None:
             return False

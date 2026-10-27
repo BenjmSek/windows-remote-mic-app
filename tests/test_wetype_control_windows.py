@@ -128,10 +128,40 @@ class InputProfileTests(unittest.TestCase):
             "_profile_registry_text",
             side_effect=profile_registry_text,
         ):
-            switched = wetype_control_windows._activate_wetype_input_profile()
+            # No focused window to read, so the session default decides.
+            switched = wetype_control_windows._activate_wetype_input_profile(
+                _focused_reader=lambda: None
+            )
 
         self.assertFalse(switched)
         self.assertEqual(manager.activations, [])
+
+    def test_activation_switches_when_only_the_focused_window_differs(self):
+        """The session default is not the profile the user sees.
+
+        With WeType as the default but Doubao raised in the focused window,
+        comparing the default reported "already active" and skipped the
+        switch entirely - 拉起 never happened where the user was typing.
+        """
+        manager = FakeProfileManager(
+            [WETYPE_PROFILE, WETYPE_PROFILE],
+            [WETYPE_PROFILE],
+        )
+        with mock.patch.object(
+            wetype_control_windows,
+            "_InputProfileManager",
+            return_value=manager,
+        ), mock.patch.object(
+            wetype_control_windows,
+            "_profile_registry_text",
+            side_effect=profile_registry_text,
+        ):
+            switched = wetype_control_windows._activate_wetype_input_profile(
+                _focused_reader=lambda: DOUBAO_PROFILE
+            )
+
+        self.assertTrue(switched)
+        self.assertEqual(manager.activations, [WETYPE_PROFILE])
 
     def test_activation_switches_and_verifies_doubao(self):
         manager = FakeProfileManager(
@@ -243,7 +273,7 @@ class InputProfileTests(unittest.TestCase):
             side_effect=profile_registry_text,
         ):
             switched = wetype_control_windows._activate_wetype_for_voice_start(
-                _sleep=waits.append
+                _sleep=waits.append, _focused_reader=lambda: None
             )
 
         self.assertFalse(switched)
@@ -1245,6 +1275,280 @@ class DoubaoVoiceControlTests(unittest.TestCase):
 
         self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
         self.assertFalse(controller.cleanup_pending)
+
+
+class TemporaryInputProfileRestoreTests(unittest.TestCase):
+    """"Temporary" mode: switch for the shortcut, then switch back."""
+
+    def setUp(self):
+        self.scheduled = []
+
+    def _controller(self, *, provider_class, previous="previous-profile", **kwargs):
+        def read_profile():
+            return previous
+
+        def schedule_restore(profile, *, generation, provider, **extra):
+            self.scheduled.append((profile, generation, provider))
+            return len(self.scheduled)
+
+        return provider_class(
+            activate_profile=lambda: True,
+            run_sta=lambda callback: callback(),
+            press_keys=lambda keys: None,
+            release_keys=lambda keys: None,
+            read_profile=read_profile,
+            schedule_restore=schedule_restore,
+            **kwargs,
+        )
+
+    def test_persistent_mode_never_schedules_a_restore(self):
+        controller = self._controller(
+            provider_class=wetype_control_windows.WeTypeVoiceControl
+        )
+        self.assertTrue(controller.start(("ralt",), restore_profile=False))
+        self.assertTrue(controller.stop())
+        self.assertEqual(self.scheduled, [])
+
+    def test_temporary_mode_restores_after_the_release(self):
+        controller = self._controller(
+            provider_class=wetype_control_windows.WeTypeVoiceControl
+        )
+        self.assertTrue(controller.start(("ralt",), restore_profile=True))
+        self.assertEqual(self.scheduled, [])
+        self.assertTrue(controller.stop())
+        self.assertEqual(
+            self.scheduled, [("previous-profile", 1, "wetype")]
+        )
+
+    def test_temporary_mode_stays_armed_across_one_release_only(self):
+        controller = self._controller(
+            provider_class=wetype_control_windows.WeTypeVoiceControl
+        )
+        self.assertTrue(controller.start(("ralt",), restore_profile=True))
+        self.assertTrue(controller.stop())
+        # A second release without a fresh start must not restore again.
+        self.assertTrue(controller.stop())
+        self.assertEqual(len(self.scheduled), 1)
+
+    def test_disabled_activation_never_restores(self):
+        controller = self._controller(
+            provider_class=wetype_control_windows.WeTypeVoiceControl
+        )
+        self.assertTrue(
+            controller.start(
+                ("ralt",), activate_profile=False, restore_profile=True
+            )
+        )
+        self.assertTrue(controller.stop())
+        self.assertEqual(self.scheduled, [])
+
+    def test_doubao_temporary_mode_restores_after_the_release(self):
+        controller = self._controller(
+            provider_class=wetype_control_windows.DoubaoVoiceControl
+        )
+        self.assertTrue(controller.start(("ralt",), restore_profile=True))
+        self.assertTrue(controller.stop())
+        self.assertEqual(self.scheduled, [("previous-profile", 1, "doubao")])
+
+    def test_a_new_start_cancels_an_outstanding_restore(self):
+        controller = self._controller(
+            provider_class=wetype_control_windows.WeTypeVoiceControl
+        )
+        self.assertTrue(controller.start(("ralt",), restore_profile=True))
+        self.assertTrue(controller.stop())
+        token = controller._profile_restore_token
+        self.assertIsNotNone(token)
+        self.assertTrue(controller.start(("ralt",), restore_profile=True))
+        self.assertNotEqual(controller._profile_restore_token, token)
+        self.assertTrue(controller.stop())
+        self.assertEqual(len(self.scheduled), 2)
+
+    def test_default_snapshot_reader_runs_inline_on_the_sta_worker(self):
+        """The default reader must not dispatch a nested STA operation.
+
+        ``start()``/``prepare()`` already run the reader on the STA worker
+        owning the single-operation lock. Nesting another dispatch failed
+        the lock and was swallowed, leaving the restore unarmed - which
+        made "temporary" mode silently never switch back.
+        """
+        dispatched = []
+
+        def dispatch(callback):
+            dispatched.append(callback)
+            # The real dispatcher would block on the single-operation lock here.
+            return callback()
+
+        sentinel = object()
+        snapshot = wetype_control_windows._read_focused_profile
+        with mock.patch.object(
+            wetype_control_windows,
+            "_focused_profile_snapshot",
+            return_value=sentinel,
+        ), mock.patch.object(
+            wetype_control_windows, "_run_on_sta_thread", dispatch
+        ):
+            # Off the worker: a dispatch is expected and succeeds.
+            self.assertIs(snapshot(), sentinel)
+            # On the worker: the reader must run inline, never dispatch.
+            wetype_control_windows._STA_REQUEST_LOCAL.operation = object()
+            try:
+                self.assertIs(snapshot(), sentinel)
+            finally:
+                del wetype_control_windows._STA_REQUEST_LOCAL.operation
+        # Only the off-worker call dispatched; the worker call ran inline.
+        self.assertEqual(len(dispatched), 1)
+
+
+class ProfileRestoreSchedulingTests(unittest.TestCase):
+    """The deferred restore itself, without a live TSF stack."""
+
+    def test_schedule_runs_the_restore_after_the_delay(self):
+        fired = []
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, delay, callback, args=()):
+                self.delay = delay
+                self.callback = callback
+                self.args = args
+                self.daemon = False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+        token = wetype_control_windows.schedule_profile_restore(
+            "profile",
+            generation=7,
+            provider="wetype",
+            delay_seconds=1.5,
+            timer_factory=FakeTimer,
+        )
+        self.assertIsNotNone(token)
+        self.assertEqual(len(timers), 1)
+        self.assertEqual(timers[0].delay, 1.5)
+        self.assertEqual(timers[0].args, (token,))
+        self.assertTrue(timers[0].daemon)
+
+        # Simulate the timer firing with a patched TSF restore.
+        original = wetype_control_windows._restore_input_profile
+        try:
+            wetype_control_windows._restore_input_profile = (
+                lambda previous, provider="wetype": (
+                    fired.append((previous, provider)) or True
+                )
+            )
+            timers[0].callback(*timers[0].args)
+        finally:
+            wetype_control_windows._restore_input_profile = original
+        self.assertEqual(fired, [("profile", "wetype")])
+
+    def test_failed_targeted_restore_still_runs_the_session_fallback(self):
+        """A targeted failure must not be mistaken for "already restored".
+
+        The fallback's equality check reads the *session default*, a different
+        scope. Skipping it after a targeted failure left the focused window
+        stuck on the voice IME while the restore reported success.
+        """
+        previous = wetype_control_windows._InputProfileSnapshot(
+            2, 1033, bytes(16), bytes(16), hkl=0x04090409
+        )
+        activations = []
+
+        class FakeManager:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get_active_profile(self):
+                return previous
+
+            def activate_profile(self, profile):
+                activations.append(profile)
+
+        with mock.patch.object(
+            wetype_control_windows, "_InputProfileManager", return_value=FakeManager()
+        ), mock.patch.object(
+            wetype_control_windows, "_restore_focused_profile", return_value=None
+        ):
+            self.assertTrue(
+                wetype_control_windows._restore_input_profile(previous, "doubao")
+            )
+        self.assertEqual(activations, [previous])
+
+    def test_focused_scope_already_restored_skips_the_fallback(self):
+        previous = wetype_control_windows._InputProfileSnapshot(
+            2, 1033, bytes(16), bytes(16), hkl=0x04090409
+        )
+        activations = []
+
+        class FakeManager:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def get_active_profile(self):
+                return previous
+
+            def activate_profile(self, profile):
+                activations.append(profile)
+
+        with mock.patch.object(
+            wetype_control_windows, "_InputProfileManager", return_value=FakeManager()
+        ), mock.patch.object(
+            wetype_control_windows, "_restore_focused_profile", return_value=False
+        ):
+            self.assertTrue(
+                wetype_control_windows._restore_input_profile(previous, "doubao")
+            )
+        self.assertEqual(activations, [])
+
+    def test_cancelling_a_pending_restore_prevents_the_switch_back(self):
+        fired = []
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, delay, callback, args=()):
+                self.delay = delay
+                self.callback = callback
+                self.args = args
+                timers.append(self)
+                self.cancelled = False
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+        token = wetype_control_windows.schedule_profile_restore(
+            "profile", generation=3, timer_factory=FakeTimer
+        )
+        wetype_control_windows.cancel_profile_restore(token)
+        self.assertTrue(timers[0].cancelled)
+
+        original = wetype_control_windows._restore_input_profile
+        try:
+            wetype_control_windows._restore_input_profile = (
+                lambda previous, provider="wetype": (
+                    fired.append(previous) or True
+                )
+            )
+            timers[0].callback(*timers[0].args)
+        finally:
+            wetype_control_windows._restore_input_profile = original
+        self.assertEqual(fired, [])
+
+    def test_cancelling_an_unknown_token_is_a_no_op(self):
+        wetype_control_windows.cancel_profile_restore(None)
+        wetype_control_windows.cancel_profile_restore(999999)
 
 
 if __name__ == "__main__":

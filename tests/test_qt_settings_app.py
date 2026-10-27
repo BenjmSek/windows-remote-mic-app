@@ -1606,6 +1606,80 @@ class SettingsControllerTests(unittest.TestCase):
         self.assertEqual(saved["close_behavior"], "quit")
         reload_settings.assert_called_once_with()
 
+    def test_input_profile_mode_dropdown_exposes_three_options(self):
+        controller, _model = self._make_controller()
+        self.assertEqual(
+            list(controller.voiceInputProfileModeOptions),
+            ["持久：拉起并保持", "临时：拉起不保持", "关闭：不拉起"],
+        )
+        self.assertEqual(controller.voiceInputProfileModeIndex, 0)
+        self.assertTrue(controller.activateVoiceInputProfile)
+
+    def test_input_profile_mode_selection_is_persisted_and_takes_effect(self):
+        controller, _model = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reload_in_process_bridge_settings",
+            return_value=True,
+        ):
+            controller.setVoiceInputProfileModeIndex(1)
+
+        saved = config.load_config(
+            config.config_path(Path(self._tmpdir.name) / "RemoteMic")
+        )
+        self.assertEqual(saved["voice_input_profile_mode"], "temporary")
+        self.assertEqual(controller.voiceInputProfileModeIndex, 1)
+        self.assertTrue(controller.activateVoiceInputProfile)
+
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reload_in_process_bridge_settings",
+            return_value=True,
+        ):
+            controller.setVoiceInputProfileModeIndex(2)
+
+        saved = config.load_config(
+            config.config_path(Path(self._tmpdir.name) / "RemoteMic")
+        )
+        self.assertEqual(saved["voice_input_profile_mode"], "off")
+        self.assertEqual(controller.voiceInputProfileModeIndex, 2)
+        self.assertFalse(controller.activateVoiceInputProfile)
+
+    def test_input_profile_mode_ignores_out_of_range_indices(self):
+        controller, _model = self._make_controller()
+        controller.setVoiceInputProfileModeIndex(-1)
+        controller.setVoiceInputProfileModeIndex(3)
+        self.assertEqual(controller.voiceInputProfileModeIndex, 0)
+
+    def test_legacy_boolean_switch_still_drives_the_dropdown(self):
+        controller, _model = self._make_controller()
+        with mock.patch.object(
+            qt_settings_app.bridge_launcher,
+            "reload_in_process_bridge_settings",
+            return_value=True,
+        ):
+            controller.setActivateVoiceInputProfile(False)
+        self.assertEqual(controller.voiceInputProfileModeIndex, 2)
+        self.assertFalse(controller.activateVoiceInputProfile)
+
+    def test_legacy_boolean_config_migrates_into_the_dropdown(self):
+        # The controller reads its mode through config's normaliser, so a
+        # config still carrying the retired boolean keeps its meaning.
+        controller, _model = self._make_controller()
+        for legacy, expected_index in ((True, 0), (False, 2)):
+            with self.subTest(legacy=legacy):
+                controller._voice_input_profile_mode = (
+                    config.normalize_voice_input_profile_mode(
+                        None, legacy
+                    )
+                )
+                self.assertEqual(
+                    controller.voiceInputProfileModeIndex, expected_index
+                )
+                self.assertEqual(
+                    controller.activateVoiceInputProfile, legacy
+                )
+
     def test_launch_at_login_uses_the_scoped_windows_owner(self):
         controller, _model = self._make_controller()
         with mock.patch.object(
@@ -10945,7 +11019,6 @@ capture_page(
         "desktopBehaviorSectionTitle",
         "launchAtLoginRow",
         "launchBridgeOnAppStartRow",
-        "activateVoiceInputProfileSwitch",
         "diagnosticTraceRow",
         "appLogRow",
         "closeBehaviorRow",
@@ -10973,6 +11046,8 @@ capture_page(
         "voiceProgramSection",
         "voiceProgramSectionTitle",
         "voiceProgramCustomPathRow",
+        "voiceInputProfileModeRow",
+        "voiceInputProfileModeCombo",
         "voiceTestSection",
         "voiceTestSectionTitle",
     ),
@@ -11401,6 +11476,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
             "elide: root.descriptionNeverElide ? Text.ElideNone : Text.ElideRight",
             self.inline_settings_row_qml,
         )
+        # Exactly one device row keeps its description elidable so the page
+        # still fits compact viewport widths (the moved 按键拉起输入法 row is
+        # now on the voice page with descriptionNeverElide: false).
         self.assertEqual(
             self.device_qml.count("descriptionNeverElide: true"),
             1,
@@ -11615,13 +11693,28 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.setCloseBehaviorIndex", self.device_qml)
         self.assertIn('text: qsTr("启动程序时自动运行服务")', self.device_qml)
         self.assertIn("自动连接遥控器", self.device_qml)
-        self.assertIn('text: qsTr("按键拉起输入法")', self.device_qml)
-        self.assertIn("拉起豆包或微信输入法", self.device_qml)
+        # 按键拉起输入法 moved to the voice page.
+        self.assertNotIn('titleText: qsTr("按键拉起输入法")', self.device_qml)
+        self.assertNotIn("拉起豆包或微信输入法", self.device_qml)
+        self.assertNotIn(
+            'objectName: "voiceInputProfileModeCombo"', self.device_qml
+        )
+        self.assertNotIn(
+            "SettingsController.setVoiceInputProfileModeIndex", self.device_qml
+        )
+        self.assertNotIn(
+            "SettingsController.voiceInputProfileModeOptions", self.device_qml
+        )
+        self.assertIn('titleText: qsTr("按键拉起输入法")', self.voice_qml)
+        self.assertIn("拉起豆包或微信输入法", self.voice_qml)
         self.assertIn(
-            'objectName: "activateVoiceInputProfileSwitch"', self.device_qml
+            'objectName: "voiceInputProfileModeCombo"', self.voice_qml
         )
         self.assertIn(
-            "SettingsController.setActivateVoiceInputProfile", self.device_qml
+            "SettingsController.setVoiceInputProfileModeIndex", self.voice_qml
+        )
+        self.assertIn(
+            "SettingsController.voiceInputProfileModeOptions", self.voice_qml
         )
         self.assertNotIn("与随 Windows 启动互不绑定", self.device_qml)
         self.assertNotIn("GeneralPage", self.main_qml)
@@ -12134,9 +12227,10 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
 
     def test_device_toggles_share_the_compact_accent_switch(self):
         # diagnosticTrace / appLog / closeBehavior plus the receiver switch and
-        # the 随 Windows 启动 / 启动程序时自动运行服务 + 按键拉起输入法 pair
-        # further up the page.
-        self.assertEqual(self.device_qml.count("CompactSwitch {"), 6)
+        # 随 Windows 启动 / 启动程序时自动运行服务 further up the page.
+        # 按键拉起输入法 is a dropdown on the voice page, not a switch, so it
+        # does not count toward the device page switch total.
+        self.assertEqual(self.device_qml.count("CompactSwitch {"), 5)
         self.assertNotIn("                    Switch {", self.device_qml)
         self.assertIn("implicitWidth: 28", self.compact_switch_qml)
         self.assertIn("implicitHeight: 14", self.compact_switch_qml)
@@ -12526,7 +12620,7 @@ class OffscreenQmlLoadTests(unittest.TestCase):
             data["warnings"], [], "main.qml produced QML warnings/errors during load"
         )
         self.assertEqual(data["width"], 720)
-        self.assertEqual(data["height"], 550)
+        self.assertEqual(data["height"], 580)
         self.assertEqual(
             data["title"],
             qt_settings_app.product_identity.windows_window_title(),

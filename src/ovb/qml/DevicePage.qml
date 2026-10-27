@@ -479,9 +479,9 @@ Item {
                     }
                 }
 
-                // Two options share one row, each half in the SettingsListRow
-                // style: title over description on the left, switch on the
-                // right. Both halves get an equal share of the row.
+                // One option now owns this row: title over description on the
+                // left, switch on the right. The input-profile mode moved to
+                // its own row below because its dropdown needs the full width.
                 Rectangle {
                     objectName: "launchBridgeOnAppStartRow"
                     color: "transparent"
@@ -543,76 +543,10 @@ Item {
                                 tokens: root.tokens
                                 checked: SettingsController.launchBridgeOnAppStart
                                 Accessible.name: qsTr("启动程序时自动运行遥控器服务")
-                                KeyNavigation.tab: activateVoiceInputProfileSwitch
+                                KeyNavigation.tab: deviceOpenLogButton
                                 onToggled: {
                                     if (checked !== SettingsController.launchBridgeOnAppStart)
                                         SettingsController.setLaunchBridgeOnAppStart(checked)
-                                }
-                            }
-                        }
-
-                        // Vertical rule so the two options read as two cells
-                        // instead of one crowded line.
-                        Rectangle {
-                            objectName: "launchBridgeOnAppStartRow_separator"
-                            Layout.fillHeight: true
-                            Layout.preferredWidth: 1
-                            Layout.topMargin: 6
-                            Layout.bottomMargin: 6
-                            color: root.tokens.border
-                        }
-
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            spacing: root.tokens.spacingSmall
-
-                            ColumnLayout {
-                                Layout.fillWidth: true
-                                spacing: 1
-
-                                UiLabel {
-                                    objectName: "activateVoiceInputProfileTitleLabel"
-                                    tokens: root.tokens
-                                    kind: bodyKind
-                                    Layout.fillWidth: true
-                                    font.pixelSize: root.tokens.fontSizeBody
-                                    font.weight: Font.Medium
-                                    elide: Text.ElideRight
-                                    text: qsTr("按键拉起输入法")
-                                }
-
-                                UiLabel {
-                                    id: activateVoiceInputProfileDescriptionLabel
-                                    objectName: "activateVoiceInputProfileDescriptionLabel"
-                                    tokens: root.tokens
-                                    kind: noteKind
-                                    Layout.fillWidth: true
-                                    maximumLineCount: 1
-                                    elide: Text.ElideRight
-                                    wrapMode: Text.NoWrap
-                                    text: qsTr("拉起豆包或微信输入法")
-                                    HoverHandler { id: activateProfileHover }
-                                    CompactToolTip {
-                                        tokens: root.tokens
-                                        active: activateProfileHover.hovered
-                                            && activateVoiceInputProfileDescriptionLabel.truncated
-                                        text: activateVoiceInputProfileDescriptionLabel.text
-                                    }
-                                }
-                            }
-
-                            CompactSwitch {
-                                id: activateVoiceInputProfileSwitch
-                                objectName: "activateVoiceInputProfileSwitch"
-                                tokens: root.tokens
-                                checked: SettingsController.activateVoiceInputProfile
-                                Accessible.name: qsTr("按键拉起输入法，拉起豆包或微信输入法")
-                                KeyNavigation.backtab: launchBridgeOnAppStartSwitch
-                                KeyNavigation.tab: deviceOpenLogButton
-                                onToggled: {
-                                    if (checked !== SettingsController.activateVoiceInputProfile)
-                                        SettingsController.setActivateVoiceInputProfile(checked)
                                 }
                             }
                         }
@@ -636,7 +570,7 @@ Item {
                         tokens: root.tokens
                         text: SettingsController.logExportBusy ? qsTr("导出中…") : qsTr("导出日志")
                         enabled: !SettingsController.logExportBusy
-                        KeyNavigation.backtab: activateVoiceInputProfileSwitch
+                        KeyNavigation.backtab: launchBridgeOnAppStartSwitch
                         KeyNavigation.tab: deviceLogLocationLink
                         onClicked: {
                             logExportDialog.selectedFile = SettingsController.logExportDefaultFile()

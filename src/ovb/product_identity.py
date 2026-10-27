@@ -10,6 +10,8 @@ from __future__ import annotations
 import re
 from pathlib import Path, PurePath
 
+from . import __version__
+
 
 DISPLAY_NAME = "无线麦Mod"
 WINDOWS_EDITION_NAME = "win版"
@@ -49,13 +51,13 @@ def windows_presentation_label(version: str) -> str:
 
 
 def windows_window_title() -> str:
-    """The settings-window title: product name without the version suffix.
+    """The settings-window title: product name plus the version tag.
 
     Kept separate from windows_presentation_label() on purpose - that one
     also builds the executable file name, which must keep its version.
     """
 
-    return WINDOWS_PRODUCT_NAME
+    return f"{WINDOWS_PRODUCT_NAME} v{validate_version(__version__)}"
 
 
 def windows_executable_name(version: str) -> str:

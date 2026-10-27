@@ -8,11 +8,11 @@ ApplicationWindow {
     id: window
     title: SettingsController.applicationPresentationLabel
     width: 720
-    // 550 covers the device page's full content (514px measured offscreen,
-    // one settings row shorter since 关闭音频发送 moved to the voice page)
+    // 580 covers the device page's full content (556px measured offscreen,
+    // which grew by one row when 按键拉起输入法 became a full-width combo)
     // plus the 23px status bar, so the default window shows every option
     // without scrolling. minimumHeight stays at 480 - the pages scroll.
-    height: 550
+    height: 580
     minimumWidth: 640
     minimumHeight: 480
     visible: true
@@ -791,7 +791,7 @@ ApplicationWindow {
                                     : qsTr("按键映射正在等待自动保存。"))
                                 : globalStatusBar.hasMessage
                                     ? SettingsController.statusMessage
-                                    : qsTr("请按页面提示处理黄色或红色状态。")
+                                    : ""
                         color: globalStatusBar.hasError
                             ? tokens.errorColor
                             : globalStatusBar.hasDirtySettings

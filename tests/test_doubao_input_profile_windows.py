@@ -1,3 +1,4 @@
+import ctypes
 import threading
 import unittest
 from unittest import mock
@@ -41,6 +42,75 @@ class Proxy:
         if self.confirm:
             self.active = target
         self.after_request()
+
+
+class ProxyActivateTests(unittest.TestCase):
+    """``_ActiveContextProxy.activate`` must pass hkl through.
+
+    A keyboard-layout profile has an all-zero clsid and profile GUID; hkl is
+    its only identity. Passing NULL made such a switch unidentifiable, so
+    restoring to an English layout could never converge.
+    """
+
+    def test_activate_passes_the_profile_hkl(self):
+        captured = {}
+        layout = controls._InputProfileSnapshot(
+            2, 1033, bytes(16), bytes(16), hkl=0x04090409
+        )
+
+        class Recorder:
+            def __init__(self, pointer):
+                self.pointer = pointer
+
+            def __call__(self, _proxy, langid, hkl, clsid, guid):
+                captured["langid"] = int(langid)
+                # ``_method`` is mocked, so ctypes argtypes never convert the
+                # HKL: it arrives as the raw 8-byte little-endian buffer.
+                raw = bytes(hkl) if not isinstance(hkl, int) else None
+                captured["hkl"] = (
+                    int.from_bytes(raw[: ctypes.sizeof(ctypes.c_void_p)], "little")
+                    if raw is not None
+                    else int(hkl)
+                )
+                return 0
+
+        proxy = object.__new__(directed._ActiveContextProxy)
+        proxy._proxy = ctypes.c_void_p(1)
+        with mock.patch.object(directed, "_method", return_value=Recorder(None)):
+            proxy.activate(layout)
+        self.assertEqual(captured["langid"], 1033)
+        self.assertEqual(captured["hkl"], 0x04090409)
+
+
+class RestoreTimeoutTests(unittest.TestCase):
+    """A deferred restore gets a wider budget than the press path."""
+
+    def setUp(self):
+        self.proxy = Proxy()
+        self.proxy.confirm = False
+        self.trace = mock.Mock()
+        for patcher in (
+            mock.patch.object(directed, '_ActiveContextProxy', return_value=self.proxy),
+            mock.patch.object(directed, 'current_target', return_value=TARGET),
+            mock.patch.object(directed.time, 'monotonic', side_effect=lambda: self.proxy.now),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_restore_budget_exceeds_the_press_budget(self):
+        self.assertGreater(
+            directed._RESTORE_TIMEOUT_SECONDS, directed._SWITCH_TIMEOUT_SECONDS
+        )
+        with self.assertRaises(TimeoutError):
+            directed.activate_for_target(
+                PROFILE,
+                cancelled=lambda: False,
+                trace=self.trace,
+                timeout_seconds=directed._RESTORE_TIMEOUT_SECONDS,
+            )
+        self.assertGreaterEqual(
+            self.proxy.now, directed._RESTORE_TIMEOUT_SECONDS
+        )
 
 
 class TargetSwitchTests(unittest.TestCase):

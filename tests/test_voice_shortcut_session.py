@@ -94,3 +94,57 @@ class VoiceResultTests(unittest.TestCase):
         session.on_cleanup(7, True)
         session.record_audio_result(303)
         services.set_result.assert_called_with(status.VOICE_RUNTIME_SUCCESS, provider="doubao_ime")
+
+
+class VoiceInputProfileModeTests(unittest.TestCase):
+    """The dropdown mode is resolved fresh on every key press."""
+
+    def test_current_string_key_is_honoured(self):
+        for mode in ("persistent", "temporary", "off"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    shortcut.voice_input_profile_mode(
+                        {"voice_input_profile_mode": mode}
+                    ),
+                    mode,
+                )
+
+    def test_legacy_boolean_still_resolves(self):
+        self.assertEqual(
+            shortcut.voice_input_profile_mode(
+                {"activate_voice_input_profile": True}
+            ),
+            "persistent",
+        )
+        self.assertEqual(
+            shortcut.voice_input_profile_mode(
+                {"activate_voice_input_profile": False}
+            ),
+            "off",
+        )
+
+    def test_missing_and_broken_snapshots_fall_back_to_persistent(self):
+        for snapshot in ({}, None, [], {"voice_input_profile_mode": 3}):
+            with self.subTest(snapshot=snapshot):
+                self.assertEqual(
+                    shortcut.voice_input_profile_mode(snapshot), "persistent"
+                )
+
+    def test_only_temporary_asks_for_a_restore_and_only_off_skips_activation(self):
+        cases = {
+            "persistent": (True, False),
+            "temporary": (True, True),
+            "off": (False, False),
+        }
+        for mode, (activate, restore) in cases.items():
+            with self.subTest(mode=mode):
+                resolved = shortcut.voice_input_profile_mode(
+                    {"voice_input_profile_mode": mode}
+                )
+                self.assertEqual(
+                    (
+                        resolved != "off",
+                        resolved == "temporary",
+                    ),
+                    (activate, restore),
+                )

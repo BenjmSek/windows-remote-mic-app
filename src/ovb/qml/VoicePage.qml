@@ -968,6 +968,36 @@ Item {
                     }
                 }
 
+                // 拉起输入法 moved from the device page: keep it under the voice
+                // program block, just below 语音物理按键, so the two audio
+                // switches below it shift down with it. The title needs the
+                // wider 84px width so "按键拉起输入法" is not elided.
+                InlineSettingsRow {
+                    objectName: "voiceInputProfileModeRow"
+                    tokens: root.tokens
+                    editorColumnWidth: 152
+                    titleWidth: 84
+                    titleText: qsTr("按键拉起输入法")
+                    descriptionText: qsTr("拉起豆包或微信输入法")
+                    descriptionNeverElide: false
+                    stateText: ""
+
+                    editorData: [
+                        SelectionComboBox {
+                            id: voiceInputProfileModeCombo
+                            objectName: "voiceInputProfileModeCombo"
+                            tokens: root.tokens
+                            Layout.fillWidth: true
+                            model: SettingsController.voiceInputProfileModeOptions
+                            currentIndex: SettingsController.voiceInputProfileModeIndex
+                            onActivated: SettingsController.setVoiceInputProfileModeIndex(index)
+                            Accessible.name: qsTr("按键拉起输入法")
+                            KeyNavigation.backtab: recordVoicePhysicalKeyButton
+                            KeyNavigation.tab: audioDuckingSwitch
+                        }
+                    ]
+                }
+
                 // Two options share one row, each half in the SettingsListRow
                 // style: title over description on the left, switch on the
                 // right. Both halves get an equal share of the row.
@@ -1211,15 +1241,6 @@ Item {
                     }
                 }
 
-            }
-
-            UiLabel {
-                objectName: "holdRecordingNote"
-                tokens: root.tokens
-                kind: noteKind
-                Layout.fillWidth: true
-                wrapMode: Text.Wrap
-                text: qsTr("按住型录音期间，语音快捷键会保持按下。请避免同时操作其他按键/鼠标操作。设置快捷键时，请留意与常用操作的冲突。")
             }
 
             Item { Layout.preferredHeight: tokens.pageVerticalPadding }

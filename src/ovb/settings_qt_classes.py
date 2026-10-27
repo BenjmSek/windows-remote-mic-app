@@ -57,6 +57,20 @@ from . import (
     win32_keys,
     windows_diagnostics,
 )
+
+# Device-page dropdown for the TSF switch around a voice shortcut. Order is the
+# UI order and doubles as the persisted value order (index <-> mode).
+_VOICE_INPUT_PROFILE_MODE_VALUES = (
+    config.VOICE_INPUT_PROFILE_MODE_PERSISTENT,
+    config.VOICE_INPUT_PROFILE_MODE_TEMPORARY,
+    config.VOICE_INPUT_PROFILE_MODE_OFF,
+)
+_VOICE_INPUT_PROFILE_MODE_OPTIONS = (
+    "持久：拉起并保持",
+    "临时：拉起不保持",
+    "关闭：不拉起",
+)
+
 from .qt_settings_app import (
     _APPLICATION_EXIT_POLL_INTERVAL_MS,
     _APPLICATION_EXIT_SAVE_WAIT_TIMEOUT_SECONDS,
@@ -778,8 +792,11 @@ def build(
             self._app_log_enabled = bool(
                 self._config.get("app_log_enabled", True)
             )
-            self._activate_voice_input_profile = bool(
-                self._config.get("activate_voice_input_profile", True)
+            self._voice_input_profile_mode = (
+                config.normalize_voice_input_profile_mode(
+                    self._config.get("voice_input_profile_mode"),
+                    self._config.get(config.LEGACY_ACTIVATE_VOICE_INPUT_PROFILE_KEY),
+                )
             )
             self._disable_audio_sending = bool(
                 self._config.get("disable_audio_sending", False)
@@ -5276,9 +5293,31 @@ def build(
             lambda self: self._app_log_enabled,
             notify=desktopBehaviorChanged,
         )
+        # Derived from the mode so existing callers keep working: anything but
+        # "off" activates the voice input profile.
         activateVoiceInputProfile = Property(
             bool,
-            lambda self: self._activate_voice_input_profile,
+            lambda self: self._voice_input_profile_mode
+            != config.VOICE_INPUT_PROFILE_MODE_OFF,
+            notify=desktopBehaviorChanged,
+        )
+        voiceInputProfileModeOptions = Property(
+            list,
+            lambda self: list(_VOICE_INPUT_PROFILE_MODE_OPTIONS),
+            constant=True,
+        )
+
+        def _get_voice_input_profile_mode_index(self) -> int:
+            try:
+                return _VOICE_INPUT_PROFILE_MODE_VALUES.index(
+                    self._voice_input_profile_mode
+                )
+            except ValueError:
+                return 0
+
+        voiceInputProfileModeIndex = Property(
+            int,
+            _get_voice_input_profile_mode_index,
             notify=desktopBehaviorChanged,
         )
         disableAudioSending = Property(
@@ -5736,15 +5775,39 @@ def build(
 
         @Slot(bool)
         def setActivateVoiceInputProfile(self, enabled: bool) -> None:
-            enabled = bool(enabled)
-            if enabled == self._activate_voice_input_profile:
+            # Kept for callers that still think in booleans: maps onto the
+            # dropdown (True -> persistent, False -> off).
+            self.setVoiceInputProfileModeIndex(
+                0
+                if enabled
+                else _VOICE_INPUT_PROFILE_MODE_VALUES.index(
+                    config.VOICE_INPUT_PROFILE_MODE_OFF
+                )
+            )
+
+        @Slot(int)
+        def setVoiceInputProfileModeIndex(self, index: int) -> None:
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                return
+            if not 0 <= index < len(_VOICE_INPUT_PROFILE_MODE_VALUES):
+                return
+            mode = _VOICE_INPUT_PROFILE_MODE_VALUES[index]
+            if mode == self._voice_input_profile_mode:
                 return
             if not self._persist_desktop_behavior(
-                "activate_voice_input_profile", enabled
+                "voice_input_profile_mode",
+                mode,
+                status_message=(
+                    "已选择："
+                    + _VOICE_INPUT_PROFILE_MODE_OPTIONS[index]
+                    + "，下次按语音键即生效。"
+                ),
             ):
                 self.desktopBehaviorChanged.emit()
                 return
-            self._activate_voice_input_profile = enabled
+            self._voice_input_profile_mode = mode
             self.desktopBehaviorChanged.emit()
             bridge_launcher.reload_in_process_bridge_settings()
 
