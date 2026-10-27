@@ -524,6 +524,21 @@ class WeTypeVoiceControlTests(unittest.TestCase):
         self.assertTrue(controller.start(self.VOICE_KEYS))
         self.assertEqual(pressed, [self.VOICE_KEYS])
 
+    def test_disabled_activation_skips_the_switch_and_still_presses(self):
+        calls = []
+        controller = self.make_controller(
+            activate_profile=lambda: calls.append("activate") or True,
+            run_sta=lambda callback: calls.append("sta") or callback(),
+            press_keys=lambda keys: calls.append(("down", tuple(keys))),
+        )
+
+        self.assertTrue(
+            controller.start(self.VOICE_KEYS, activate_profile=False)
+        )
+
+        self.assertEqual(calls, [("down", self.VOICE_KEYS)])
+        self.assertTrue(controller.cleanup_pending)
+
     def test_activation_failure_still_sends_the_configured_shortcut(self):
         pressed = []
         controller = self.make_controller(
@@ -1214,6 +1229,21 @@ class DoubaoVoiceControlTests(unittest.TestCase):
 
         self.assertFalse(controller.start(("ralt",)))
         self.assertEqual(pressed, [])
+        self.assertFalse(controller.cleanup_pending)
+
+    def test_disabled_activation_skips_the_switch_and_still_sends_hold(self):
+        calls = []
+        controller = wetype_control_windows.DoubaoVoiceControl(
+            activate_profile=lambda: calls.append("activate") or True,
+            run_sta=lambda callback: calls.append("sta") or callback(),
+            press_keys=lambda keys: calls.append(("down", tuple(keys))),
+            release_keys=lambda keys: calls.append(("up", tuple(keys))),
+        )
+
+        self.assertTrue(controller.start(("ralt",), activate_profile=False))
+        self.assertTrue(controller.stop())
+
+        self.assertEqual(calls, [("down", ("ralt",)), ("up", ("ralt",))])
         self.assertFalse(controller.cleanup_pending)
 
 

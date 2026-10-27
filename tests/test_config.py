@@ -60,6 +60,7 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(defaults["gain_db"], 10.0)
         self.assertFalse(defaults["launch_bridge_on_app_start"])
         self.assertFalse(defaults["diagnostic_trace_enabled"])
+        self.assertTrue(defaults["activate_voice_input_profile"])
         self.assertEqual(
             defaults["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )
@@ -104,6 +105,16 @@ class DefaultConfigPrivacyTests(unittest.TestCase):
         self.assertEqual(
             loaded["close_behavior"], config.CLOSE_BEHAVIOR_HIDE_TO_TRAY
         )
+
+    def test_voice_input_profile_switch_is_persisted_as_a_boolean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps({"activate_voice_input_profile": 0}),
+                encoding="utf-8",
+            )
+            loaded = config.load_config(path)
+        self.assertFalse(loaded["activate_voice_input_profile"])
 
     def test_legacy_hide_to_tray_choice_is_preserved(self):
         with tempfile.TemporaryDirectory() as tmp:

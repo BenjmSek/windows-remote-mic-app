@@ -36,6 +36,17 @@ _SCOPED_STATUS_FILENAME_TEMPLATE = "bridge-runtime-status-{scope}.json"
 _STATUS_SCOPE_UNSET = object()
 _default_status_scope: object | str = _STATUS_SCOPE_UNSET
 _default_status_scope_lock = threading.Lock()
+
+# Memory backend switch. Off by default so tests and any caller that wants a
+# durable copy keep the historical file behaviour; ``__main__`` turns it on
+# for real launches, which is what keeps ``config/runtime`` from existing at
+# all. When the switch is on but the section cannot be reached, the file
+# path still serves as a working fallback rather than losing the channel.
+_SHARED_BACKEND_ENABLED = False
+_SHARED_BACKEND_SCOPE: Optional[str] = None
+_SHARED_BACKEND_LOCK = threading.Lock()
+_BACKEND_UNAVAILABLE = object()
+
 FAILED_RAW_INPUT_STATES = frozenset(
     {
         "unavailable",
@@ -187,6 +198,112 @@ def _status_scope(session_id: Optional[int]) -> str:
     return f"s{resolved}"
 
 
+def enable_shared_backend(scope: Optional[str] = None) -> bool:
+    """Route transient status through a memory section instead of a file.
+
+    Returns False on non-Windows platforms, where the file backend stays in
+    charge. ``scope`` pins the section name; omitting it falls back to the
+    per-logon-session scope the file names already used, so two sessions of
+    the same user still cannot see each other's bridge.
+    """
+
+    global _SHARED_BACKEND_ENABLED, _SHARED_BACKEND_SCOPE
+
+    if sys.platform != "win32":
+        return False
+    with _SHARED_BACKEND_LOCK:
+        _SHARED_BACKEND_SCOPE = scope
+        _SHARED_BACKEND_ENABLED = True
+    return True
+
+
+def disable_shared_backend() -> None:
+    global _SHARED_BACKEND_ENABLED, _SHARED_BACKEND_SCOPE
+
+    with _SHARED_BACKEND_LOCK:
+        _SHARED_BACKEND_ENABLED = False
+        _SHARED_BACKEND_SCOPE = None
+
+
+def shared_backend_active() -> bool:
+    return _SHARED_BACKEND_ENABLED
+
+
+def _shared_scope(session_id: Optional[int]) -> str:
+    if _SHARED_BACKEND_SCOPE:
+        return _SHARED_BACKEND_SCOPE
+    return _status_scope(session_id)
+
+
+def _shared_module():
+    try:
+        from . import runtime_shared_windows
+    except Exception:  # noqa: BLE001 - missing bindings must not break status
+        return None
+    return runtime_shared_windows
+
+
+def _shared_write(payload: bytes, session_id: Optional[int]) -> object:
+    if not _SHARED_BACKEND_ENABLED:
+        return _BACKEND_UNAVAILABLE
+    module = _shared_module()
+    if module is None:
+        return _BACKEND_UNAVAILABLE
+    try:
+        from . import hid_elevation_windows
+
+        try:
+            sid = hid_elevation_windows.canonical_user_sid(
+                hid_elevation_windows.current_user_sid()
+            )
+        except Exception:  # noqa: BLE001 - default DACL still works same-IL
+            sid = ""
+        module.write_slot(
+            _shared_scope(session_id),
+            module.SLOT_STATUS,
+            payload,
+            sid=sid,
+        )
+        return True
+    except Exception:  # noqa: BLE001 - fall back to the file backend
+        return _BACKEND_UNAVAILABLE
+
+
+def _shared_read(session_id: Optional[int]) -> object:
+    if not _SHARED_BACKEND_ENABLED:
+        return _BACKEND_UNAVAILABLE
+    module = _shared_module()
+    if module is None:
+        return _BACKEND_UNAVAILABLE
+    try:
+        return module.read_slot(_shared_scope(session_id), module.SLOT_STATUS)
+    except Exception:  # noqa: BLE001 - fall back to the file backend
+        return _BACKEND_UNAVAILABLE
+
+
+def _status_payload(status: BridgeRuntimeStatus) -> dict:
+    return {
+        "schema": SCHEMA_VERSION,
+        "state": status.state.value,
+        "pid": status.pid,
+        "updated_at": status.updated_at,
+        "app_version": status.app_version,
+        "runtime_kind": status.runtime_kind,
+        "package_name": status.package_name,
+        "runtime_id": status.runtime_id,
+        "raw_input_state": status.raw_input_state,
+        "hid_tap_state": status.hid_tap_state,
+        "voice_key_physicalizer_state": status.voice_key_physicalizer_state,
+        "last_button_at": status.last_button_at,
+        "last_button_source": status.last_button_source,
+        "voice_active": status.voice_active,
+        "voice_runtime_state": status.voice_runtime_state,
+        "voice_runtime_provider": status.voice_runtime_provider,
+        "voice_runtime_updated_at": status.voice_runtime_updated_at,
+        "battery_level": status.battery_level,
+    }
+
+
 def status_path(
     config_root: Path,
     *,
@@ -198,10 +315,14 @@ def status_path(
         if scope
         else STATUS_FILENAME
     )
+    path = Path(config_root) / RUNTIME_SUBDIRECTORY / filename
+    if _SHARED_BACKEND_ENABLED:
+        # The path is only reported to callers that ask for it; creating the
+        # directory here would defeat the point of the memory backend.
+        return path
     # Bounded runtime state, not durable settings. Creating the scoped
     # directory here keeps every caller - production and tests alike - from
     # having to know that the parent is not the config root itself.
-    path = Path(config_root) / RUNTIME_SUBDIRECTORY / filename
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -308,39 +429,16 @@ def publish_status(
         voice_runtime_updated_at=voice_runtime_updated_at,
         battery_level=battery_level,
     )
+    payload = json.dumps(
+        _status_payload(status), ensure_ascii=True, sort_keys=True
+    ).encode("utf-8")
+    if _shared_write(payload, session_id) is True:
+        return status
     path = status_path(config_root, session_id=session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        temporary.write_text(
-            json.dumps(
-                {
-                    "schema": SCHEMA_VERSION,
-                    "state": status.state.value,
-                    "pid": status.pid,
-                    "updated_at": status.updated_at,
-                    "app_version": status.app_version,
-                    "runtime_kind": status.runtime_kind,
-                    "package_name": status.package_name,
-                    "runtime_id": status.runtime_id,
-                    "raw_input_state": status.raw_input_state,
-                    "hid_tap_state": status.hid_tap_state,
-                    "voice_key_physicalizer_state": (
-                        status.voice_key_physicalizer_state
-                    ),
-                    "last_button_at": status.last_button_at,
-                    "last_button_source": status.last_button_source,
-                    "voice_active": status.voice_active,
-                    "voice_runtime_state": status.voice_runtime_state,
-                    "voice_runtime_provider": status.voice_runtime_provider,
-                    "voice_runtime_updated_at": status.voice_runtime_updated_at,
-                    "battery_level": status.battery_level,
-                },
-                ensure_ascii=True,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+        temporary.write_text(payload.decode("utf-8"), encoding="utf-8")
         os.replace(temporary, path)
     finally:
         try:
@@ -355,6 +453,10 @@ def _read_status_file(path: Path) -> Optional[BridgeRuntimeStatus]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
+    return _decode_status(payload)
+
+
+def _decode_status(payload) -> Optional[BridgeRuntimeStatus]:
     if not isinstance(payload, dict):
         return None
     schema = payload.get("schema")
@@ -464,6 +566,18 @@ def read_status(
     *,
     session_id: Optional[int] = None,
 ) -> Optional[BridgeRuntimeStatus]:
+    shared = _shared_read(session_id)
+    if shared is not _BACKEND_UNAVAILABLE:
+        if shared is None:
+            # The section is the whole state: an absent or empty slot means
+            # no live bridge, and a leftover file must not resurrect it.
+            return None
+        try:
+            return _decode_status(
+                json.loads(shared.decode("utf-8"))
+            )
+        except (UnicodeError, json.JSONDecodeError):
+            return None
     return _read_status_file(status_path(config_root, session_id=session_id))
 
 
@@ -483,6 +597,30 @@ def _restore_claimed_status(claimed: Path, path: Path) -> bool:
     return True
 
 
+def _clear_shared_status(module, session_id: Optional[int], pid: Optional[int]) -> bool:
+    scope = _shared_scope(session_id)
+    if not module.section_exists(scope):
+        # No section means no bridge and no state: nothing to clean up. This
+        # is the normal path for a reader clearing after a bridge exit.
+        return False
+    payload = module.read_slot(scope, module.SLOT_STATUS)
+    if payload is None:
+        return False
+    try:
+        current = _decode_status(json.loads(payload.decode("utf-8")))
+    except (UnicodeError, json.JSONDecodeError):
+        return False
+    if current is None:
+        return False
+    if pid is not None and current.pid != int(pid):
+        return False
+    try:
+        module.write_slot(scope, module.SLOT_STATUS, b"")
+    except Exception:  # noqa: BLE001 - a reader above our integrity level
+        return False
+    return True
+
+
 def clear_status(
     config_root: Path,
     *,
@@ -495,6 +633,13 @@ def clear_status(
     bridge from deleting a replacement status published by a newer bridge.
     """
 
+    if _SHARED_BACKEND_ENABLED:
+        module = _shared_module()
+        if module is not None:
+            try:
+                return _clear_shared_status(module, session_id, pid)
+            except Exception:  # noqa: BLE001 - fall back to the file backend
+                pass
     path = status_path(config_root, session_id=session_id)
     expected_pid = None if pid is None else int(pid)
     claimed = path.with_name(f".{path.name}.{uuid.uuid4().hex}.clear")

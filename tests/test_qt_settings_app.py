@@ -10945,6 +10945,7 @@ capture_page(
         "desktopBehaviorSectionTitle",
         "launchAtLoginRow",
         "launchBridgeOnAppStartRow",
+        "activateVoiceInputProfileSwitch",
         "diagnosticTraceRow",
         "appLogRow",
         "closeBehaviorRow",
@@ -11612,8 +11613,16 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertIn("SettingsController.setLaunchBridgeOnAppStart", self.device_qml)
         self.assertIn("SettingsController.setDiagnosticTraceEnabled", self.device_qml)
         self.assertIn("SettingsController.setCloseBehaviorIndex", self.device_qml)
-        self.assertIn('titleText: qsTr("启动程序时自动运行服务")', self.device_qml)
+        self.assertIn('text: qsTr("启动程序时自动运行服务")', self.device_qml)
         self.assertIn("自动连接遥控器", self.device_qml)
+        self.assertIn('text: qsTr("按键拉起输入法")', self.device_qml)
+        self.assertIn("拉起豆包或微信输入法", self.device_qml)
+        self.assertIn(
+            'objectName: "activateVoiceInputProfileSwitch"', self.device_qml
+        )
+        self.assertIn(
+            "SettingsController.setActivateVoiceInputProfile", self.device_qml
+        )
         self.assertNotIn("与随 Windows 启动互不绑定", self.device_qml)
         self.assertNotIn("GeneralPage", self.main_qml)
         self.assertNotIn('objectName: "generalTabButton"', self.main_qml)
@@ -12125,8 +12134,9 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
 
     def test_device_toggles_share_the_compact_accent_switch(self):
         # diagnosticTrace / appLog / closeBehavior plus the receiver switch and
-        # the 随 Windows 启动 / 启动程序时自动运行服务 pair further up the page.
-        self.assertEqual(self.device_qml.count("CompactSwitch {"), 5)
+        # the 随 Windows 启动 / 启动程序时自动运行服务 + 按键拉起输入法 pair
+        # further up the page.
+        self.assertEqual(self.device_qml.count("CompactSwitch {"), 6)
         self.assertNotIn("                    Switch {", self.device_qml)
         self.assertIn("implicitWidth: 28", self.compact_switch_qml)
         self.assertIn("implicitHeight: 14", self.compact_switch_qml)

@@ -1057,6 +1057,7 @@ class WeTypeVoiceControl:
         keys: Sequence[str],
         *,
         cancelled: Optional[Callable[[], bool]] = None,
+        activate_profile: bool = True,
     ) -> bool:
         session_keys = tuple(str(key) for key in keys)
         if not session_keys:
@@ -1095,30 +1096,45 @@ class WeTypeVoiceControl:
             generation=int(generation),
             keys=list(session_keys),
         )
-        try:
-            switched = self._run_sta(self._activate_profile)
-        except Exception as exc:
-            _trace(
-                "voice_hotkey_control",
-                provider=self._provider_name.casefold(),
-                phase="profile_activation",
-                generation=int(generation),
-                success=False,
-                continued=bool(self._continue_after_activation_error),
-                error_type=type(exc).__name__,
-            )
-            if not self._continue_after_activation_error or isinstance(exc, InputProfilePreparationError):
+        if activate_profile:
+            try:
+                switched = self._run_sta(self._activate_profile)
+            except Exception as exc:
+                _trace(
+                    "voice_hotkey_control",
+                    provider=self._provider_name.casefold(),
+                    phase="profile_activation",
+                    generation=int(generation),
+                    success=False,
+                    continued=bool(self._continue_after_activation_error),
+                    error_type=type(exc).__name__,
+                )
+                if not self._continue_after_activation_error or isinstance(exc, InputProfilePreparationError):
+                    self._logger.exception(
+                        "%s input profile activation failed on STA thread",
+                        self._provider_name,
+                    )
+                    self._cancel_starting(generation)
+                    return False
                 self._logger.exception(
-                    "%s input profile activation failed on STA thread",
+                    "%s input profile activation failed on STA thread; "
+                    "trying the configured shortcut anyway",
                     self._provider_name,
                 )
-                self._cancel_starting(generation)
-                return False
-            self._logger.exception(
-                "%s input profile activation failed on STA thread; "
-                "trying the configured shortcut anyway",
-                self._provider_name,
-            )
+            else:
+                _trace(
+                    "voice_hotkey_control",
+                    provider=self._provider_name.casefold(),
+                    phase="profile_activation",
+                    generation=int(generation),
+                    success=True,
+                    switched=bool(switched),
+                )
+                self._logger.info(
+                    "%s input profile ready on STA thread switched=%s",
+                    self._provider_name,
+                    switched,
+                )
         else:
             _trace(
                 "voice_hotkey_control",
@@ -1126,12 +1142,13 @@ class WeTypeVoiceControl:
                 phase="profile_activation",
                 generation=int(generation),
                 success=True,
-                switched=bool(switched),
+                skipped=True,
+                switched=False,
             )
             self._logger.info(
-                "%s input profile ready on STA thread switched=%s",
+                "%s input profile activation skipped by setting; sending the "
+                "configured shortcut under the active input method",
                 self._provider_name,
-                switched,
             )
         if cancelled is not None and cancelled():
             self._cancel_starting(generation)
@@ -1368,6 +1385,7 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
         *,
         cancelled: Optional[Callable[[], bool]] = None,
         cancel_event: Optional[threading.Event] = None,
+        activate_profile: bool = True,
     ) -> Optional[PreparedDoubaoVoiceStart]:
         """Activate the IME profile without dispatching the shortcut yet."""
 
@@ -1391,6 +1409,21 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
             keys=list(session_keys),
         )
         operation: Optional[_StaOperation] = None
+        if not activate_profile:
+            _trace(
+                "voice_hotkey_control",
+                provider="doubao",
+                phase="profile_activation",
+                generation=int(generation),
+                success=True,
+                skipped=True,
+                switched=False,
+            )
+            self._logger.info(
+                "Doubao input profile activation skipped by setting; sending "
+                "the configured shortcut under the active input method"
+            )
+            return PreparedDoubaoVoiceStart(generation, session_keys)
         try:
             if self._doubao_start_sta is not None:
                 operation = self._doubao_start_sta(
@@ -1562,8 +1595,11 @@ class DoubaoVoiceControl(WeTypeVoiceControl):
         keys: Sequence[str],
         *,
         cancelled: Optional[Callable[[], bool]] = None,
+        activate_profile: bool = True,
     ) -> bool:
-        prepared = self.prepare(keys, cancelled=cancelled)
+        prepared = self.prepare(
+            keys, cancelled=cancelled, activate_profile=activate_profile
+        )
         if prepared is None:
             return False
         if not prepared.ready:

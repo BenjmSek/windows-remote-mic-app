@@ -311,6 +311,7 @@ class ChromecastApp:
                 prepare_mute_guard=self._prepare_wetype_playback_mute_guard,
                 duck_playback=self._playback_ducker.begin,
                 restore_playback=self._playback_ducker.end,
+                settings=lambda: self._config,
             ),
         )
         # Attach Frida to the Doubao IME up front so the first voice-key /

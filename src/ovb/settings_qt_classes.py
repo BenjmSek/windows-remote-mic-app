@@ -778,6 +778,9 @@ def build(
             self._app_log_enabled = bool(
                 self._config.get("app_log_enabled", True)
             )
+            self._activate_voice_input_profile = bool(
+                self._config.get("activate_voice_input_profile", True)
+            )
             self._disable_audio_sending = bool(
                 self._config.get("disable_audio_sending", False)
             )
@@ -5273,6 +5276,11 @@ def build(
             lambda self: self._app_log_enabled,
             notify=desktopBehaviorChanged,
         )
+        activateVoiceInputProfile = Property(
+            bool,
+            lambda self: self._activate_voice_input_profile,
+            notify=desktopBehaviorChanged,
+        )
         disableAudioSending = Property(
             bool,
             lambda self: self._disable_audio_sending,
@@ -5725,6 +5733,20 @@ def build(
                 "已开启应用日志。" if enabled else "已关闭应用日志（不再生成 app.log）。",
                 self._DESKTOP_BEHAVIOR_PAGE_INDEX,
             )
+
+        @Slot(bool)
+        def setActivateVoiceInputProfile(self, enabled: bool) -> None:
+            enabled = bool(enabled)
+            if enabled == self._activate_voice_input_profile:
+                return
+            if not self._persist_desktop_behavior(
+                "activate_voice_input_profile", enabled
+            ):
+                self.desktopBehaviorChanged.emit()
+                return
+            self._activate_voice_input_profile = enabled
+            self.desktopBehaviorChanged.emit()
+            bridge_launcher.reload_in_process_bridge_settings()
 
         @Slot(bool)
         def setDisableAudioSending(self, enabled: bool) -> None:

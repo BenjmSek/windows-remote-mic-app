@@ -13,11 +13,14 @@
           },
           "home": {
             "keys": [],
-            "kind": "disabled"
+            "kind": "system_volume_mute"
           },
           "input_source": {
-            "keys": [],
-            "kind": "disabled"
+            "keys": [
+              "rctrl",
+              "right"
+            ],
+            "kind": "key_combo"
           },
           "left": {
             "keys": [],
@@ -36,8 +39,11 @@
             "kind": "return"
           },
           "power": {
-            "keys": [],
-            "kind": "disabled"
+            "keys": [
+              "rctrl",
+              "left"
+            ],
+            "kind": "key_combo"
           },
           "right": {
             "keys": [],
@@ -60,8 +66,10 @@
             "kind": "system_volume_up"
           },
           "youtube": {
-            "keys": [],
-            "kind": "disabled"
+            "keys": [
+              "comma"
+            ],
+            "kind": "key_combo"
           }
         },
         "combo_bindings": {

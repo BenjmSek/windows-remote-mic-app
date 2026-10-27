@@ -636,7 +636,7 @@ class LiveSettingsReloadTests(_AppWiringTestCase):
             self.app._configured_voice_hotkey_backend(),
             app_module._VOICE_HOTKEY_BACKEND_DOUBAO,
         )
-        control.start.assert_called_once_with(("ralt",))
+        control.start.assert_called_once_with(("ralt",), activate_profile=True)
         self.app._voice_shortcut.doubao_physicalizer.start.assert_called_once_with((0xA5,))
         self.assertTrue(
             self.app._voice_shortcut.apply(
@@ -1103,7 +1103,9 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 )
             )
 
-        wetype_control.start.assert_called_once_with(WETYPE_VOICE_TOKENS)
+        wetype_control.start.assert_called_once_with(
+            WETYPE_VOICE_TOKENS, activate_profile=True
+        )
         wetype_control.stop.assert_called_once_with()
         marked_down.assert_not_called()
         marked_up.assert_not_called()
@@ -1170,7 +1172,9 @@ class HostHotkeyFailureSuppressesMicOpenTests(_AppWiringTestCase):
                 )
             )
 
-        doubao_control.start.assert_called_once_with(DEFAULT_VOICE_TOKENS)
+        doubao_control.start.assert_called_once_with(
+            DEFAULT_VOICE_TOKENS, activate_profile=True
+        )
         doubao_control.stop.assert_called_once_with()
         self.app._voice_shortcut.doubao_physicalizer.start.assert_called_once_with((0xA5,))
         wetype_start.assert_not_called()

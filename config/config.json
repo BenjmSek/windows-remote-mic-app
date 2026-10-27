@@ -1,4 +1,5 @@
 {
+  "activate_voice_input_profile": true,
   "app_log_enabled": false,
   "audio_ducking_enabled": true,
   "close_behavior": "hide_to_tray",
@@ -24,9 +25,9 @@
         "output_endpoint_name": "CABLE Input (VB-Audio Virtual Cable)",
         "remote_recording_limit_seconds": 120,
         "remote_recording_mode": "hold",
-        "voice_hotkey": "lctrl+lwin+lalt",
+        "voice_hotkey": "lctrl+lalt+lwin",
         "voice_hotkeys": {
-          "hold": "lctrl+lwin+lalt"
+          "hold": "lctrl+lalt+lwin"
         },
         "voice_hotkeys_by_provider": {
           "chatterfly": {
@@ -38,8 +39,8 @@
             "source": "default"
           },
           "doubao_ime": {
-            "hold": "lctrl+lwin+lalt",
-            "source": "manual"
+            "hold": "lctrl+lalt+lwin",
+            "source": "auto"
           },
           "none": {
             "hold": "ralt",

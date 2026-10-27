@@ -190,15 +190,10 @@ def _read_pdb_identity(path, details):
 
 
 def _symbol_cache() -> Path:
-    from . import dev_session
-
-    # Downloaded symbol files are a cache, not user state, but they still
-    # belong to this checkout in a portable launch - writing them into
-    # %LOCALAPPDATA% would leave the program unable to run from a copied
-    # directory on a machine that never had it installed.
-    portable = dev_session.portable_root()
-    if portable is not None:
-        return portable / "runtime" / "HidSymbols"
+    # dbghelp resolves symbols from a real directory, so this cache cannot be
+    # memory-backed like the bridge status. It stays out of the checkout all
+    # the same: a portable launch would otherwise drop a 560 KB PDB into a
+    # source tree, and %LOCALAPPDATA% is shared across checkouts anyway.
     root = os.environ.get("LOCALAPPDATA")
     if not root:
         raise TapError("hid_symbol_unavailable", detail="cache_root")

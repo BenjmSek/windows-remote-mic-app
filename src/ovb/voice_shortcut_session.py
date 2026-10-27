@@ -34,6 +34,9 @@ class ShortcutServices:
     # nothing is muted unless the application wires these up.
     duck_playback: Callable = lambda: False  # noqa: E731 - dataclass default
     restore_playback: Callable = lambda: None  # noqa: E731 - dataclass default
+    # Optional live settings snapshot. Defaults keep every existing caller
+    # working: an empty mapping leaves every opt-out at its default.
+    settings: Callable = lambda: {}  # noqa: E731 - dataclass default
 
 
 class VoiceShortcutSession:
@@ -364,12 +367,28 @@ class VoiceShortcutSession:
                     else "up",
                     expected_markers,
                 )
+            # The provider is summoned by its own global hotkey when the user
+            # turns the input-profile switch off; hold/toggle both honour it.
+            activate_profile = True
+            if action == voice_controller.VoiceHostAction.KEY_DOWN:
+                try:
+                    activate_profile = bool(
+                        (self.services.settings() or {}).get(
+                            "activate_voice_input_profile", True
+                        )
+                    )
+                except Exception:
+                    activate_profile = True
             try:
                 if action == voice_controller.VoiceHostAction.KEY_DOWN:
                     delivered = (
-                        control.start(tokens)
+                        control.start(tokens, activate_profile=activate_profile)
                         if cancelled is None
-                        else control.start(tokens, cancelled=cancelled)
+                        else control.start(
+                            tokens,
+                            cancelled=cancelled,
+                            activate_profile=activate_profile,
+                        )
                     )
                 else:
                     delivered = control.stop()

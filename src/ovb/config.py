@@ -182,6 +182,12 @@ def default_config() -> Dict[str, Any]:
         # Opt out of the rotating app.log entirely. The desktop shell only
         # stops writing it; existing files are left on disk for export.
         "app_log_enabled": True,
+        # Opt out of the TSF input-profile switch that normally runs right
+        # before the voice shortcut is handed to the input method. Doubao and
+        # WeType can be summoned while another input method stays active, so
+        # turning this off leaves the current input method alone and relies on
+        # that provider's own global hotkey instead.
+        "activate_voice_input_profile": True,
         # Opt in to sending the voice key even when no playback endpoint can
         # be opened. Voice normally fails closed on the audio output so a
         # broken sink is reported instead of silently dropped.
@@ -597,6 +603,9 @@ def _normalize_desktop_behavior(config: Dict[str, Any]) -> None:
     )
     config["app_log_enabled"] = bool(
         config.get("app_log_enabled", True)
+    )
+    config["activate_voice_input_profile"] = bool(
+        config.get("activate_voice_input_profile", True)
     )
     config["disable_audio_sending"] = bool(
         config.get("disable_audio_sending", False)

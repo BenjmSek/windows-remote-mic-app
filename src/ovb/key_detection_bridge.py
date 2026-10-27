@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -13,6 +14,28 @@ from typing import Callable, Optional
 
 SCHEMA_VERSION = 1
 STALE_AFTER_SECONDS = 60.0
+
+
+def _runtime_root(config_root: Path) -> Path:
+    """Where request/result handoffs are parked.
+
+    A portable launch used to write these under the checkout's ``runtime``
+    directory, which left transient JSON files in a source tree. They are
+    short-lived cross-process scratch, not settings, so a portable launch
+    moves them to the OS temp directory; every other caller (tests, packaged
+    builds) keeps the historical layout under its own root.
+    """
+
+    root = Path(config_root)
+    try:
+        from . import dev_session
+
+        portable = dev_session.portable_root()
+    except Exception:  # noqa: BLE001 - a missing marker must not break IPC
+        portable = None
+    if portable is not None and Path(portable) == root:
+        return Path(tempfile.gettempdir()) / "RemoteMic-key-detection"
+    return root / "runtime" / "key-detection"
 
 
 @dataclass(frozen=True)
@@ -42,7 +65,7 @@ def request_detection(
     *,
     now: Callable[[], float] = time.time,
 ) -> DetectionRequest:
-    root = Path(config_root) / "runtime" / "key-detection"
+    root = _runtime_root(config_root)
     root.mkdir(parents=True, exist_ok=True)
     _cleanup_stale(root, now=now)
     request = DetectionRequest(token=uuid.uuid4().hex, root=root)
@@ -62,7 +85,7 @@ def has_pending_request(
     *,
     now: Callable[[], float] = time.time,
 ) -> bool:
-    root = Path(config_root) / "runtime" / "key-detection"
+    root = _runtime_root(config_root)
     if not root.is_dir():
         return False
     _cleanup_stale(root, now=now)
@@ -79,7 +102,7 @@ def publish_next_button(
 
     if not button_id or not all(ch.isalnum() or ch == "_" for ch in button_id):
         return False
-    root = Path(config_root) / "runtime" / "key-detection"
+    root = _runtime_root(config_root)
     if not root.is_dir():
         return False
     _cleanup_stale(root, now=now)

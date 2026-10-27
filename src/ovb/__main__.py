@@ -802,6 +802,14 @@ def main() -> None:
     from . import startup_windows
 
     args = dev_session.consume_marker(sys.argv[1:])
+    # Transient bridge status lives in a session-local memory section so a
+    # portable checkout never grows a config/runtime directory. Packaged and
+    # isolated runs keep the file backend: an installed copy writes outside
+    # the program directory anyway, and fixtures stay reproducible.
+    if dev_session.is_active() and not dev_session.is_isolated():
+        from . import bridge_runtime_status
+
+        bridge_runtime_status.enable_shared_backend()
     if "--capture-hotkey-worker" in args:
         from . import hotkey_capture_process
         if args[0] != hotkey_capture_process.FLAG:
