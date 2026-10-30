@@ -4,6 +4,16 @@
 （GPL-3.0-only）的衍生版本，剥离小米 RC003 支持，仅保留 Google Chromecast 链路。
 版本号自 0.2.0 起独立编排，与上游版本号不可比。
 
+## 0.2.2
+
+- 修复重启后第一次按语音键「拉不起输入法」的问题：原 `deliver_voice_hotkey` 在
+  `prepare_doubao`（Frida attach 豆包 `ImeService.exe`）失败时直接 `return undelivered()`，
+  把「切换 Windows 输入法」整条路径一并丢弃。冷启动时豆包进程尚未加载，于是首次按键
+  完全拉不起输入法（且这正是触发 `ImeService.exe` 加载的入口，鸡生蛋死锁）。改为软降级：
+  `prepare_doubao` 失败仅告警，继续走 `control.start` 拉输入法；语音物理按键组合键在进程
+  加载末段可能末次不完全生效，但输入法已拉起，第二次按即全功能。
+  （`src/ovb/voice_shortcut_session.py`）
+
 ## 0.2.0
 
 - 对豆包 0.9.3.20 新版本进行适配

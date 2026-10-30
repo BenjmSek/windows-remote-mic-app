@@ -343,20 +343,16 @@ class VoiceShortcutSession:
             control = self.control_for_backend(backend)
             provider = self.provider_for_backend(backend)
             if action == voice_controller.VoiceHostAction.KEY_DOWN:
-                if (
-                    backend == _VOICE_HOTKEY_BACKEND_DOUBAO
-                    # Always arm the Frida hook with the complete configured
-                    # hotkey set, never with the subset that this particular
-                    # entry point injects.  The physical-key long-press path
-                    # drops the monitored key (``lwin``) from ``tokens`` to
-                    # avoid re-injecting a key the finger is holding down;
-                    # feeding that reduced set here would make the hook's
-                    # ``allowedVks`` differ from the remote-MIC path and force
-                    # a full re-attach (0.2-1s) on every switch between the two
-                    # entry points.  The extra whitelisted key is harmless: the
-                    # hook only acts on injected events that also carry the
-                    # voice marker.
-                    and not self.services.prepare_doubao(
+                if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
+                    # 拉起输入法（切换 Windows 输入法）不应被"豆包语音物理化器
+                    # 已就绪"卡死。冷启动时豆包 ImeService.exe 尚未加载，
+                    # prepare_doubao 会失败，但切输入法本身正是触发 ImeService
+                    # 加载的入口——这里是鸡生蛋死锁。该就绪检查只服务于 Frida
+                    # 注入，失败时应降级警告、继续往下走 control.start（拉输入法
+                    # 与语音链路），而不是把整条路径（含 input-profile 切换）一并
+                    # 丢弃。语音物理按键组合键在进程加载末段可能末次不完全生效，
+                    # 但输入法已经拉起，第二次按即全功能。
+                    if not self.services.prepare_doubao(
                         tuple(
                             dict.fromkeys(
                                 tuple(self.hotkey.modifiers)
@@ -364,9 +360,11 @@ class VoiceShortcutSession:
                                 + tuple(tokens)
                             )
                         )
-                    )
-                ):
-                    return undelivered()
+                    ):
+                        self.logger.warning(
+                            "Doubao voice physicalizer not ready on first "
+                            "press; input-profile switch (拉起输入法) still runs"
+                        )
                 self.begin_runtime(backend)
             if backend == _VOICE_HOTKEY_BACKEND_DOUBAO:
                 try:
