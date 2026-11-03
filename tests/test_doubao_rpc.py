@@ -420,6 +420,45 @@ class DoubaoPhysicalizerTests(unittest.TestCase):
         script.unload.assert_called_once()
         session.detach.assert_called_once()
 
+    def test_10023_checks_entry_and_forward_before_hooks_without_stack_writes(self):
+        source = doubao_rpc._physicalizer_source(
+            (0xA3, 0x4C), 0x7DDD90, 0x7DF19D, 0x7DF1A3, 0, 0)
+        self.assertIn("hasBytes(callback, [0x4C, 0x8B, 0xDC, 0x53", source)
+        self.assertIn("hasBytes(earlyForward, [0xFF, 0x15, 0x7D, 0x72, 0xDE", source)
+        self.assertLess(source.index("throw new Error('verified Doubao hook layout changed')"),
+                        source.index("Interceptor.attach(callback"))
+        self.assertEqual(source.count("Interceptor.attach("), 1)
+        self.assertEqual(source.count("Interceptor.replace("), 1)
+        self.assertNotIn("decisionGate", source)
+        self.assertNotIn("consumedStackOffset", source)
+        self.assertNotIn("this.context.rsp", source)
+        self.assertNotIn("this.context.pc", source)
+        self.assertIn("forwardSlot.readPointer().equals(nextHook)", source)
+        self.assertIn("callback_path = 'native_forward'", source)
+
+    def test_10023_start_uses_only_verified_forward_and_unloads(self):
+        script = _ready_script()
+        session = mock.Mock()
+        session.create_script.return_value = script
+        self.processes.return_value = [types.SimpleNamespace(pid=46500, name="ImeService.exe")]
+        fake_frida = types.SimpleNamespace(attach=mock.Mock(return_value=session))
+        physicalizer = doubao_rpc.DoubaoPhysicalizer()
+        with mock.patch.dict(sys.modules, {"frida": fake_frida}), mock.patch.object(
+            physicalizer, "_probe_module",
+            return_value=r"C://Program Files//DoubaoIME//versions//v1.0.0.23//ImeService.exe",
+        ), mock.patch.object(doubao_rpc, "_module_sha256",
+            return_value="fee3566aeb39913707b0afe6afd1c4e0ab84d5c676bf3abe1f9ea265d878cec3",
+        ):
+            self.assertTrue(physicalizer.start((0xA3, 0x4C)))
+        source = session.create_script.call_args.args[0]
+        for address in ("7DDD90", "7DF19D", "7DF1A3"):
+            self.assertIn(f"module.base.add(0x{address})", source)
+        self.assertNotIn("consumedStackOffset", source)
+        self.assertEqual(physicalizer.status, "active")
+        physicalizer.stop()
+        script.unload.assert_called_once()
+        session.detach.assert_called_once()
+
     def test_new_build_starts_with_new_layout_and_cleans_up(self):
         script = _ready_script()
         session = mock.Mock()

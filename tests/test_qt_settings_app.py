@@ -11347,7 +11347,9 @@ class SettingsShellSourceContractTests(unittest.TestCase):
         self.assertNotIn("comboMapping", self.tokens_qml)
 
     def test_all_selectors_reuse_one_selected_option_delegate(self):
-        self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 4)
+        # 4 built-in selectors + 按键拉起输入法, moved here from the device
+        # page in 0.2.1 so it sits under 语音物理按键.
+        self.assertEqual(self.voice_qml.count("SelectionComboBox {"), 5)
         self.assertIn(
             "recommendedIndex: SettingsController.recommendedEndpointIndex",
             self.voice_qml,

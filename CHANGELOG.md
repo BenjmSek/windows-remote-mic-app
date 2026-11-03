@@ -4,6 +4,29 @@
 （GPL-3.0-only）的衍生版本，剥离小米 RC003 支持，仅保留 Google Chromecast 链路。
 版本号自 0.2.0 起独立编排，与上游版本号不可比。
 
+## 0.2.3
+
+- 适配豆包输入法 **v1.0.0.23**（0.9 → 1.0 跨大版本），**已真机验证可用**：重启程序后
+  语音键能开能停、打字不丢键，`app.log` 无 `verified Doubao hook layout changed`。
+  该版本回调被重写：`.text` 段
+  增大约 2.4 MB，0.9.3.20 的字节签名在新二进制中**零命中**，旧 layout 不可用。
+  新 layout `_DOUBAO_10023_HOOK_LAYOUT = (0x7DDD90, 0x7DF19D, 0x7DF1A3, 0, 0)`，
+  仍是 forward-only 布局（后两位为 0，无 decision gate / 无栈偏移）。
+  定位方法：解析 `user32.dll` 导入表拿到 `CallNextHookEx` 的 IAT 槽位 `0x15C6420`，
+  反算全部 `FF 15` 调用点（3 处），再用 `.pdata` 异常表筛出唯一的大栈帧回调
+  `[0x7DDD90, 0x7DF2A7)`（0xB0A 字节局部变量）；另两处分别是 1635 字节的 cleanup
+  分支与 41 字节的转发 thunk，均排除。
+  静态验证四项全过：布局与旧版同构、`FF 15` 反算目标恰为 `0x15C6420`、
+  `earlyForward` 签名全文件唯一、`callback` 取 19 字节唯一。
+  同步新增 `_VERIFIED_FORWARD_ONLY_SIGNATURES` 与 `_VERIFIED_VOICE_STOP_BUILDS` 表项。
+  登记的三文件 sha256：`ImeService.exe fee3566a…`、`rpc.dll de0ab466…`、
+  `tsf-oime-core.dll 8fa4b16d…`。voice-stop 沿用 `wParam=1` 绕过「触发后 800ms 内
+  抑制停止」，已在真机确认（此前标注为待验证）。
+  **纯新增**：0.9.3.20 及更早版本的全部表项与 layout 一字未改，测试也未删。
+  （`src/ovb/doubao_rpc.py`；测试 `tests/test_doubao_rpc.py` 新增 2 例，46 例全通过）
+- 修复 `tests/test_qt_settings_app.py` 中语音页 `SelectionComboBox` 计数断言
+  （0.2.1 把「按键拉起输入法」从设备页搬到语音页，计数 4 → 5，当时漏改）。
+
 ## 0.2.2
 
 - 修复重启后第一次按语音键「拉不起输入法」的问题：原 `deliver_voice_hotkey` 在
