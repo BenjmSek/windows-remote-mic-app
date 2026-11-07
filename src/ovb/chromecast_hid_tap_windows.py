@@ -440,7 +440,7 @@ function report(buffer) {
     if (lengths.has(size)) lengths.set(size, Math.min(2147483647, lengths.get(size) + 1));
     else if (lengths.size < 16) lengths.set(size, 1);
     else count("lengths_overflow");
-    if (size !== 8 && size !== 2) { count("length_rejected"); return null; }
+    if (size !== 8 && size !== 2 && size !== 1) { count("length_rejected"); return null; }
     errorStep = "access";
     const accessOut = Memory.alloc(Process.pointerSize);
     if (method(buffer, 0, "int", ["pointer", "pointer", "pointer"])(buffer, iid, accessOut) !== 0) {
@@ -460,6 +460,14 @@ function report(buffer) {
       const code = usage === 0 ? 0 : consumerCodes[usage];
       if (code === undefined) { count("code_rejected"); return null; }
       return new Uint8Array([code, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    if (size === 1) {
+      // 1-byte vendor report variant: the byte is the button code itself
+      // (remote_layout.CHROMECAST_REPORT_CODES), same slot as byte 0 of the
+      // 8-byte path. Pad to the 8-byte shape downstream expects.
+      const padded = new Uint8Array(8);
+      padded[0] = bytes[0];
+      return padded;
     }
     return bytes;
   } finally {
