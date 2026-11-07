@@ -251,6 +251,14 @@ class VoiceReceiver:
             self._probe_decision(f"control/{value[0] if value else 256}/{len(value)}/{previous}/{self.gate.control_result}", now)
             self.effects(effects)
         elif kind == "audio":
+            if self.gate.state == "idle" and not self.stopping:
+                # Variant remote (PID 9450 REV 0110) starts streaming ADPCM
+                # audio the moment the voice key is held, without any 0x04
+                # AUDIO_START control notification. Feed the existing control
+                # path a synthesized start so the recording gate opens and the
+                # host launches its IME voice hotkey as usual.
+                start_effects = self.gate.control(b"\x04\x03\x02\x01", now)
+                self.effects(start_effects)
             effects = self.gate.audio(value, now)
             if self.observation:
                 self.observation.count("accepted_audio" if effects else "ignored_audio")
