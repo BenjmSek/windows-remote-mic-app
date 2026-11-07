@@ -26,8 +26,11 @@ CAPABILITIES_TIMEOUT = 3.0
 
 
 def supported_capabilities(payload):
-    return (isinstance(payload, bytes) and len(payload) == 9
-            and payload[:3] == b"\x0b\x01\x00" and payload[3] & 2 != 0
+    # Variant remotes append a trailing capability byte to the v1.0
+    # CAPS_RESP (10 bytes instead of 9); the first nine bytes carry every
+    # field this check needs, so accept any length >= 9.
+    return (isinstance(payload, (bytes, bytearray)) and len(payload) >= 9
+            and bytes(payload[:3]) == b"\x0b\x01\x00" and payload[3] & 2 != 0
             and payload[4] == 3 and 1 <= int.from_bytes(payload[5:7], "big") <= 512)
 
 
