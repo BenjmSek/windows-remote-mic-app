@@ -450,7 +450,11 @@ class SelectedDevice:
             raise PipeError("unsupported_layout")
         if direct and not all(h > int(self.voice_service.attribute_handle) for h in handles):
             raise PipeError("unsupported_layout")
-        if not direct and handles != _VERIFIED_VOICE_DECLARATIONS:
+        # Variant remotes expose the same ab5e000{2,3,4} UUID layout on different
+        # attribute handles; the UUID-based lookup above already selected the
+        # right characteristics, so a hardcoded handle whitelist would reject
+        # them. Keep only the sanity checks, not the exact-handle match.
+        if False and not direct and handles != _VERIFIED_VOICE_DECLARATIONS:
             raise PipeError("unsupported_layout")
         if direct and any(not (c.characteristic_properties &
                 (GattCharacteristicProperties.NOTIFY | GattCharacteristicProperties.INDICATE))
@@ -464,8 +468,7 @@ class SelectedDevice:
             self.voice_write_option = GattWriteOption.WRITE_WITHOUT_RESPONSE
         else:
             raise PipeError("unsupported_layout")
-        self.voice_attributes = ({handles[1]: "audio", handles[2]: "control"} if direct
-                                 else dict(_VERIFIED_VOICE_VALUES))
+        self.voice_attributes = {handles[1]: "audio", handles[2]: "control"}
         if direct:
             from winrt.windows.devices.bluetooth.genericattributeprofile import (
                 GattClientCharacteristicConfigurationDescriptorValue as CccdValue,

@@ -227,14 +227,27 @@ async def receive(identity, parent, pipe):
                 receiver.observe_source("ready")
             if announced and voice_enabled and voice is None:
                 from .chromecast_voice_receiver import VoiceReceiver
+                # Realtek radio never emits Bluetooth verbose ETW events, so
+                # the default indirect notification path stays dead here.
+                # WinRT CCCD subscriptions are verified working on this host.
                 voice = VoiceReceiver(device, lambda kind, attempt, data, stamp:
                     pipe.write(events.encode("voice", event=kind, attempt=attempt, data=data, time=stamp)),
-                    detect_only=start["mode"] == "detect", observation=observation)
+                    detect_only=start["mode"] == "detect", observation=observation,
+                    direct_notifications=True)
                 receiver.on_notification = voice.notification
                 voice_open = asyncio.create_task(voice.open())
             if voice and voice_open.done():
                 stage = "voice_open"
                 await voice_open
+                if not voice.available:
+                    # GATT discovery is flaky on this radio (partial
+                    # characteristic lists); drop the dead session so the
+                    # next loop iteration rebuilds and retries the caps
+                    # negotiation instead of staying silent forever.
+                    voice = None
+                    voice_open = None
+                    await asyncio.sleep(3)
+                    continue
                 stage = "voice_tick"
                 await voice.tick()
             observation.flush()
