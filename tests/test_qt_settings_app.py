@@ -12135,6 +12135,18 @@ class ThreePageSettingsSourceContractTests(unittest.TestCase):
         self.assertIn("ButtonsPage {", self.main_qml)
         self.assertIn("VoicePage {", self.main_qml)
 
+    def test_doubao_update_notice_is_scoped_to_doubao(self):
+        self.assertIn('objectName: "doubaoUpdateNotice"', self.voice_qml)
+        self.assertIn("visible: root.doubaoSelected", self.voice_qml)
+        self.assertIn("kind: noteKind", self.voice_qml)
+        self.assertIn(
+            'text: qsTr("豆包更新可能导致遥控语音暂时不可用。建议关闭豆包自动更新，确认兼容后再手动更新。")',
+            self.voice_qml,
+        )
+        # The notice is a static hint: it must not claim every update breaks voice.
+        self.assertNotIn("豆包更新必然导致遥控语音不可用", self.voice_qml)
+        self.assertEqual(self.voice_qml.count('objectName: "doubaoUpdateNotice"'), 1)
+
     def test_window_uses_the_inset_rounded_client_shell(self):
         for token_name in (
             "windowFrame",
