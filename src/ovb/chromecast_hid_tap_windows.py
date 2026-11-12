@@ -33,6 +33,9 @@ _KNOWN_LAYOUTS = {
     "8a18571ddfa447bd590354ccdf7800b815a098806359ab195d395158f9d07cc5": (0x12FCC, 24),
     "de2b7ff2a61d50473cfe1e00ec012e99bda9361d563249ef93dce59f576e9936": (0x1580C, 8),
     "372c3628e3366c18152199eb8fb554d27bb4f02d1356b1f514f711328df4a8d6": (0x157FC, 8),
+    # 10.0.26100.9818 (KB5132061/KB5132688, 2026-11); RVAs verified via public PDB
+    # (OnReportValueChanged = 101804 = 0x18DAC; prologue bytes confirmed in-file).
+    "63633289822aa0157adb32e0ec062bf0f3cb31db25bdfc92eb8e39cea0a5475a": (0x18DAC, 8),
 }
 _HID_SERVICE = "{00001812-0000-1000-8000-00805f9b34fb}"
 _GOOGLE_HARDWARE = (
@@ -324,18 +327,24 @@ def _constructor_address_offset(code: bytes) -> int:
     """Recognize complete verified x64 prologues before RCX/RDX can change.
 
     The constructor's first argument (RDX) is the Bluetooth address. Only the
-    RIP-relative vtable displacement may vary; never scan object memory or
-    search arbitrary instructions for a coincidental address/store.
+    RIP-relative vtable displacement and the callee-saved push block may vary
+    (26100.9818 builds push r12/r13/r14 where older builds pushed r12/r14/r15);
+    never scan object memory or search arbitrary instructions for a
+    coincidental address/store.
     """
-    prefix = bytes.fromhex(
-        "4c894c2420 48894c2408 53 55 56 57 4154 4156 4157 4883ec50 "
-        "4d8bf1 410fb7e8 488bf9"
+    head = bytes.fromhex("4c894c2420 48894c2408")
+    pushes = (
+        bytes.fromhex("53555657 4154 4156 4157"),
+        bytes.fromhex("53555657 4154 4155 4156"),
     )
-    for offset, initialize in ((24, bytes.fromhex("4533e4 4c896108 4c896110")), (8, b"")):
-        start = prefix + initialize + bytes.fromhex("488d05")
-        end = bytes.fromhex("488901 488951") + bytes([offset])
-        if code.startswith(start) and code[len(start) + 4:len(start) + 4 + len(end)] == end:
-            return offset
+    tail = bytes.fromhex("4883ec50 4d8bf1 410fb7e8 488bf9")
+    for push_block in pushes:
+        prefix = head + push_block + tail
+        for offset, initialize in ((24, bytes.fromhex("4533e4 4c896108 4c896110")), (8, b"")):
+            start = prefix + initialize + bytes.fromhex("488d05")
+            end = bytes.fromhex("488901 488951") + bytes([offset])
+            if code.startswith(start) and code[len(start) + 4:len(start) + 4 + len(end)] == end:
+                return offset
     raise TapError("hid_symbol_unavailable", detail="constructor_unrecognized")
 
 
