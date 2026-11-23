@@ -4,6 +4,27 @@
 （GPL-3.0-only）的衍生版本，剥离小米 RC003 支持，仅保留 Google Chromecast 链路。
 版本号自 0.2.0 起独立编排，与上游版本号不可比。
 
+## 0.2.4 — 适配豆包输入法 v1.1.1.12
+
+- **适配豆包输入法 v1.1.1.12**：新版 `ImeService.exe` 的 sha256 不在白名单，
+  语音键失效。静态验证确认回调并未重写，而是 1.0.0.23 的整体平移：prologue
+  逐字节相同、forward 相对入口偏移同为 +0x140D，仅 `.text` 上移约 0xF480、
+  `CallNextHookEx` IAT 槽由 `0x15C6420` 移到 `0x16893E8`。
+  新增 `_DOUBAO_11112_HOOK_LAYOUT = (0x7ED410, 0x7EE81D, 0x7EE823, 0, 0)`
+  （forward-only），并加入 `_VERIFIED_IME_SERVICE_BUILDS` /
+  `_VERIFIED_FORWARD_ONLY_SIGNATURES` / `_VERIFIED_VOICE_STOP_BUILDS` 三张白名单。
+  Frida 脚本零改动（IAT 槽由脚本动态反算）。登记三文件 sha256：
+  `ImeService.exe 68a7642e…`、`rpc.dll 80a93177…`、`tsf-oime-core.dll 6ba1c053…`。
+  纯新增，0.9.3.20 / 1.0.0.23 的全部表项与 layout 一字未改。
+  静态闭环实测：真 exe 哈希命中表、entry/forward 签名逐字节匹配磁盘、
+  voice-stop 三文件交叉校验通过。
+  （`src/ovb/doubao_rpc.py`；`tests/test_doubao_rpc.py` 新增 2 例）
+  **待真机验证**：需重启程序重新挂钩后试语音开/停与打字；voice-stop 的
+  `wParam=1` 仅静态沿用前版，尚未真机确认。
+- 版本号 `0.2.3` → `0.2.4`（`src/ovb/VERSION`，单一来源，面板标题/exe 名自动跟随）。
+- 全量回归 **3576 例 / 1 失败 / 9 跳过**，唯一失败是 v0.2.2 软降级遗留旧基线失败，
+  与本轮改动无交集。
+
 ## 0.2.3 后续修订：移植上游 1.0.103 的两项低风险兼容改进
 
 不升版本号（仍为 0.2.3）、不打 tag，仅同步本次本地改动到仓库。

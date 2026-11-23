@@ -42,6 +42,14 @@ _DOUBAO_09320_HOOK_LAYOUT = (0x7CD5A0, 0x7CE5B2, 0x7CE5B8, 0, 0)
 # callback: [0x7DDD90, 0x7DF2A7) with 0xB0A bytes of locals.  The other two
 # call sites are a 1635-byte cleanup path and a 41-byte forwarding thunk.
 _DOUBAO_10023_HOOK_LAYOUT = (0x7DDD90, 0x7DF19D, 0x7DF1A3, 0, 0)
+# 1.1.1.12 keeps 1.0.0.23's forward-only shape and its callback prologue is
+# byte-for-byte identical; only the whole .text moved (~+0xF480) and the
+# CallNextHookEx IAT slot moved to 0x16893E8. Verified statically on the real
+# binary (no attach): callback [0x7ED410,0x7EE927) with 0xAB0-byte frame, its
+# single FF 15 forward at 0x7EE81D (+0x140D into the callback, same as 1.0.0.23),
+# FF 15 rel32 reversing to the IAT slot. The other FF 15 site is the cleanup
+# path [0x7EF3C0,0x7EFA4C) which restores rsp then returns.
+_DOUBAO_11112_HOOK_LAYOUT = (0x7ED410, 0x7EE81D, 0x7EE823, 0, 0)
 _VERIFIED_IME_SERVICE_BUILDS = {
     "94b17bdca571ac3cd2dafa687b4cb8e3a789cda9d044276483003b0a9e8f77a6":
         _DOUBAO_0900_HOOK_LAYOUT,
@@ -53,6 +61,8 @@ _VERIFIED_IME_SERVICE_BUILDS = {
         _DOUBAO_09320_HOOK_LAYOUT,
     "fee3566aeb39913707b0afe6afd1c4e0ab84d5c676bf3abe1f9ea265d878cec3":
         _DOUBAO_10023_HOOK_LAYOUT,
+    "68a7642e6d590fc7dc1488d446fde3fdd1cc2ceb978951f76a48c24d48f82b06":
+        _DOUBAO_11112_HOOK_LAYOUT,
 }
 # These gates belong to the same exact build as the callback, not just the
 # same version label. Both are checked in loaded memory before any hook.
@@ -80,6 +90,10 @@ _VERIFIED_FORWARD_ONLY_SIGNATURES = {
     _DOUBAO_10023_HOOK_LAYOUT: (
         bytes.fromhex("4C 8B DC 53 56 57 41 54 41 55 41 56 41 57 48 81 EC B0 0A"),
         bytes.fromhex("FF 15 7D 72 DE 00 48 8B D8 48 8D 8C 24 20 07 00 00 E8 1D 88 FF FF"),
+    ),
+    _DOUBAO_11112_HOOK_LAYOUT: (
+        bytes.fromhex("4C 8B DC 53 56 57 41 54 41 55 41 56 41 57 48 81 EC B0 0A"),
+        bytes.fromhex("FF 15 C5 AB E9 00 48 8B D8 48 8D 8C 24 20 07 00 00 E8 1D 88 FF FF"),
     ),
 }
 _VERIFIED_VOICE_STOP_BUILDS = {
@@ -113,6 +127,14 @@ _VERIFIED_VOICE_STOP_BUILDS = {
         "8fa4b16de76d88d179d8e1133eaa18652a665c51abe086060ce0b88dff0ea67b",
         # 1.0.0.23: same first-800-ms guard as 0.9.3.20, so the native stop
         # button still needs wParam=1.  VERIFY ON DEVICE before relying on it.
+        1,
+    ),
+    "80a93177dfd92672307382d789a834fd5cd8471d1d861957ceaf8cc1aca5d7a2": (
+        "68a7642e6d590fc7dc1488d446fde3fdd1cc2ceb978951f76a48c24d48f82b06",
+        "6ba1c0537d31ae10b506f7fdc01e00d2e6d3a83dcaebad9c3751142654ea253e",
+        # 1.1.1.12 keeps the forward-only callback and the same first-800-ms
+        # guard, so the native stop button still needs wParam=1.
+        # VERIFY ON DEVICE before relying on it.
         1,
     ),
 }
