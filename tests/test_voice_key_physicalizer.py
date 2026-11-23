@@ -745,6 +745,88 @@ class PhysicalModifierTrackingTests(unittest.TestCase):
         )
         query.assert_not_called()
 
+    @staticmethod
+    def _age_startup_residue(vk_code):
+        """Age a seeded down bit and the tracker install time together."""
+        with physicalizer._PHYSICAL_KEY_STATE_LOCK:
+            physicalizer._PHYSICAL_TRACKER_STARTED_AT -= 5.0
+            if vk_code in physicalizer._PHYSICAL_KEY_LAST_EDGE_AT:
+                physicalizer._PHYSICAL_KEY_LAST_EDGE_AT[vk_code] -= 5.0
+
+    def test_cold_start_modifier_residue_is_cleared_for_opted_in_shortcut(self):
+        lctrl = physicalizer.VK_LCONTROL
+        physicalizer.reset_self_injected_keys_for_tests()
+        # Tracker installation seeds the modifier from GetAsyncKeyState, but no
+        # real keyboard edge ever reaches the hook: this is the exact cold-start
+        # state that used to make the voice shortcut preflight drop the combo.
+        physicalizer._set_physical_tracker_active(
+            True, _query=lambda vk: vk == lctrl
+        )
+        self._age_startup_residue(lctrl)
+        trace = mock.Mock()
+        physicalizer.set_diagnostic_trace(trace)
+
+        self.assertFalse(
+            physicalizer.physical_key_is_down_before_injection(
+                lctrl,
+                _query=lambda _vk: True,
+                reconciled_vks=frozenset({lctrl}),
+            )
+        )
+        self.assertFalse(physicalizer.physical_key_is_down(lctrl))
+        trace.emit.assert_called_once()
+        self.assertEqual(
+            trace.emit.call_args.args, ("input_physical_state_reconciled",)
+        )
+
+    def test_genuine_physical_hold_blocks_even_after_residue_grace(self):
+        lctrl = physicalizer.VK_LCONTROL
+        physicalizer._set_physical_tracker_active(
+            True, _query=lambda _vk: False
+        )
+        physicalizer.record_physical_key_event(
+            self._event(lctrl), physicalizer.WM_KEYDOWN
+        )
+        self._age_startup_residue(lctrl)
+
+        self.assertTrue(
+            physicalizer.physical_key_is_down_before_injection(
+                lctrl,
+                _query=lambda _vk: True,
+                reconciled_vks=frozenset({lctrl}),
+            )
+        )
+        self.assertTrue(physicalizer.physical_key_is_down(lctrl))
+
+    def test_non_opted_in_modifier_keeps_fail_closed_rule_on_residue(self):
+        lctrl = physicalizer.VK_LCONTROL
+        physicalizer._set_physical_tracker_active(
+            True, _query=lambda vk: vk == lctrl
+        )
+        self._age_startup_residue(lctrl)
+
+        self.assertTrue(
+            physicalizer.physical_key_is_down_before_injection(
+                lctrl, _query=lambda _vk: True
+            )
+        )
+
+    def test_freshly_installed_tracker_never_exempts_a_down_bit(self):
+        lctrl = physicalizer.VK_LCONTROL
+        physicalizer._set_physical_tracker_active(
+            True, _query=lambda vk: vk == lctrl
+        )
+        with physicalizer._PHYSICAL_KEY_STATE_LOCK:
+            physicalizer._PHYSICAL_KEY_LAST_EDGE_AT[lctrl] -= 5.0
+
+        self.assertTrue(
+            physicalizer.physical_key_is_down_before_injection(
+                lctrl,
+                _query=lambda _vk: True,
+                reconciled_vks=frozenset({lctrl}),
+            )
+        )
+
 
 class VoiceKeyPhysicalizerLifecycleTests(unittest.TestCase):
     def test_test_worker_starts_and_stops_cleanly(self):

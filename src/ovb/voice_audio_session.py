@@ -59,6 +59,19 @@ class VoiceAudioSession:
                 raise audio_output.AudioOutputUnavailableError(
                     "audio playback writer could not start"
                 )
+            # Report the host API the sink ACTUALLY opened, not the persisted
+            # one: a saved cable+DirectSound pair is degraded to a reliable
+            # view in resolve_selected_endpoint (issue #5), and logging the
+            # saved value would hide a silent playback path.
+            resolved_host_api = getattr(sink, "resolved_host_api", "") or endpoint_host_api
+            degraded = bool(endpoint_host_api) and resolved_host_api != endpoint_host_api
+            if degraded:
+                self.logger.info(
+                    "voice playback host API degraded from %s to %s "
+                    "(saved combination cannot carry audio)",
+                    endpoint_host_api,
+                    resolved_host_api,
+                )
             timing_snapshot = getattr(sink, "timing_snapshot", None)
             timing = timing_snapshot() if callable(timing_snapshot) else None
             if timing is None:
@@ -66,7 +79,7 @@ class VoiceAudioSession:
                     "voice playback opened: endpoint=%s host_api=%s "
                     "sample_rate=%s channels=%s",
                     endpoint_name or "unspecified",
-                    endpoint_host_api or "unspecified",
+                    resolved_host_api or "unspecified",
                     sink.output_sample_rate_hz,
                     sink.output_channels,
                 )
@@ -75,7 +88,7 @@ class VoiceAudioSession:
                     "voice playback opened: endpoint=%s host_api=%s "
                     "sample_rate=%s channels=%s open_ms=%.2f",
                     endpoint_name or "unspecified",
-                    endpoint_host_api or "unspecified",
+                    resolved_host_api or "unspecified",
                     sink.output_sample_rate_hz,
                     sink.output_channels,
                     timing.open_elapsed_ms,

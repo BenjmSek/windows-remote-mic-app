@@ -5357,7 +5357,10 @@ class SettingsControllerTests(unittest.TestCase):
             "the display-only recommendation must never pollute saved endpoint text",
         )
 
-    def test_endpoint_recommendation_falls_back_to_unique_directsound_cable_input(self):
+    def test_endpoint_recommendation_rejects_unreliable_directsound_only_cable_input(self):
+        # Issue #5: DirectSound on a VB-CABLE renders silence. With no reliable
+        # WASAPI/MME view there is nothing safe to recommend - fail closed
+        # instead of steering the user into a silent voice path.
         endpoints = [
             audio_output.AudioEndpoint(
                 name="Speakers",
@@ -5374,11 +5377,7 @@ class SettingsControllerTests(unittest.TestCase):
         ):
             controller, _ = self._make_controller()
 
-        self.assertGreaterEqual(controller.recommendedEndpointIndex, 0)
-        self.assertEqual(
-            controller.endpointOptions[controller.recommendedEndpointIndex],
-            settings_ui._endpoint_display(endpoints[1]),
-        )
+        self.assertEqual(controller.recommendedEndpointIndex, -1)
 
     def test_endpoint_recommendation_fails_closed_for_unsupported_or_ambiguous_matches(self):
         cases = (

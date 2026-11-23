@@ -72,7 +72,9 @@ class HostApiDisambiguationTests(unittest.TestCase):
         )
         self.assertEqual(endpoint.host_api, "Windows WASAPI")
 
-    def test_directsound_is_used_when_wasapi_is_absent(self):
+    def test_cable_input_never_selects_directsound_when_wasapi_is_absent(self):
+        # Issue #5: DirectSound accepts a VB-CABLE stream but renders silence.
+        # With no WASAPI view, MME must win over DirectSound for a cable.
         endpoints = [
             audio_output.AudioEndpoint(name="CABLE Input", host_api="MME"),
             audio_output.AudioEndpoint(
@@ -80,7 +82,61 @@ class HostApiDisambiguationTests(unittest.TestCase):
             ),
         ]
         endpoint = audio_output.resolve_selected_endpoint(endpoints, "CABLE Input")
+        self.assertEqual(endpoint.host_api, "MME")
+
+    def test_realtime_device_still_uses_directsound_when_wasapi_is_absent(self):
+        # The exclusion is cable-specific: real hardware keeps DirectSound as
+        # a legitimate fallback.
+        endpoints = [
+            audio_output.AudioEndpoint(name="Speakers", host_api="MME"),
+            audio_output.AudioEndpoint(
+                name="Speakers", host_api="Windows DirectSound"
+            ),
+        ]
+        endpoint = audio_output.resolve_selected_endpoint(endpoints, "Speakers")
         self.assertEqual(endpoint.host_api, "Windows DirectSound")
+
+    def test_saved_cable_directsound_degrades_to_wasapi(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input", host_api="Windows DirectSound"
+            ),
+            audio_output.AudioEndpoint(name="CABLE Input", host_api="Windows WASAPI"),
+        ]
+        endpoint = audio_output.resolve_selected_endpoint(
+            endpoints, "CABLE Input", "Windows DirectSound"
+        )
+        self.assertEqual(endpoint.host_api, "Windows WASAPI")
+
+    def test_saved_cable_directsound_without_reliable_view_fails_closed(self):
+        endpoints = [
+            audio_output.AudioEndpoint(
+                name="CABLE Input", host_api="Windows DirectSound"
+            )
+        ]
+        with self.assertRaises(audio_output.AudioOutputUnavailableError):
+            audio_output.resolve_selected_endpoint(
+                endpoints, "CABLE Input", "Windows DirectSound"
+            )
+
+    def test_is_reliable_output_endpoint_rules(self):
+        self.assertFalse(audio_output.is_reliable_output_endpoint(
+            audio_output.AudioEndpoint("CABLE Input", "Windows DirectSound")
+        ))
+        self.assertFalse(audio_output.is_reliable_output_endpoint(
+            audio_output.AudioEndpoint("CABLE Input (VB-Audio Virtual Cable)",
+                                       "Windows DirectSound")
+        ))
+        self.assertTrue(audio_output.is_reliable_output_endpoint(
+            audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")
+        ))
+        self.assertTrue(audio_output.is_reliable_output_endpoint(
+            audio_output.AudioEndpoint("CABLE Input", "MME")
+        ))
+        # DirectSound on a real device remains reliable.
+        self.assertTrue(audio_output.is_reliable_output_endpoint(
+            audio_output.AudioEndpoint("Speakers (Realtek)", "Windows DirectSound")
+        ))
 
     def test_wdm_ks_is_rejected_even_when_explicitly_saved(self):
         endpoints = [

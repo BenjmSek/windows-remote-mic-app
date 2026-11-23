@@ -62,6 +62,13 @@ VOICE_EVENT_MARKER_SEQUENCE_MASK = _VOICE_EVENT_MARKER_SEQUENCE_MASK
 _TRACKING_LOST_CALLBACK_TIMEOUT_SECONDS = 3.0
 _TRACKING_LOST_PUMP_INTERVAL_SECONDS = 0.005
 _RALT_STALE_OWNER_GRACE_SECONDS = 0.250
+# A Windows modifier down bit left by a previous session (or by an IME
+# profile switch) is trusted as stale only after the hook has watched real
+# edges for this long. It covers the brief installation window in which a
+# genuine keydown may still be travelling to the low-level callback. Beyond
+# it, an empty _PHYSICAL_KEYS_TOUCHED is authoritative: a real hold always
+# reaches the hook and marks the key touched for the rest of the generation.
+_STARTUP_STALE_MODIFIER_GRACE_SECONDS = 2.0
 # Modifiers that may additionally clear a stale cached hold while a voice
 # shortcut is being delivered. Reconciliation stays opt-in: callers pass the
 # keys of the shortcut actually being sent, so an unrelated modifier never
@@ -121,6 +128,10 @@ _PHYSICAL_TRACKER_MARKER_MATCHES = 0
 _PHYSICAL_TRACKER_MARKER_MISMATCHES: dict[str, int] = {}
 _PHYSICAL_TRACKER_LAST_CALLBACK_AT = 0.0
 _PHYSICAL_TRACKER_LAST_MARKER_AT = 0.0
+# monotonic() when the current hook tracker generation was installed. Used to
+# tell a stale Windows modifier down bit left by a previous session from a
+# genuine hold that simply has not reached the hook callback yet.
+_PHYSICAL_TRACKER_STARTED_AT: float = 0.0
 _GENERIC_KEY_VARIANTS = {
     VK_SHIFT: (VK_LSHIFT, VK_RSHIFT),
     VK_CONTROL: (VK_LCONTROL, VK_RCONTROL),
@@ -808,6 +819,36 @@ def physical_key_is_down(
     return False
 
 
+def cold_start_residue_may_be_cleared(vk_code: int) -> bool:
+    """Whether a Windows modifier down bit can be trusted as stale residue.
+
+    The low-level hook is the authoritative witness of a real keyboard: a
+    genuinely held modifier always produces a ``WM_*KEYDOWN`` callback and is
+    recorded in ``_PHYSICAL_KEYS_TOUCHED`` for the rest of the tracker
+    generation. A down bit with no such edge - after the hook has had time to
+    settle - is left over from a previous session or an IME profile switch,
+    not a finger on the key.
+
+    Shared by the preflight query and the Raw Input cleanup in win32_input so
+    both layers apply exactly the same rule. Read-only; callers are still
+    responsible for the epoch/revision-guarded mutation of their own state.
+    """
+
+    normalized = int(vk_code)
+    variants = _GENERIC_KEY_VARIANTS.get(normalized, (normalized,))
+    with _PHYSICAL_KEY_STATE_LOCK:
+        if not _PHYSICAL_TRACKER_ACTIVE or _PHYSICAL_TRACKER_DRAINING:
+            return False
+        if (
+            time.monotonic() - _PHYSICAL_TRACKER_STARTED_AT
+            <= _STARTUP_STALE_MODIFIER_GRACE_SECONDS
+        ):
+            return False
+        return not any(
+            variant in _PHYSICAL_KEYS_TOUCHED for variant in variants
+        )
+
+
 def physical_key_is_down_before_injection(
     vk_code: int,
     *,
@@ -867,7 +908,23 @@ def physical_key_is_down_before_injection(
                 return True
     query = _query or _real_async_key_is_down
     if any(bool(query(variant)) for variant in variants):
-        return True
+        # A cold start (or an IME profile switch) can leave Windows reporting a
+        # modifier down while this tracker generation has never observed a real
+        # keyboard edge for it. The low-level hook is authoritative here: a
+        # genuinely held key always reaches the callback and marks the key
+        # touched. Only an opted-in shortcut key may bypass the residue, and
+        # only after the hook has had time to settle.
+        #
+        # Original rule, kept as the default for every other case:
+        #     return True   # GetAsyncKeyState says the key is physically down
+        opted_in = normalized in (reconciled_vks or frozenset())
+        residue = bool(
+            active
+            and opted_in
+            and cold_start_residue_may_be_cleared(normalized)
+        )
+        if not residue:
+            return True
     if not active:
         return False
 
@@ -1007,6 +1064,7 @@ def _set_physical_tracker_active(
     global _PHYSICAL_TRACKER_CALLBACK_ENTRIES
     global _PHYSICAL_TRACKER_MARKER_CALLBACKS, _PHYSICAL_TRACKER_MARKER_MATCHES
     global _PHYSICAL_TRACKER_LAST_CALLBACK_AT, _PHYSICAL_TRACKER_LAST_MARKER_AT
+    global _PHYSICAL_TRACKER_STARTED_AT
 
     with _PHYSICAL_KEY_STATE_LOCK:
         previous_generation = _PHYSICAL_TRACKER_GENERATION
@@ -1036,6 +1094,7 @@ def _set_physical_tracker_active(
         _PHYSICAL_TRACKER_MARKER_MISMATCHES.clear()
         _PHYSICAL_TRACKER_LAST_CALLBACK_AT = 0.0
         _PHYSICAL_TRACKER_LAST_MARKER_AT = 0.0
+        _PHYSICAL_TRACKER_STARTED_AT = time.monotonic() if active else 0.0
     if not active:
         _cancel_voice_confirmations(previous_generation)
         return generation

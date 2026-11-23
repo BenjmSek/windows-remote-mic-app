@@ -86,6 +86,7 @@ class EndpointPlaybackSink:
     def __init__(self, endpoint_name: str, host_api: str = "") -> None:
         self._endpoint_name = endpoint_name
         self._host_api = host_api
+        self._resolved_host_api = host_api
         self._stream = None
         self._ready = False
         self._output_sample_rate_hz = SOURCE_SAMPLE_RATE_HZ
@@ -101,7 +102,7 @@ class EndpointPlaybackSink:
         self._write_count = 0
         self._underflow_count = 0
 
-    def open(self) -> None:
+    def open(self, *, sd_module=None) -> None:
         if self._stream is not None:
             raise PlaybackUnavailableError(
                 "playback sink still owns a stream; close it before reopening"
@@ -113,12 +114,15 @@ class EndpointPlaybackSink:
             self._max_write_elapsed_ms = 0.0
             self._write_count = 0
             self._underflow_count = 0
-        try:
-            import sounddevice as sd  # type: ignore
-        except ImportError as exc:  # pragma: no cover - exercised only on Windows
-            raise PlaybackUnavailableError(
-                "the 'sounddevice' package is not installed"
-            ) from exc
+        if sd_module is None:
+            try:
+                import sounddevice as sd  # type: ignore
+            except ImportError as exc:  # pragma: no cover - exercised only on Windows
+                raise PlaybackUnavailableError(
+                    "the 'sounddevice' package is not installed"
+                ) from exc
+        else:
+            sd = sd_module
 
         device_index = self._resolve_device_index(sd)
         self._output_channels = self._select_output_channels(sd, device_index)
@@ -163,6 +167,12 @@ class EndpointPlaybackSink:
     @property
     def endpoint_name(self) -> str:
         return self._endpoint_name
+
+    @property
+    def resolved_host_api(self) -> str:
+        """Host API actually used after unsafe persisted values are degraded."""
+
+        return self._resolved_host_api
 
     @property
     def ready(self) -> bool:
@@ -246,6 +256,10 @@ class EndpointPlaybackSink:
             self._endpoint_name,
             self._host_api,
         )
+        # Retain the host API actually chosen (which may have been degraded
+        # away from a saved-but-unsafe one, e.g. issue #5's cable+DirectSound)
+        # so diagnostics report the truth instead of the persisted value.
+        self._resolved_host_api = resolved.host_api
         matching_indices = [
             index for index, host_api_name in candidates if host_api_name == resolved.host_api
         ]
@@ -309,6 +323,29 @@ class EndpointPlaybackSink:
                 self._write_count += 1
                 if underflowed:
                     self._underflow_count += 1
+
+    def write_native_frames(self, frames) -> bool:
+        """Write int16 frames already at this sink's output rate/channels.
+
+        Bypasses the 16 kHz source resampler so the route verifier can play a
+        sweep built at exactly the format the real voice path opened. The
+        production voice path still uses ``write()``; this method is only for
+        the preflight-owned disposable sink (issue #5).
+        """
+        import numpy as np  # type: ignore
+
+        if self._stream is None:
+            raise PlaybackUnavailableError("open() must be called before write_native_frames()")
+        array = np.asarray(frames, dtype="int16")
+        if array.ndim == 1:
+            array = array.reshape(-1, 1)
+        if array.shape[1] == 1 and self._output_channels > 1:
+            array = np.repeat(array, self._output_channels, axis=1)
+        if array.shape[1] != self._output_channels:
+            raise PlaybackUnavailableError(
+                "native frame channel count does not match the opened sink"
+            )
+        return bool(self._stream.write(array))
 
     def close(self) -> None:
         if self._stream is not None:
@@ -707,6 +744,216 @@ def probe_virtual_cable_loopback(
             _analyze_loopback_capture(
                 np, captured, probe_signal, lead_samples, sample_rate_hz
             )
+        )
+        detected = (
+            correlation >= LOOPBACK_PROBE_CORRELATION_THRESHOLD
+            and signal_rms
+            >= max(
+                LOOPBACK_PROBE_MIN_SIGNAL_RMS,
+                baseline_rms * LOOPBACK_PROBE_BASELINE_MULTIPLIER,
+            )
+            and not input_overflowed
+            and not output_underflowed
+        )
+        return CableLoopbackProbeResult(
+            detected=detected,
+            correlation=correlation,
+            baseline_rms=baseline_rms,
+            signal_rms=signal_rms,
+            roundtrip_latency_ms=latency_ms if detected else None,
+            input_overflowed=input_overflowed,
+            output_underflowed=output_underflowed,
+            sample_rate_hz=sample_rate_hz,
+        )
+
+
+class CableRouteVerificationError(audio_output.AudioOutputUnavailableError):
+    """The real voice sink's format carried no signal on the recording side."""
+
+
+def verify_cable_route_with_voice_sink(
+    output_endpoint: audio_output.AudioEndpoint,
+    input_endpoint: Optional[audio_output.AudioEndpoint] = None,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+    sd_module=None,
+) -> CableLoopbackProbeResult:
+    """Prove the format the REAL voice sink picks can reach CABLE Output.
+
+    Unlike ``probe_virtual_cable_loopback`` - which opens its own duplex
+    stream with its own format candidates - this drives an actual
+    ``EndpointPlaybackSink`` (the same class the voice session uses) and
+    writes a known sweep at that sink's chosen rate/channels. The recording
+    side is a plain blocking InputStream on the paired CABLE Output view
+    under the same host API. This closes the issue #5 gap where the loopback
+    diagnostic passed on its own format while the voice path was silent.
+
+    Intended for the settings-save preflight child (no recognizer holding
+    CABLE Output). Never call from the live voice-open path, which would
+    contend with the recognizer for the recording endpoint.
+    """
+
+    global _retained_preflight_sink, _retained_loopback_stream
+    with _portaudio_test_lock:
+        cleanup_retained_portaudio_test_resources(blocking=True)
+        if cancel_event is not None and cancel_event.is_set():
+            raise LoopbackProbeCancelledError("VB-CABLE 通道测试已取消")
+        if not audio_output.is_cable_input_endpoint(output_endpoint.name):
+            raise CableRouteVerificationError("播放端点不是 CABLE Input，无法做线缆实证")
+
+        if sd_module is None:
+            try:
+                import sounddevice as sd  # type: ignore
+            except ImportError as exc:  # pragma: no cover - Windows packaging path
+                raise CableRouteVerificationError("缺少 sounddevice，无法验证线缆") from exc
+        else:
+            sd = sd_module
+        try:
+            import numpy as np  # type: ignore
+        except ImportError as exc:  # pragma: no cover - frozen build includes NumPy
+            raise CableRouteVerificationError("缺少 NumPy，无法验证线缆") from exc
+
+        # The recording side must be the CABLE Output under the same host API
+        # the voice sink actually resolved to (it may have been degraded from
+        # a saved DirectSound value). Callers that already resolved a unique
+        # paired input endpoint can pass it directly.
+        sink = EndpointPlaybackSink(output_endpoint.name, output_endpoint.host_api)
+        try:
+            sink.open(sd_module=sd)
+        except audio_output.AudioOutputUnavailableError as exc:
+            raise CableRouteVerificationError("真实播放端无法打开，无法验证线缆") from exc
+        resolved_host_api = sink.resolved_host_api
+        sample_rate_hz = sink.output_sample_rate_hz
+        output_channels = sink.output_channels
+
+        if input_endpoint is not None:
+            recording_endpoint = input_endpoint
+        else:
+            recording_match = [
+                endpoint
+                for endpoint in audio_output.enumerate_input_endpoints()
+                if audio_output.is_cable_output_endpoint(endpoint.name)
+                and endpoint.host_api == resolved_host_api
+            ]
+            if len(recording_match) != 1:
+                sink.close()
+                raise CableRouteVerificationError(
+                    "无法在相同音频接口下唯一确定 CABLE Output 录音端"
+                )
+            recording_endpoint = recording_match[0]
+        if recording_endpoint.host_api != resolved_host_api:
+            sink.close()
+            raise CableRouteVerificationError("录音端与播放端音频接口不一致")
+        try:
+            input_index = _resolve_loopback_device_index(
+                sd, recording_endpoint, "max_input_channels"
+            )
+        except LoopbackProbeUnavailableError as exc:
+            sink.close()
+            raise CableRouteVerificationError("无法解析 CABLE Output 录音端") from exc
+
+        output_signal, probe_signal, lead_samples = _build_loopback_probe(
+            np, sample_rate_hz
+        )
+        captured = np.zeros(len(output_signal), dtype="int16")
+        cursor = 0
+        finished = threading.Event()
+        callback_errors = []
+        input_overflowed = False
+
+        def _callback(indata, _outdata, frames, _time_info, status) -> None:
+            nonlocal cursor, input_overflowed
+            try:
+                input_overflowed = input_overflowed or bool(
+                    getattr(status, "input_overflow", False)
+                )
+                take = min(frames, max(0, len(output_signal) - cursor))
+                if take > 0:
+                    captured[cursor : cursor + take] = indata[:take, 0]
+                    cursor += take
+                if cursor >= len(output_signal):
+                    finished.set()
+                    raise sd.CallbackStop
+            except Exception as exc:
+                if isinstance(exc, getattr(sd, "CallbackStop", type(None))):
+                    raise
+                callback_errors.append(exc)
+                finished.set()
+                raise sd.CallbackAbort
+
+        input_stream = None
+        input_started = False
+        output_underflowed = False
+        operation_error = None
+        timed_out = False
+        try:
+            try:
+                input_stream = sd.InputStream(
+                    device=input_index,
+                    channels=1,
+                    dtype="int16",
+                    samplerate=sample_rate_hz,
+                    latency="low",
+                    callback=_callback,
+                    finished_callback=finished.set,
+                )
+                input_stream.start()
+                input_started = True
+                # Drive the REAL sink (its own rate/channels) with the same
+                # sweep the analyser correlates against.
+                output_underflowed = bool(sink.write_native_frames(output_signal))
+            except Exception as exc:  # noqa: BLE001 - sanitize at verification boundary
+                operation_error = exc
+
+            if operation_error is None:
+                deadline = time.perf_counter() + LOOPBACK_PROBE_TIMEOUT_SECONDS
+                while not finished.wait(0.02):
+                    if cancel_event is not None and cancel_event.is_set():
+                        timed_out = True
+                        raise LoopbackProbeCancelledError("VB-CABLE 通道测试已取消")
+                    if time.perf_counter() >= deadline:
+                        timed_out = True
+                        raise CableRouteVerificationError("线缆实证超时，未得到完整结果")
+                if callback_errors:
+                    raise CableRouteVerificationError("线缆实证录音回调失败") from callback_errors[0]
+        except (LoopbackProbeCancelledError, CableRouteVerificationError) as exc:
+            operation_error = exc
+        except Exception as exc:  # noqa: BLE001 - never expose device details
+            operation_error = exc
+        finally:
+            cleanup_errors = []
+            if input_stream is not None:
+                try:
+                    if input_started:
+                        if timed_out:
+                            input_stream.abort()
+                        else:
+                            input_stream.stop()
+                except Exception as exc:  # noqa: BLE001 - close still must run
+                    cleanup_errors.append(exc)
+                try:
+                    input_stream.close()
+                except Exception as exc:  # noqa: BLE001 - retain for retry
+                    cleanup_errors.append(exc)
+                    _retained_loopback_stream = input_stream
+            try:
+                sink.close()
+            except Exception as exc:  # noqa: BLE001 - retain owner for retry
+                cleanup_errors.append(exc)
+                if sink.owns_stream:
+                    _retained_preflight_sink = sink
+            if cleanup_errors and operation_error is None:
+                raise CableRouteVerificationError(
+                    "线缆实证结束时未能完整释放临时音频流"
+                ) from cleanup_errors[0]
+
+        if isinstance(operation_error, LoopbackProbeCancelledError):
+            raise operation_error
+        if operation_error is not None:
+            raise CableRouteVerificationError("线缆实证无法完成") from operation_error
+
+        correlation, baseline_rms, signal_rms, latency_ms = _analyze_loopback_capture(
+            np, captured, probe_signal, lead_samples, sample_rate_hz
         )
         detected = (
             correlation >= LOOPBACK_PROBE_CORRELATION_THRESHOLD

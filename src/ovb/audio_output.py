@@ -34,6 +34,13 @@ PREFERRED_OUTPUT_HOST_APIS = (
     "Windows DirectSound",
     "MME",
 )
+# Windows DirectSound accepts a VB-CABLE "CABLE Input" stream and reports
+# success - open() and write() succeed with zero underflows - but the driver
+# renders digital silence (verified locally: rms=0 at both 44100 and 48000,
+# while MME/WASAPI carry the same tone). It is unsafe for virtual-cable
+# endpoints specifically, NOT for real devices, where DirectSound stays a
+# legitimate fallback. See GitHub issue #5.
+CABLE_UNRELIABLE_OUTPUT_HOST_APIS = frozenset({"Windows DirectSound"})
 
 
 def is_supported_output_host_api(host_api: str) -> bool:
@@ -46,6 +53,26 @@ def is_supported_output_host_api(host_api: str) -> bool:
     """
 
     return host_api not in UNSUPPORTED_BLOCKING_OUTPUT_HOST_APIS
+
+
+def is_reliable_output_endpoint(endpoint: AudioEndpoint) -> bool:
+    """Whether this endpoint's host API can really carry PCM to the device.
+
+    Adds one narrow, evidence-based rule on top of
+    ``is_supported_output_host_api``: DirectSound on a VB-CABLE virtual cable
+    opens and writes successfully but renders silence, so it is never a
+    reliable playback endpoint. Real hardware under DirectSound stays valid;
+    only CABLE Input is affected (issue #5).
+    """
+
+    if not is_supported_output_host_api(endpoint.host_api):
+        return False
+    if (
+        is_cable_input_endpoint(endpoint.name)
+        and endpoint.host_api in CABLE_UNRELIABLE_OUTPUT_HOST_APIS
+    ):
+        return False
+    return True
 
 
 def ensure_supported_output_endpoint(endpoint: AudioEndpoint) -> AudioEndpoint:
@@ -79,11 +106,12 @@ def select_preferred_output_endpoint(
     usable = [
         endpoint
         for endpoint in endpoints
-        if is_supported_output_host_api(endpoint.host_api)
+        if is_reliable_output_endpoint(endpoint)
     ]
     if not usable:
         raise AudioOutputUnavailableError(
-            "no output endpoint uses a supported blocking playback host API"
+            "no output endpoint uses a reliable blocking playback host API "
+            "(DirectSound on a virtual cable renders silence)"
         )
     best_rank = min(output_host_api_rank(endpoint.host_api) for endpoint in usable)
     preferred = [
@@ -131,6 +159,25 @@ def resolve_selected_endpoint(
         )
 
     if selected_host_api:
+        # A persisted CABLE Input + DirectSound pair is the known silent
+        # combination from issue #5: the driver accepts the stream but renders
+        # nothing. Never honour it verbatim - re-rank the same-name views and
+        # pick the best reliable one (WASAPI/MME). If the cable has no reliable
+        # view at all, fail closed instead of running a silent voice path.
+        saved_pair = AudioEndpoint(name=selected_name, host_api=selected_host_api)
+        if not is_reliable_output_endpoint(saved_pair):
+            reliable_matches = [
+                endpoint for endpoint in name_matches
+                if is_reliable_output_endpoint(endpoint)
+            ]
+            if not reliable_matches:
+                raise AudioOutputUnavailableError(
+                    "saved output uses Windows DirectSound on a virtual cable, "
+                    "which renders silence, and no reliable host API is "
+                    "available; select the CABLE Input endpoint again"
+                )
+            return select_preferred_output_endpoint(reliable_matches)
+
         host_api_matches = [
             endpoint for endpoint in name_matches if endpoint.host_api == selected_host_api
         ]

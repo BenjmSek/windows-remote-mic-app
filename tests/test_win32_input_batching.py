@@ -2198,6 +2198,117 @@ class RightAltReleasePostconditionTests(unittest.TestCase):
                 win32_input._real_voice_event(self.ralt, True)
 
 
+class ColdStartModifierResidueTests(unittest.TestCase):
+    """A stale Windows modifier down bit must not drop the first voice combo.
+
+    Live 2026-11-07 trace: after a reboot, pressing the remote's voice key
+    produced ``input_preflight_rejected`` with held_vks [162,164] and
+    raw_down=true / hook_down=false / windows_down=true /
+    ambiguous_owners=false. The low-level hook tracker had never seen a real
+    keyboard edge for Ctrl/Alt in that generation - only Windows' leftover
+    async down bit. Pressing the power key (a real edge) flushed it.
+    """
+
+    def setUp(self):
+        self.raw = win32_input.raw_input_windows
+        self.hook = win32_input.voice_key_physicalizer_windows
+        self.lctrl = win32_input.win32_keys.VK_CODES["lctrl"]
+        self.lalt = win32_input.win32_keys.VK_CODES["lalt"]
+        self.windows_down = True
+        self.sent = []
+        self.raw._set_physical_keyboard_tracker_active(True)
+        # The hook was installed while Windows still reported both modifiers
+        # up, so nothing was seeded into _PHYSICAL_KEYS_DOWN / _TOUCHED.
+        self.hook._set_physical_tracker_active(True, _query=lambda _vk: False)
+        self.addCleanup(self.raw._set_physical_keyboard_tracker_active, False)
+        self.addCleanup(self.hook._set_physical_tracker_active, False)
+        self.addCleanup(self.hook.reset_self_injected_keys_for_tests)
+        for module in (self.raw, self.hook):
+            patcher = mock.patch.object(
+                module,
+                "_real_async_key_is_down",
+                side_effect=lambda vk: self.windows_down
+                and vk in (self.lctrl, self.lalt),
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for target, kwargs in (
+            (
+                (win32_input, "_real_voice_event"),
+                {"side_effect": self._send},
+            ),
+            (
+                (win32_input, "_real_async_key_state_observation"),
+                {"side_effect": lambda vk, **_kw: self.windows_down},
+            ),
+            (
+                (win32_input, "_real_key_state_query_context"),
+                {"return_value": ("Default", 10, 20, 8192, 8192)},
+            ),
+        ):
+            patcher = mock.patch.object(target[0], target[1], **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _seed_residue(self):
+        # Device-scoped Raw holds with no matching UP, aged past every grace.
+        self.raw.record_physical_keyboard_event(
+            101, vkey=0x11, make_code=0, flags=0, message=0x100
+        )
+        self.raw.record_physical_keyboard_event(
+            101, vkey=0x12, make_code=0, flags=0, message=0x100
+        )
+        with self.raw._PHYSICAL_KEY_STATE_LOCK:
+            for vk in (self.lctrl, self.lalt):
+                self.raw._PHYSICAL_KEY_LAST_EDGE_AT[vk] -= 10.0
+        with self.hook._PHYSICAL_KEY_STATE_LOCK:
+            self.hook._PHYSICAL_TRACKER_STARTED_AT -= 5.0
+
+    def _send(self, vk, key_up):
+        # Mirror _real_voice_event: it records its own modifier holds before
+        # the native call so a tracker restart mid-hold cannot seed them as
+        # physical owners. Without this the owed key-up reconcile cannot tell
+        # our own hold from a foreign one.
+        self.hook.note_self_injected_key_edge(int(vk), bool(key_up))
+        self.sent.append((vk, key_up))
+        if key_up:
+            self.windows_down = False
+
+    def test_cold_start_residue_delivers_both_down_and_owed_up(self):
+        self._seed_residue()
+
+        win32_input.send_voice_key_combo_down(("lctrl", "lalt"))
+        win32_input.send_voice_key_combo_up(("lctrl", "lalt"))
+
+        self.assertEqual(
+            self.sent,
+            [
+                (self.lctrl, False),
+                (self.lalt, False),
+                (self.lalt, True),
+                (self.lctrl, True),
+            ],
+        )
+
+    def test_real_physical_hold_still_drops_the_combo(self):
+        # A genuine edge reaches the hook and marks the key touched, so the
+        # residue exemption must not apply to a really held modifier.
+        event = self.hook.KBDLLHOOKSTRUCT(
+            vkCode=self.hook.VK_LCONTROL,
+            scanCode=0,
+            flags=0,
+            time=0,
+            dwExtraInfo=0,
+        )
+        self.hook.record_physical_key_event(event, self.hook.WM_KEYDOWN)
+        self._seed_residue()
+
+        with self.assertRaises(win32_input.PhysicalKeyInUseError):
+            win32_input.send_voice_key_combo_down(("lctrl", "lalt"))
+
+        self.assertEqual(self.sent, [])
+
+
 class VolumeTests(unittest.TestCase):
     def test_volume_up_taps_the_volume_up_key(self):
         sender = RecordingSender()

@@ -1114,8 +1114,11 @@ def check_vb_cable_loopback(
     list_recording: Callable[
         [], Sequence[audio_output.AudioEndpoint]
     ] = audio_output.enumerate_input_endpoints,
+    # Issue #5: validate the format the REAL voice sink opens, not a separate
+    # duplex stream's own format candidates. The old probe stays available as
+    # an injectable alternative for callers/tests that need it.
     probe: Callable[..., audio_playback.CableLoopbackProbeResult] = (
-        audio_playback.probe_virtual_cable_loopback
+        audio_playback.verify_cable_route_with_voice_sink
     ),
     cancel_event: Optional[threading.Event] = None,
 ) -> CheckResult:

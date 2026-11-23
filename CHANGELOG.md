@@ -4,6 +4,31 @@
 （GPL-3.0-only）的衍生版本，剥离小米 RC003 支持，仅保留 Google Chromecast 链路。
 版本号自 0.2.0 起独立编排，与上游版本号不可比。
 
+## 0.2.5 — 修复 GitHub issue #5（虚拟线缆 DirectSound 静音）
+
+版本号 `0.2.4` → `0.2.5`（`src/ovb/VERSION`，单一来源，面板标题自动跟随）。三层修复：
+
+1. **根治（选路层）**：`audio_output.py` 新增 `is_reliable_output_endpoint()`，
+   把"VB-CABLE + Windows DirectSound"判为不可靠（该组合 `open()`/`write()` 都
+   成功、零 underflow，但驱动输出数字静音，本机与报告人机器均实测 rms=0）。
+   `resolve_selected_endpoint()` / `select_preferred_output_endpoint()` /
+   设置页端点推荐一律排除该组合：保存的 `CABLE Input + DirectSound` 自动降级
+   到同名可靠视图（WASAPI 优先，无 WASAPI 则 MME），无任何可靠视图则 fail
+   closed 并提示重新选择。真实声卡在 DirectSound 下仍可用，不受影响。
+2. **防回归（诊断实证）**：`audio_playback.py` 新增
+   `verify_cable_route_with_voice_sink()`，用**真实 `EndpointPlaybackSink` 的格式
+   与 stream** 写入已知 chirp、在同 host API 的 CABLE Output 录回做相关分析；
+   `check_vb_cable_loopback()` 默认改用它，因此"VB-CABLE 本地通道"测试不再
+   出现"自检用自己的格式通过、真实语音路径却静音"的盲区。该验证只在诊断
+   子进程里跑，不进入实时开麦路径（避免与识别器争用录音端）。
+3. **可诊断**：`EndpointPlaybackSink.resolved_host_api` 暴露实际使用的 host API；
+   `voice_audio_session.open()` 日志改记真实值，降级时额外打一条 warning，
+   不再把保存的坏值当成实际值写进日志。
+
+测试：`tests/test_audio_output.py` / `tests/test_audio_playback.py` /
+`tests/test_qt_settings_app.py` 更新了被 issue #5 证伪的旧契约（CABLE 回退到
+DirectSound 不再是合法行为），新增静音复现、降级、真实 sink 格式验证等用例。
+
 ## 0.2.4 — 适配豆包输入法 v1.1.1.12
 
 - **适配豆包输入法 v1.1.1.12**：新版 `ImeService.exe` 的 sha256 不在白名单，

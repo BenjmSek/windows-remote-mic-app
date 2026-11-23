@@ -75,6 +75,20 @@ class ResolveDeviceIndexTests(unittest.TestCase):
         with self.assertRaises(audio_output.AudioOutputUnavailableError):
             sink._resolve_device_index(sd)
 
+    def test_resolved_host_api_reflects_issue5_downgrade(self):
+        # Saved cable+DirectSound is unsafe; resolution degrades to WASAPI and
+        # the sink must report the API it actually uses for honest diagnostics.
+        sd = FakeSoundDevice(
+            devices=[
+                _device("CABLE Input", 2, 0, default_samplerate=48000.0),
+                _device("CABLE Input", 2, 1, default_samplerate=48000.0),
+            ],
+            host_apis=[{"name": "Windows DirectSound"}, {"name": "Windows WASAPI"}],
+        )
+        sink = EndpointPlaybackSink("CABLE Input", "Windows DirectSound")
+        self.assertEqual(sink._resolve_device_index(sd), 1)
+        self.assertEqual(sink.resolved_host_api, "Windows WASAPI")
+
 
 class SelectOutputSampleRateTests(unittest.TestCase):
     def setUp(self):
@@ -839,6 +853,175 @@ class CableLoopbackProbeTests(unittest.TestCase):
 
         self.assertFalse(cleaned)
         self.assertLess(time.monotonic() - started_at, 0.5)
+
+
+class _FakeRouteSoundDevice:
+    """sounddevice-shaped fake with separate OutputStream/InputStream that
+    connect CABLE Input writes to CABLE Output reads through one buffer.
+
+    Used to exercise verify_cable_route_with_voice_sink end to end without a
+    real VB-Cable: ``route_gain=0`` reproduces issue #5's digital silence.
+    """
+
+    CallbackStop = _FakeCallbackStop
+    CallbackAbort = _FakeCallbackAbort
+
+    def __init__(self, *, route_gain=1.0, delay_samples=0):
+        self.route_gain = route_gain
+        self.delay_samples = delay_samples
+        self.route_buffer = None
+        self._devices = [
+            {"name": "CABLE Input", "max_input_channels": 0,
+             "max_output_channels": 2, "hostapi": 0, "default_samplerate": 48000.0},
+            {"name": "CABLE Output", "max_input_channels": 2,
+             "max_output_channels": 0, "hostapi": 0, "default_samplerate": 48000.0},
+        ]
+        self.last_output_kwargs = None
+        self.last_input_kwargs = None
+
+    def query_devices(self):
+        return self._devices
+
+    def query_hostapis(self):
+        return [{"name": "Windows WASAPI"}]
+
+    def check_input_settings(self, **_kwargs):
+        return None
+
+    def check_output_settings(self, **_kwargs):
+        return None
+
+    def OutputStream(self, **kwargs):
+        owner = self
+        self.last_output_kwargs = kwargs
+
+        class Stream:
+            def __init__(self):
+                self.stop_calls = 0
+                self.close_calls = 0
+
+            def start(self):
+                pass
+
+            def write(self, array):
+                routed = np.rint(
+                    np.asarray(array, dtype=np.float64) * owner.route_gain
+                ).clip(-32768, 32767).astype("int16")
+                padding = np.zeros((owner.delay_samples, routed.shape[1]), dtype="int16")
+                owner.route_buffer = np.concatenate((padding, routed), axis=0)
+                return False
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def close(self):
+                self.close_calls += 1
+
+        return Stream()
+
+    def InputStream(self, **kwargs):
+        owner = self
+        self.last_input_kwargs = kwargs
+
+        class Stream:
+            def __init__(self):
+                self.abort_calls = 0
+                self.stop_calls = 0
+                self.close_calls = 0
+                self._thread = None
+
+            def start(self):
+                callback = kwargs["callback"]
+
+                def _run():
+                    # Wait until the verifier writes the sweep into the route.
+                    while owner.route_buffer is None:
+                        time.sleep(0.001)
+                    routed = owner.route_buffer[:, :1]
+                    owner.route_buffer = None
+                    block = 512
+                    cursor = 0
+                    while cursor < len(routed):
+                        chunk = routed[cursor : cursor + block]
+                        cursor += len(chunk)
+                        if len(chunk) < block:
+                            chunk = np.pad(
+                                chunk, ((0, block - len(chunk)), (0, 0))
+                            )
+                        try:
+                            callback(chunk, np.zeros((block, 1), dtype="int16"),
+                                     block, None, _FakeStreamStatus())
+                        except (_FakeCallbackStop, _FakeCallbackAbort):
+                            kwargs["finished_callback"]()
+                            return
+                    # CallbackStop should have fired once all samples were fed.
+                    kwargs["finished_callback"]()
+
+                self._thread = threading.Thread(target=_run, daemon=True)
+                self._thread.start()
+
+            def abort(self):
+                self.abort_calls += 1
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def close(self):
+                self.close_calls += 1
+
+        return Stream()
+
+
+class VoiceSinkCableRouteVerificationTests(unittest.TestCase):
+    def setUp(self):
+        audio_playback.cleanup_retained_portaudio_test_resources(blocking=True)
+
+    def tearDown(self):
+        audio_playback.cleanup_retained_portaudio_test_resources(blocking=True)
+
+    def test_real_sink_format_with_signal_passes(self):
+        sd = _FakeRouteSoundDevice(route_gain=0.9, delay_samples=240)
+        endpoint = audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")
+        recording = audio_output.AudioEndpoint("CABLE Output", "Windows WASAPI")
+        result = audio_playback.verify_cable_route_with_voice_sink(
+            endpoint, recording, sd_module=sd
+        )
+        self.assertTrue(result.detected)
+        self.assertEqual(result.sample_rate_hz, 48000)
+        # The stream was opened at the sink's real rate/channels, not an
+        # independent duplex format (issue #5's gap).
+        self.assertEqual(sd.last_output_kwargs["samplerate"], 48000)
+        self.assertEqual(sd.last_output_kwargs["channels"], 2)
+        self.assertEqual(sd.last_input_kwargs["samplerate"], 48000)
+
+    def test_silent_real_sink_format_is_reported(self):
+        # Issue #5: open()/write() succeed but the cable carries silence.
+        sd = _FakeRouteSoundDevice(route_gain=0.0)
+        endpoint = audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")
+        recording = audio_output.AudioEndpoint("CABLE Output", "Windows WASAPI")
+        result = audio_playback.verify_cable_route_with_voice_sink(
+            endpoint, recording, sd_module=sd
+        )
+        self.assertFalse(result.detected)
+        self.assertLess(result.signal_rms, result.baseline_rms + 1e-9)
+
+    def test_non_cable_endpoint_fails_closed(self):
+        sd = _FakeRouteSoundDevice()
+        endpoint = audio_output.AudioEndpoint("Speakers", "Windows WASAPI")
+        with self.assertRaises(audio_playback.CableRouteVerificationError):
+            audio_playback.verify_cable_route_with_voice_sink(
+                endpoint, sd_module=sd
+            )
+
+    def test_cancelled_before_start_fails_closed(self):
+        sd = _FakeRouteSoundDevice()
+        endpoint = audio_output.AudioEndpoint("CABLE Input", "Windows WASAPI")
+        event = threading.Event()
+        event.set()
+        with self.assertRaises(audio_playback.LoopbackProbeCancelledError):
+            audio_playback.verify_cable_route_with_voice_sink(
+                endpoint, cancel_event=event, sd_module=sd
+            )
 
 
 if __name__ == "__main__":

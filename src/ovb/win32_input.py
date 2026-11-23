@@ -1934,6 +1934,20 @@ def _voice_physical_query_for_sender(
                 )
             return voice_key_physicalizer_windows.physical_key_is_down(vk_code)
         if before_injection and vk_code in reconciled_vks:
+            # A cold start leaves Windows reporting the modifier down with no
+            # real keyboard edge in the hook tracker. Raw Input holds the same
+            # residue in its device-scoped owner table, and that stale owner
+            # would suppress the owed key-up even after the down was allowed.
+            # Clear it under the same witness rule the hook query uses, and
+            # only when the epoch/revision-guarded snapshot still matches.
+            if voice_key_physicalizer_windows.cold_start_residue_may_be_cleared(
+                vk_code
+            ):
+                snapshot = raw_input_windows.snapshot_stale_modifier_owner(vk_code)
+                if snapshot is not None:
+                    raw_input_windows.clear_stale_modifier_owner_if_unchanged(
+                        snapshot
+                    )
             # Non-right-Alt modifiers reach the hook query too, but only the
             # keys of this shortcut may clear a stale hold.
             if raw_input_windows.physical_key_has_ambiguous_owners(vk_code):
