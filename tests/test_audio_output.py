@@ -121,6 +121,35 @@ class CableEndpointMatchingTests(unittest.TestCase):
             audio_output.is_cable_output_endpoint("CABLE Output (VB-Audio Virtual Cable)")
         )
 
+    def test_channel_count_playback_spelling_matches(self):
+        # Newer VB-CABLE packs rename the playback side to a channel count.
+        self.assertTrue(audio_output.is_cable_input_endpoint("CABLE In 16 Ch"))
+        self.assertTrue(
+            audio_output.is_cable_input_endpoint("CABLE In 16 Ch (VB-Audio Virtual Cable)")
+        )
+        self.assertTrue(audio_output.is_cable_input_endpoint("  CABLE In 16 Ch  "))
+
+    def test_channel_count_spelling_is_playback_only(self):
+        self.assertFalse(audio_output.is_cable_output_endpoint("CABLE In 16 Ch"))
+        self.assertFalse(
+            audio_output.is_cable_output_endpoint("CABLE In 16 Ch (VB-Audio Virtual Cable)")
+        )
+
+    def test_channel_count_similarly_named_device_does_not_match(self):
+        self.assertFalse(audio_output.is_cable_input_endpoint("CABLE In 16 Ch Splitter"))
+        self.assertFalse(audio_output.is_cable_input_endpoint("My CABLE In 16 Ch"))
+
+    def test_localized_default_playback_view_does_not_match(self):
+        # The Windows audio panel shows this once the cable is the default
+        # playback device. It refuses every stream format on the hardware
+        # measured, so it must not be accepted as a usable voice endpoint.
+        self.assertFalse(
+            audio_output.is_cable_input_endpoint("扬声器 (VB-Audio Virtual Cable)")
+        )
+        self.assertFalse(
+            audio_output.is_cable_input_endpoint("Speakers (VB-Audio Virtual Cable)")
+        )
+
     def test_leading_trailing_whitespace_is_tolerated(self):
         self.assertTrue(audio_output.is_cable_input_endpoint("  CABLE Input  "))
 
