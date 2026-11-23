@@ -14,3 +14,17 @@ frida==17.24.0
 comtypes==1.4.17
 uiautomation==2.0.29
 pefile==2024.8.26
+
+# WinRT projections (pywinrt 3.2.1) - required for paired-device discovery
+# ("选择设备" / --list-remote-devices) and the BLE GATT voice path.
+# THIRD_PARTY_NOTICES.md already pins these versions, but this file omitted
+# them: without the projections DeviceInformation enumeration returns nothing,
+# the device list stays empty and the Chromecast receiver worker exits with
+# code 2 before any audio can flow.
+winrt-runtime==3.2.1
+winrt-Windows.Devices.Bluetooth==3.2.1
+winrt-Windows.Devices.Bluetooth.GenericAttributeProfile==3.2.1
+winrt-Windows.Devices.Enumeration==3.2.1
+winrt-Windows.Storage.Streams==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
