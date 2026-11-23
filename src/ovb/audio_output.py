@@ -267,6 +267,24 @@ def _enumerate_endpoints(channel_count_key: str) -> List[AudioEndpoint]:
 # persisted until the user saves and the real stream preflight succeeds.
 CABLE_INPUT_NAME = "CABLE Input"
 CABLE_OUTPUT_NAME = "CABLE Output"
+# Newer VB-CABLE driver packs expose the playback side of the same cable under
+# a channel-count name ("CABLE In 16 Ch (VB-Audio Virtual Cable)") instead of
+# the canonical "CABLE Input". Nothing else changes: it is still the endpoint
+# that feeds CABLE Output, and it still carries the driver's own
+# "(VB-Audio Virtual Cable)" decoration. Without this alias such an install
+# resolves the saved endpoint successfully and then fails every subsequent
+# name check, so neither the settings preflight nor the channel test can run.
+#
+# Deliberately NOT aliased: the localized "Speakers (VB-Audio Virtual Cable)"
+# view that the Windows audio panel shows once the cable is the default
+# playback device. On the hardware measured here it refuses every stream
+# format (MME: device unavailable, DirectSound: unanticipated host error,
+# WASAPI: invalid device), so accepting it would turn a clear name-check
+# failure into a confusing open-time one; its prefix is also language
+# dependent and cannot be matched portably.
+CABLE_INPUT_ALIASES = ("CABLE In 16 Ch",)
+
+
 def _matches_cable_endpoint(name: str, canonical: str) -> bool:
     """True only if ``name`` is exactly ``canonical``, or ``canonical``
     followed by a parenthesized host-API/driver decoration Windows/PortAudio
@@ -284,9 +302,17 @@ def _matches_cable_endpoint(name: str, canonical: str) -> bool:
 
 
 def is_cable_input_endpoint(name: str) -> bool:
-    """True if ``name`` names VB-CABLE's playback ("CABLE Input") endpoint."""
+    """True if ``name`` names VB-CABLE's playback signal source.
 
-    return _matches_cable_endpoint(name, CABLE_INPUT_NAME)
+    Accepts the canonical ``CABLE Input`` plus the alternate driver spelling in
+    ``CABLE_INPUT_ALIASES``. Every candidate still goes through the strict
+    exact-or-parenthesized-decoration match above, never a bare substring test.
+    """
+
+    return any(
+        _matches_cable_endpoint(name, candidate)
+        for candidate in (CABLE_INPUT_NAME, *CABLE_INPUT_ALIASES)
+    )
 
 
 def is_cable_output_endpoint(name: str) -> bool:
