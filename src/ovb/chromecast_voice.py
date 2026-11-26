@@ -204,7 +204,7 @@ class Recording:
         opcode = payload[0]
         if opcode == 0x04:  # AUDIO_START: reason, codec, stream.
             if len(payload) != 4 or payload[2] != 2 or not (
-                    (payload[1] == 3 and 1 <= payload[3] <= 128)
+                    (payload[1] == 3 and 1 <= payload[3] <= 255)
                     or (payload[1] == 0 and payload[3] == 0)):
                 self.control_result = "unsupported_voice_stream"
                 return self.finish(now, "unsupported_voice_stream")
@@ -261,7 +261,15 @@ class Recording:
                 return effects + self.finish(now, "released" if self.mode == "hold" and payload[1] == 2
                                              else "device_ended")
             if previous and previous[1] == 3 and payload[1] == 2:
-                if self.host_ready and not self.open_pending:
+                # A toggle press closes the physical stream as soon as the
+                # button is released. Open the software stream immediately
+                # instead of waiting for ``host_ready``: the host (Doubao IME)
+                # can take seconds to open its capture session, and speech
+                # during that gap is never captured by the remote at all, so
+                # no buffer on the bridge side can recover it. The host's
+                # capture-readiness gate still controls when buffered PCM is
+                # actually written to the output sink.
+                if not self.open_pending:
                     self.open_pending = True
                     effects.append(self._effect("device", b"\x0c\x00"))
                 return effects
@@ -290,7 +298,7 @@ class Recording:
             return False
         command = effect.value
         if command == b"\x0c\x00":
-            return (self.state == "starting" and self.host_ready and self.open_pending
+            return (self.state == "starting" and self.open_pending
                     and self.stream is None and not self.shutting_down)
         if not isinstance(command, bytes) or len(command) != 2:
             return False

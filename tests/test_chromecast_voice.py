@@ -49,9 +49,12 @@ class RecordingTests(unittest.TestCase):
         gate = Recording("toggle", limit)
         gate.control(PHYSICAL, 1)
         gate.control(b"\x08", 1.01)
-        gate.control(RELEASE, 1.1)
-        command = gate.host_result(1, True, 1.2)[0]
+        released = gate.control(RELEASE, 1.1)
+        # The software mic is now opened on release, before the host is ready.
+        command = next(e for e in released
+                       if e.kind == "device" and e.value == b"\x0c\x00")
         self.assertTrue(gate.command_submitted(command))
+        gate.host_result(1, True, 1.2)
         gate.control(SOFTWARE, 1.3)
         self.assertEqual(gate.state, "recording")
         return gate
@@ -63,6 +66,15 @@ class RecordingTests(unittest.TestCase):
         for mode, limit in [("other", 120), ("hold", True), ("toggle", 0)]:
             with self.assertRaises(ValueError):
                 Recording(mode, limit)
+
+    def test_audio_start_accepts_extended_stream_id(self):
+        """Regression for firmware variants using stream IDs > 128 (e.g. 165, 166)."""
+        gate = Recording()
+        # AUDIO_START: opcode=4, reason=3, codec=2, stream_id=165
+        payload = bytes((0x04, 0x03, 0x02, 165))
+        effects = gate.control(payload, 1.0)
+        self.assertEqual(gate.stream, (165, 3))
+        self.assertEqual(gate.state, "starting")
 
     def test_release_reason_is_not_inferred_from_any_device_stop(self):
         for payload, reason in ((RELEASE, "released"), (STOP, "device_ended")):
@@ -81,13 +93,47 @@ class RecordingTests(unittest.TestCase):
             self.assertEqual(gate.control(b"\x08", now), [])
             self.assertEqual(gate.control(PHYSICAL, now), [])
         self.assertEqual(gate.state, "starting")
-        gate.control(RELEASE, 1.4)
-        effects = gate.host_result(1, True, 1.5)
-        self.assertEqual([e.value for e in effects], [b"\x0c\x00"])
+        released = gate.control(RELEASE, 1.4)
+        opened = [e for e in released
+                  if e.kind == "device" and e.value == b"\x0c\x00"]
+        self.assertEqual(len(opened), 1)
         self.assertEqual(gate.state, "starting")
-        self.assertTrue(gate.command_submitted(effects[0]))
+        self.assertTrue(gate.command_submitted(opened[0]))
+        gate.host_result(1, True, 1.5)
         gate.control(SOFTWARE, 1.6)
         self.assertEqual(gate.state, "recording")
+
+    def test_toggle_release_opens_mic_before_host_ready(self):
+        """Regression for the opening-word loss on a short toggle press.
+
+        The host (Doubao IME) takes 1.3-3.9 s on this machine to open its
+        capture session. Speech during that gap is never captured by the
+        remote at all, so no bridge-side buffer can recover it. The software
+        mic must therefore be opened on release, not on ``host_ready``.
+        """
+        gate = Recording("toggle")
+        gate.control(PHYSICAL, 1)
+        self.assertFalse(gate.host_ready)
+
+        released = gate.control(RELEASE, 1.1)
+        opened = [e for e in released
+                  if e.kind == "device" and e.value == b"\x0c\x00"]
+        self.assertEqual(len(opened), 1, "software mic must open on release")
+        self.assertTrue(gate.command_valid(opened[0]))
+        self.assertTrue(gate.command_submitted(opened[0]))
+
+        # Software stream and audio frames arrive well before the host ever
+        # confirms its capture session. Frames are still forwarded so the host
+        # can buffer them in ``pending_pcm`` while the gate stays "starting".
+        gate.control(SOFTWARE, 1.2)
+        self.assertEqual(gate.state, "starting")
+        self.assertEqual(len(gate.audio(bytes(20), 1.3)), 1)
+
+        effects = gate.host_result(1, True, 2.5)
+        self.assertEqual(gate.state, "recording")
+        self.assertFalse([e for e in effects if e.kind == "device"],
+                         "mic must not be opened twice")
+        self.assertEqual(len(gate.audio(bytes(20), 2.6)), 1)
 
     def test_host_ready_before_release_does_not_send_open_while_physical_stream_runs(self):
         gate = Recording("toggle")
@@ -196,9 +242,11 @@ class RecordingTests(unittest.TestCase):
     def test_open_in_flight_shutdown_keeps_liability(self):
         gate = Recording("toggle")
         gate.control(PHYSICAL, 1)
-        gate.control(RELEASE, 1.1)
-        command = gate.host_result(1, True, 1.2)[0]
+        released = gate.control(RELEASE, 1.1)
+        command = next(e for e in released
+                       if e.kind == "device" and e.value == b"\x0c\x00")
         gate.command_submitted(command)
+        gate.host_result(1, True, 1.2)
         effects = gate.finish(1.3, shutdown=True)
         self.assertEqual([e.value for e in effects if e.kind == "device"], [b"\x0d\x00"])
         gate.host_stopped(1, True, 1.4)
